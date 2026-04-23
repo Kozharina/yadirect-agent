@@ -1,0 +1,65 @@
+"""Central configuration. Loaded once from env, passed explicitly everywhere.
+
+Design choices:
+- pydantic-settings for typed config with validation at startup (fail fast).
+- No global singleton — we pass Settings into clients/services via DI so
+  tests can swap it out cleanly.
+- SecretStr for tokens so they never accidentally end up in logs.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Literal
+
+from pydantic import Field, SecretStr, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # --- Yandex ---
+    yandex_direct_token: SecretStr = Field(default=SecretStr(""))
+    yandex_metrika_token: SecretStr = Field(default=SecretStr(""))
+    yandex_client_login: str | None = None
+    yandex_use_sandbox: bool = True
+
+    # --- Anthropic ---
+    anthropic_api_key: SecretStr = Field(default=SecretStr(""))
+    anthropic_model: str = "claude-opus-4-7"
+
+    # --- Agent ---
+    agent_policy_path: Path = Path("./agent_policy.yml")
+    agent_max_daily_budget_rub: int = 10_000
+
+    # --- Observability ---
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    log_format: Literal["json", "console"] = "json"
+    audit_log_path: Path = Path("./logs/audit.jsonl")
+
+    # --- Derived ---
+    @property
+    def direct_base_url(self) -> str:
+        if self.yandex_use_sandbox:
+            return "https://api-sandbox.direct.yandex.com/json/v5"
+        return "https://api.direct.yandex.com/json/v5"
+
+    @property
+    def metrika_base_url(self) -> str:
+        return "https://api-metrika.yandex.net"
+
+    @field_validator("audit_log_path")
+    @classmethod
+    def _ensure_log_dir(cls, v: Path) -> Path:
+        v.parent.mkdir(parents=True, exist_ok=True)
+        return v
+
+
+def get_settings() -> Settings:
+    """Construct settings. Called from entry points, not import time."""
+    return Settings()
