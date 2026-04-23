@@ -30,8 +30,8 @@ install-hooks:  ## Install pre-commit git hooks
 test:  ## Run the test suite
 	@$(BIN)/pytest -q
 
-test-cov:  ## Run tests with coverage report
-	@$(BIN)/pytest --cov=src/yadirect_agent --cov-report=term-missing --cov-report=html
+test-cov:  ## Run tests with coverage report (HTML at htmlcov/index.html)
+	@$(BIN)/pytest --cov=src/yadirect_agent --cov-report=term-missing --cov-report=html --cov-fail-under=78
 
 lint:  ## Ruff check + format check (no writes)
 	@$(BIN)/ruff check .

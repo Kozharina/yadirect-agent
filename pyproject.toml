@@ -32,6 +32,9 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "pytest-vcr>=1.0.2",
+    "pytest-cov>=5.0",              # coverage measurement + --cov-fail-under gate
+    "pytest-randomly>=3.15",        # shuffles test order each run; catches hidden deps
+    "pytest-timeout>=2.3",          # hard per-test timeout so hangs fail fast
     "respx>=0.21",                  # httpx mocking
     "ruff>=0.6",
     "mypy>=1.11",
@@ -74,3 +77,37 @@ plugins = ["pydantic.mypy"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Hard limit per test — a hung async test (missing event, forgotten release)
+# should surface as a red test, not a multi-minute wait. 10s is chosen so
+# a real retry chain (5x wait_random_exponential up to 30s) fits in the
+# worst reasonable case while still catching actual hangs. Override with
+# `@pytest.mark.timeout(N)` if a test legitimately needs longer.
+timeout = 10
+# Seed pytest-randomly to keep a given CI run reproducible; the plugin
+# still rotates the seed by default across runs.
+# addopts is kept empty here so `make check` and `make test-cov` can
+# opt into coverage explicitly — keeps `pytest -q` fast for local iteration.
+addopts = "--strict-markers --strict-config"
+
+[tool.coverage.run]
+branch = true
+source = ["src/yadirect_agent"]
+# pyc/cache folders are not measured; __init__.py re-exports and CLI entry
+# trivia are intentionally excluded to keep the signal strong.
+omit = [
+    "src/yadirect_agent/__init__.py",
+    "src/yadirect_agent/*/__init__.py",
+    "src/yadirect_agent/cli/main.py",  # thin typer adapter; covered via smoke tests only
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+precision = 1
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "\\.\\.\\.",                    # bare `...` in Protocol stubs
+]

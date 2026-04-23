@@ -284,6 +284,10 @@ async def test_rate_limit_error_is_retried(
     assert route.call_count == 2
 
 
+# wait_random_exponential(max=30) x stop_after_attempt(5) can legitimately
+# sleep > 10 s across five tries; raise the per-test cap so retry-exhaustion
+# tests don't become a flaky-timeout source. See docs/TESTING.md#coverage.
+@pytest.mark.timeout(60)
 @pytest.mark.asyncio
 async def test_retry_is_exhausted_for_persistent_5xx(
     settings: Settings, respx_mock: respx.MockRouter
@@ -336,6 +340,9 @@ async def test_validation_error_is_not_retried(
 # --------------------------------------------------------------------------
 
 
+# Same reasoning as test_retry_is_exhausted_for_persistent_5xx: non-JSON
+# body is classified transient and goes through the full retry chain.
+@pytest.mark.timeout(60)
 @pytest.mark.asyncio
 async def test_non_json_body_becomes_transient_error(
     settings: Settings, respx_mock: respx.MockRouter

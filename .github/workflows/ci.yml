@@ -38,5 +38,19 @@ jobs:
       - name: mypy (strict)
         run: mypy src/
 
-      - name: pytest
-        run: pytest -q
+      - name: pytest (with coverage gate)
+        run: |
+          pytest -q \
+            --cov=src/yadirect_agent \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=78
+
+      - name: Upload coverage XML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+          if-no-files-found: ignore
+          retention-days: 7
