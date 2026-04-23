@@ -4,6 +4,103 @@
 > with a tight unit layer, an `respx`-driven HTTP layer, and an opt-in
 > VCR layer for end-to-end sanity in sandbox. No unit test ever touches
 > the network.
+>
+> **Workflow note**: every behaviour change is introduced test-first. See
+> `<tdd_workflow>` below.
+
+## <tdd_workflow>
+**TDD is the default here** — not a preference, not "where practical".
+This is what that actually means in practice.
+
+### The loop
+
+1. **Red.** Write the smallest possible failing test for the next
+   behaviour. Run it. It must fail — and fail *for the right reason*
+   (the behaviour isn't implemented), not because of a typo, a missing
+   fixture, or an import error. Fix those and re-run until the failure
+   is clean.
+
+   Commit it as its own commit:
+   ```
+   test(<scope>): add failing test for <behaviour>
+   ```
+   The commit body states what's being tested and *why it fails right
+   now* (the absent function, the unenforced constraint, the missing
+   branch). This is the audit trail that proves the test was honest.
+
+2. **Green.** Write the minimum code that makes the new test pass. No
+   extra features. No "while I'm here" improvements. Run the whole
+   suite — no other test may regress.
+
+   Commit:
+   ```
+   feat(<scope>): implement <behaviour> (test passes)
+   ```
+   or `fix(<scope>): ...` when addressing a bug.
+
+3. **Refactor.** With the suite green, tidy the implementation. Extract
+   helpers, rename for clarity, remove duplication. Run the full suite
+   after each edit. If anything turns red, revert the last change.
+
+   Commit (optional, only when the change is meaningful):
+   ```
+   refactor(<scope>): <what, briefly>
+   ```
+
+4. **Repeat** for the next small behaviour.
+
+### What counts as a behaviour change
+
+- A new public function / method / class / CLI flag.
+- A new branch in existing code (new error type, new edge case).
+- A change in an existing contract (different return shape, different
+  validation rule). The old tests that no longer describe the contract
+  are edited *first*, commit as `test:`, see them fail against the old
+  code, then update the implementation.
+
+Not a behaviour change (TDD exempt):
+- Pure rename, pure reformatting, pure type-annotation adjustments.
+- Documentation-only edits.
+- Dependency bumps without API surface change.
+- CI / tooling / build-script changes.
+- Deleting dead code that has no tests pointing at it.
+
+### Anti-patterns and how to spot them
+
+| Symptom                                              | What actually happened                           |
+| ---------------------------------------------------- | ------------------------------------------------ |
+| `test:` and `feat:` in one commit                    | Tests written after. If impl was first, rewrite. |
+| `feat:` with no `test:` anywhere in the PR           | No TDD. Back to step 1.                          |
+| `test:` commit contains a test that *passes*         | Test was added after; rewrite it against the old |
+|                                                      | code until it fails, commit, then fix.           |
+| Pre-commit skipped on the `test:` commit             | Probably because tests failed — expected in red. |
+|                                                      | Use `git commit --no-verify` only on `test:`     |
+|                                                      | commits; note "-- red" in the commit subject.    |
+
+### Red-commit convention
+
+Because pre-commit runs `pytest` isn't one of our hooks (it runs lint +
+type), most `test:` red commits pass hooks. But if a failing test
+somehow breaks lint or mypy (bad import, etc.), fix that first — a red
+test is *only* red because the implementation is missing, never because
+the test file itself is malformed.
+
+### Worked example
+
+We want `CampaignService.set_daily_budget` to reject < 300 RUB.
+
+```
+$ pytest -x tests/unit/services/test_campaigns.py -k rejects
+# FAIL: no attribute set_daily_budget           ← step 1, red
+$ git commit -m "test(services): failing case for <300 RUB rejection"
+# Edit services/campaigns.py, add the method + early raise
+$ pytest -x
+# PASS                                          ← step 2, green
+$ git commit -m "feat(services): reject budgets below Direct's 300 RUB floor"
+```
+
+Two commits, visible red-before-green pair. A reviewer reading
+`git log --oneline` knows immediately that the test was not a retrofit.
 
 ## <layers>
 | Suite                      | What it covers                                | How it's mocked                          | Speed target |

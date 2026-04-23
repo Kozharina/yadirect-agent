@@ -78,20 +78,34 @@ Takes ~10 minutes. This is where bad things hide.
 ## <tier_4_tests>
 Takes ~5 minutes.
 
-16. **New behaviour has tests.** Every new public function or service
+16. **TDD trail is visible.** `git log --oneline <base>..HEAD` on the PR
+    branch shows at least one `test:` commit that precedes the matching
+    `feat:` or `fix:` commit. The `test:` commit, when checked out in
+    isolation, must cause `pytest -x` to fail (that's the whole point —
+    we saw it fail before we made it pass).
+
+    Exempt commit types (no red-before-green required): `refactor:`,
+    `docs:`, `chore:`, `ci:`, `build:`, `style:`, `revert:`.
+
+    If a PR bundles a feature into a single commit, the commit body must
+    state "tests written first" and explain why the split was dropped —
+    and the reviewer may still request the split if the diff is complex.
+    See `docs/TESTING.md#tdd_workflow`.
+
+17. **New behaviour has tests.** Every new public function or service
     method has at least:
     - a happy-path test,
     - one failure-path test (validation, auth, or transient — pick what's
       most likely),
     - a decision test (for service methods that branch on input).
-17. **HTTP touches use `respx`.** No live network in unit or
+18. **HTTP touches use `respx`.** No live network in unit or
     `tests/integration/`.
-18. **Coverage did not drop** for the touched files (≥ 80%).
-19. **Tests are fast and hermetic.** No `sleep` other than
+19. **Coverage did not drop** for the touched files (≥ 80%).
+20. **Tests are fast and hermetic.** No `sleep` other than
     `asyncio.sleep(0)` for yielding. No reliance on current time unless
     the test also pins the clock (`freezegun` or a fake clock injected
     through `Settings`).
-20. **Test names describe behaviour**, not implementation
+21. **Test names describe behaviour**, not implementation
     (`test_list_campaigns_filters_states`, not
     `test_list_campaigns_calls_get_campaigns_with_states`).
 </tier_4_tests>
@@ -99,26 +113,26 @@ Takes ~5 minutes.
 ## <tier_5_dx_and_docs>
 Takes ~3 minutes.
 
-21. **Public surface documented.** If `README.md` or a `docs/*.md` page
+22. **Public surface documented.** If `README.md` or a `docs/*.md` page
     mentions the feature area, it's updated.
-22. **Flags and env vars** introduced are listed in `.env.example` with
+23. **Flags and env vars** introduced are listed in `.env.example` with
     a one-line comment explaining intent.
-23. **Error messages** are actionable. `AuthError("expired")` is fine;
+24. **Error messages** are actionable. `AuthError("expired")` is fine;
     `AuthError("")` is not.
-24. **TODO markers** use `TODO(milestone): …` format and the milestone
+25. **TODO markers** use `TODO(milestone): …` format and the milestone
     exists in `docs/TECHNICAL_SPEC.md`.
-25. **Types survive mypy strict** and don't leak `Any` across module
+26. **Types survive mypy strict** and don't leak `Any` across module
     boundaries.
 </tier_5_dx_and_docs>
 
 ## <tier_6_subjective>
 Human reviewer only. Not a blocker — a discussion prompt.
 
-26. Does the new code surface make the agent **easier to reason about**?
-27. Is there a simpler design that would have shipped the same outcome?
-28. Is naming precise? (`apply_bids` is more honest than `update_bids`
+27. Does the new code surface make the agent **easier to reason about**?
+28. Is there a simpler design that would have shipped the same outcome?
+29. Is naming precise? (`apply_bids` is more honest than `update_bids`
     if it also rejects some.)
-29. Would I understand this PR in six months without the author next
+30. Would I understand this PR in six months without the author next
     to me?
 </tier_6_subjective>
 
