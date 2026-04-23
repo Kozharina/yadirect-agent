@@ -20,6 +20,11 @@ Call out:
 
 ## Tests
 
+- [ ] **TDD trail is visible**: at least one `test:` commit precedes the
+      matching `feat:`/`fix:` commit for every new behaviour. Exempt PR
+      types: `refactor`, `docs`, `chore`, `ci`, `build`, `style`. If this
+      PR bundles a feature into a single commit, the commit body states
+      "tests written first". See `docs/TESTING.md#tdd_workflow`.
 - [ ] Unit tests added / updated (`pytest -q` green locally)
 - [ ] `respx` fixtures cover the happy and failure paths for new HTTP calls
 - [ ] Coverage for changed files ≥ 80%

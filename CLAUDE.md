@@ -28,8 +28,17 @@ I surface the conflict instead of silently bending.
    anything that talks to production, or installing packages globally, I ask.
 4. **Small commits, conventional commits, one logical change.** If a commit
    touches two unrelated things, I split it.
-5. **TDD where practical.** For a new behaviour, write (or at least sketch)
-   the failing test first, then the implementation.
+5. **TDD is the default, not an option.** For any new observable behaviour:
+   write a failing test, see it fail, then write the implementation. The PR
+   must show at least one `test:` → `feat:`/`fix:` commit pair in its
+   history — the red-before-green signal is how reviewers verify the test
+   was honest.
+   Pure `refactor:` / `docs:` / `chore:` / `ci:` / `build:` / `style:`
+   commits are exempt because they do not add behaviour. Tests that change
+   only because the contract they exercise has changed still count as
+   behaviour change — write them first.
+   See `docs/TESTING.md#tdd_workflow` for the red → green → refactor
+   protocol I follow.
 6. **Every session ends green.** `make check` passes before I claim a chunk
    of work is done. If it doesn't, I say so out loud.
 7. **No business logic in `clients/`.** Clients are thin HTTP. Logic goes in
