@@ -30,8 +30,14 @@ repos:
     hooks:
       - id: mypy
         files: ^src/
+        # mypy runs in its own isolated venv here — every runtime dep whose
+        # types we rely on must be listed, otherwise we see false
+        # "module not found" errors that the in-venv mypy does not.
         additional_dependencies:
           - pydantic>=2.8
           - pydantic-settings>=2.4
+          - httpx>=0.27
+          - structlog>=24.4
+          - tenacity>=9.0
           - types-python-slugify
         args: ["--config-file=pyproject.toml"]
