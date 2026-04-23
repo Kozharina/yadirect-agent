@@ -1,0 +1,32 @@
+name: Feature request
+description: Propose new functionality or an improvement.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What real task or pain is this solving? Link to the milestone in `docs/TECHNICAL_SPEC.md` if one fits.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Sketch the API / CLI / tool surface. Rough is fine — we'll iterate.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What have you already ruled out, and why?
+
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety implications
+      description: |
+        Does this expand the set of mutating operations, touch bidding,
+        budgets, or audience settings? If yes — how do we keep it reversible
+        and policy-gated?

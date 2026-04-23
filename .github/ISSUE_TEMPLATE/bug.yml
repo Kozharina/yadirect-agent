@@ -1,0 +1,70 @@
+name: Bug report
+description: Something is broken in yadirect-agent.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please fill in the fields below so we can reproduce.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `python -c "import yadirect_agent; print(yadirect_agent.__version__)"`
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - CLI agent
+        - MCP server
+        - Library / programmatic
+        - Tests / dev tooling
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Yandex environment
+      options:
+        - sandbox
+        - production
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what happened instead?
+      placeholder: |
+        Steps:
+        1.
+        2.
+        Expected:
+        Actual:
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: |
+        Include structured log lines (one JSON per line). **Redact any tokens
+        or personally identifiable data before pasting.**
+      render: shell
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Confirm
+      options:
+        - label: I have removed tokens, OAuth codes, and account identifiers from pasted output.
+          required: true
