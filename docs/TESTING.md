@@ -224,18 +224,36 @@ If you do use VCR:
 - Scrub `Authorization` headers and `Client-Login` before committing.
 
 ## <coverage>
-- Target: **80%** on `src/yadirect_agent/`.
-- Hard exclusions: `cli/main.py` (thin adapter), `__init__.py` files.
-- Branch coverage on: `clients/base.py` (retry logic), `agent/safety.py`
-  (policy decisions). These are the places a missed branch is expensive.
+- **CI gates** the merge on `--cov-fail-under=78` today; target is **80%**
+  once M7.1 dotyazhka lands (`test_bidding.py`, `test_semantics.py`).
+  After that the gate moves up. PRs may not lower the gate — they may
+  raise it.
+- **Branch coverage on** — every branch counts, not just line coverage.
+  This is why `clients/base.py` (retry/error classification) and
+  `agent/loop.py` (tool dispatch decisions) are over 90%: missed branches
+  there are expensive.
+- **Excluded from coverage** (see `[tool.coverage.run].omit` in
+  `pyproject.toml`):
+  - `__init__.py` files (re-exports only).
+  - `cli/main.py` — thin typer adapter; covered via CLI smoke tests, the
+    orchestration logic isn't branch-dense.
+  - Lines marked `pragma: no cover`, `if TYPE_CHECKING:`, Protocol stubs
+    (`...`), `raise NotImplementedError`.
+- **Runtime controls**:
+  - `pytest-randomly` shuffles tests on each run so hidden order
+    dependencies surface locally before CI.
+  - `pytest-timeout` kills tests that exceed 10 s (configured in
+    `[tool.pytest.ini_options]`). Override per-test with
+    `@pytest.mark.timeout(N)` when a retry chain legitimately needs more.
 
-Run:
+Run locally:
 
 ```bash
-make test-cov
+make test-cov       # enforces the gate, writes htmlcov/index.html
 ```
 
-HTML report at `htmlcov/index.html`.
+CI uploads `coverage.xml` as a build artefact per Python version — grab
+it if you need to inspect what was missed in a red build.
 
 ## <what_not_to_test>
 - **Pydantic model field presence.** Trust pydantic; don't re-test
