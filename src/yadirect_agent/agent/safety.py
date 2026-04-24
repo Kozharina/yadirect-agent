@@ -947,3 +947,210 @@ class BudgetBalanceDriftCheck:
             baseline_total_rub=baseline_total,
             projected_total_rub=projected_total,
         )
+
+
+# --------------------------------------------------------------------------
+# Kill-switch #6 — Conversion integrity.
+#
+# Unlike KS#1-#5, this is not a per-operation guard — it's a
+# system-level gatekeeper that runs once before any write plan and
+# blocks *every* write when Metrika tracking looks broken. Three
+# classes of failure:
+#   1. Volume collapse — current conversions are far below baseline,
+#      suggesting the tracking pixel died, a tag manager update wiped
+#      it, or a privacy-setting change killed collection.
+#   2. Absolute floor — current conversions below a minimum count per
+#      window, catching "zero conversions for a whole day" cases.
+#   3. Missing goals — a goal that existed in baseline is not in
+#      the current snapshot, suggesting it was deleted or misconfigured.
+#
+# The check's signature is (baseline, current) — no `changes` list.
+# The pipeline runner (M2.2) reads the result; a `blocked` result
+# aborts the whole plan before any write executes. A `warn` result
+# (e.g. baseline empty on first-ever run) is surfaced but does not
+# itself block writes — M2.3 audit sink records it.
+#
+# Out of scope here (BACKLOG): real Metrika integration
+# (`MetrikaService.get_report` in M6), rolling-window arithmetic,
+# per-goal sensitivity tuning.
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GoalConversions:
+    """Conversions for one Metrika goal over the snapshot window.
+
+    ``__post_init__`` enforces the count contract at construction.
+    Without it, a plain frozen dataclass would accept negative ints
+    and booleans — a caller stitching a snapshot from a malicious
+    or corrupt Metrika response could submit `conversions=-500`,
+    inflating the ratio-vs-baseline metric in their favour and
+    bypassing KS#6. Same pattern as KeywordSnapshot.__post_init__
+    for quality_score (security-auditor LOW on KS#6).
+    """
+
+    goal_id: int
+    goal_name: str
+    conversions: int
+
+    def __post_init__(self) -> None:
+        # bool is a subclass of int — reject explicitly so True/False
+        # don't slip in as 1/0.
+        if isinstance(self.conversions, bool) or not isinstance(self.conversions, int):
+            msg = f"GoalConversions.conversions must be int, got {type(self.conversions).__name__}"
+            raise TypeError(msg)
+        if self.conversions < 0:
+            msg = f"GoalConversions.conversions must be non-negative, got {self.conversions}"
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True)
+class ConversionsSnapshot:
+    """Metrika conversions observed over one reporting window.
+
+    The window size and anchor are the caller's concern; this shape
+    only carries the counts. The check compares two snapshots for
+    the same counter_id — it does not attempt to reason about time.
+    """
+
+    counter_id: int
+    goals: list[GoalConversions] = field(default_factory=list)
+
+    def total_conversions(self) -> int:
+        return sum(g.conversions for g in self.goals)
+
+    def goal_ids(self) -> set[int]:
+        return {g.goal_id for g in self.goals}
+
+    def find(self, goal_id: int) -> GoalConversions | None:
+        for g in self.goals:
+            if g.goal_id == goal_id:
+                return g
+        return None
+
+
+class ConversionIntegrityPolicy(BaseModel):
+    """Kill-switch #6 policy slice.
+
+    Three knobs, each can be disabled independently:
+
+    - ``min_conversions_total`` — absolute floor on ``current``'s
+      total count. Zero means the floor is disabled.
+    - ``min_ratio_vs_baseline`` — ratio current/baseline must be ≥
+      this. Zero disables the ratio check; 1.0 demands no drop at
+      all (rarely useful).
+    - ``require_all_baseline_goals_present`` — if True, every
+      goal_id in baseline must exist in current (current may have
+      new goals — additive changes are fine).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    min_conversions_total: int = Field(default=1, ge=0)
+    min_ratio_vs_baseline: float = Field(default=0.5, ge=0.0, le=1.0)
+    require_all_baseline_goals_present: bool = True
+
+
+def load_conversion_integrity_policy(path: Path) -> ConversionIntegrityPolicy:
+    """Read ``agent_policy.yml`` and extract the conversion-integrity slice."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    keys = (
+        "min_conversions_total",
+        "min_ratio_vs_baseline",
+        "require_all_baseline_goals_present",
+    )
+    fields = {k: raw[k] for k in keys if k in raw}
+    return ConversionIntegrityPolicy.model_validate(fields)
+
+
+class ConversionIntegrityCheck:
+    """Block all writes when Metrika tracking looks broken.
+
+    Pipeline (fails fast on the first tripped rule):
+    0. Empty baseline or baseline total == 0 → warn. No reference
+       point for the ratio; don't silently pass.
+    1. Absolute floor: current total < min_conversions_total →
+       blocked. Detects "zero conversions for a window" outages.
+    2. Ratio: current / baseline < min_ratio_vs_baseline → blocked.
+       Detects collapses that the absolute floor alone misses.
+    3. Missing goals: baseline goal_ids not ⊆ current goal_ids →
+       blocked (unless require_all_baseline_goals_present is False).
+       Detects deleted / misconfigured goals. Additive changes
+       (new goals in current) are fine.
+    """
+
+    def __init__(self, policy: ConversionIntegrityPolicy) -> None:
+        self._policy = policy
+
+    def check(
+        self,
+        baseline: ConversionsSnapshot,
+        current: ConversionsSnapshot,
+    ) -> CheckResult:
+        # Sanity gate: the two snapshots must describe the same
+        # Metrika counter. Comparing tracking from counter A against
+        # counter B is meaningless and a realistic pipeline-wiring
+        # mistake in M2.2 (security-auditor LOW on KS#6).
+        if baseline.counter_id != current.counter_id:
+            return CheckResult.blocked_result(
+                (
+                    f"snapshot counter_id mismatch: baseline="
+                    f"{baseline.counter_id}, current={current.counter_id}"
+                ),
+                baseline_counter_id=baseline.counter_id,
+                current_counter_id=current.counter_id,
+            )
+
+        baseline_total = baseline.total_conversions()
+        current_total = current.total_conversions()
+
+        # (0) Empty baseline → warn, regardless of current state.
+        if not baseline.goals or baseline_total == 0:
+            return CheckResult.warn_result(
+                "baseline has no conversions; integrity check cannot apply",
+                baseline_total=baseline_total,
+                current_total=current_total,
+            )
+
+        # (1) Absolute floor.
+        if self._policy.min_conversions_total > 0 and (
+            current_total < self._policy.min_conversions_total
+        ):
+            return CheckResult.blocked_result(
+                (
+                    f"current total conversions {current_total} is below "
+                    f"minimum {self._policy.min_conversions_total}"
+                ),
+                current_total=current_total,
+                baseline_total=baseline_total,
+                min_total=self._policy.min_conversions_total,
+            )
+
+        # (2) Ratio vs baseline. Guard against divide-by-zero via the
+        # empty-baseline branch above.
+        ratio = current_total / baseline_total
+        if self._policy.min_ratio_vs_baseline > 0 and (ratio < self._policy.min_ratio_vs_baseline):
+            return CheckResult.blocked_result(
+                (
+                    f"current/baseline ratio {ratio:.3f} is below "
+                    f"minimum {self._policy.min_ratio_vs_baseline}"
+                ),
+                current_total=current_total,
+                baseline_total=baseline_total,
+                ratio=ratio,
+                min_ratio=self._policy.min_ratio_vs_baseline,
+            )
+
+        # (3) Missing goals. Only checked when the operator wants it.
+        if self._policy.require_all_baseline_goals_present:
+            missing = sorted(baseline.goal_ids() - current.goal_ids())
+            if missing:
+                return CheckResult.blocked_result(
+                    (f"baseline goals missing in current snapshot: {missing}"),
+                    missing_goal_ids=missing,
+                )
+
+        return CheckResult.ok_result(
+            baseline_total=baseline_total,
+            current_total=current_total,
+        )
