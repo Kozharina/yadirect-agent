@@ -23,12 +23,6 @@ from yadirect_agent.agent.tools import (
     build_default_registry,
 )
 from yadirect_agent.config import Settings
-from yadirect_agent.models.campaigns import (
-    Campaign,
-    CampaignState,
-    CampaignStatus,
-    DailyBudget,
-)
 from yadirect_agent.models.keywords import Keyword
 
 # --------------------------------------------------------------------------
@@ -352,12 +346,10 @@ async def test_list_campaigns_summary_shape(
     tool_context: ToolContext,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from yadirect_agent.services.campaigns import CampaignService
-
     # The service wraps `Campaign` in `CampaignSummary`. The tool converts
     # that summary to a dict. We bypass `DirectService` by patching the
     # service method to produce summaries directly.
-    from yadirect_agent.services.campaigns import CampaignSummary
+    from yadirect_agent.services.campaigns import CampaignService, CampaignSummary
 
     async def fake_summaries(self: CampaignService, _limit: int = 500) -> list[CampaignSummary]:
         return [
