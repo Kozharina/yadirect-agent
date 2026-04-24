@@ -50,22 +50,34 @@ I surface the conflict instead of silently bending.
 ## <workflow_per_task>
 For every non-trivial task (more than a one-line fix):
 
-1. **Read first.** Load `docs/TECHNICAL_SPEC.md` for the milestone and
-   `docs/PRIOR_ART.md` for the references assigned to it. Spend a minute
-   actually reading — not grepping.
-2. **Sketch a plan.** Before writing code: list the files I'll touch, the
-   functions I'll add, the tests I'll write, and the open questions. Share
-   with the human if the task is fuzzy.
-3. **TDD loop.** For each small unit:
+1. **Read the backlog.** Open `docs/BACKLOG.md`. Confirm the session's
+   task is in *Active queue* (or in *In progress* if picked up earlier).
+   If it isn't — add it first with a one-line entry, then start. No
+   silent side-quests; the backlog is the record of intent.
+2. **Read the spec.** Load `docs/TECHNICAL_SPEC.md` for the milestone
+   and `docs/PRIOR_ART.md` for the references assigned to it. Spend a
+   minute actually reading — not grepping.
+3. **Sketch a plan.** Before writing code: list the files I'll touch,
+   the functions I'll add, the tests I'll write, and the open questions.
+   Share with the human if the task is fuzzy.
+4. **TDD loop.** For each small unit:
    - write a failing test (`respx` for HTTP, monkeypatch for service-level),
    - make it pass with the simplest thing that works,
    - refactor while tests stay green.
-4. **Local gate.** Run `make lint && make type && make test`. All three must
-   be green before a commit.
-5. **Commit.** Conventional commit, imperative mood, under ~70 chars on the
-   subject. Body explains "why", not "what".
-6. **Summarise.** Tell the human what landed, what's pending, and anything
-   that needs a human decision next.
+5. **Local gate.** Run `make lint && make type && make test`. All three
+   must be green before a commit.
+6. **Commit.** Conventional commit, imperative mood, under ~70 chars on
+   the subject. Body explains "why", not "what".
+7. **Close the loop on the backlog.** In the same PR (or a follow-up
+   `chore(backlog): …` / `docs(backlog): …` commit), update
+   `docs/BACKLOG.md`:
+   - the shipped item moves to *Done* (newest on top, keep last ~10),
+   - anything discovered as debt goes to *Tech debt / follow-ups*,
+   - promising-but-not-yet ideas go to *Ideas*,
+   - blocked items say what unblocks them and who owns that.
+   A PR that adds behaviour without touching the backlog is incomplete.
+8. **Summarise.** Tell the human what landed, what's now at the top of
+   *Active queue*, and anything that needs a human decision next.
 
 ## <context_hygiene>
 Working on this codebase well means not drowning in context. I:
@@ -124,7 +136,9 @@ Subject line:
 `build`, `chore`, `style`, `revert` }.
 
 `<scope>` is the module or layer (`clients`, `services`, `agent`,
-`mcp`, `cli`, `safety`, `audit`, `ci`, `docs`, or a milestone like `m0`).
+`mcp`, `cli`, `safety`, `audit`, `ci`, `docs`, `backlog`, or a milestone
+like `m0`). Use `backlog` for pure updates to `docs/BACKLOG.md` that
+aren't tied to a shipped feature in the same commit.
 
 Body (optional, hard-wrapped at 72):
 - **why** the change exists (usually a pointer to a milestone or a link to
@@ -154,11 +168,20 @@ painful to debug at 2 AM with a client asking why their budget got burned
 When a new Claude Code session opens in this repo:
 
 1. Read `docs/BRIEF.md` (1 min) — project context.
-2. Read **this file** — operational rules.
-3. Read `docs/ARCHITECTURE.md` — layer contracts.
-4. Glance at `docs/TECHNICAL_SPEC.md` table of contents to locate the current
-   milestone.
-5. Ask the human what we're doing in this session.
+2. Read `docs/BACKLOG.md` — what's in *Active queue*, *In progress*,
+   *Blocked*. State aloud what I believe the session's next task is
+   and the one after it; that gives the human a chance to redirect
+   before I sink time into the wrong thing.
+3. Read **this file** — operational rules.
+4. Read `docs/ARCHITECTURE.md` — layer contracts.
+5. Glance at `docs/TECHNICAL_SPEC.md` table of contents to locate the
+   current milestone.
+6. Confirm the plan with the human. If the session's task is absent
+   from the backlog, add it in step 1 of the per-task workflow before
+   writing code.
 
 Total setup: ~3 minutes. Then we're productive.
+
+**If you open a session and I haven't read the backlog**, the one-word
+prompt `backlog` is enough — I'll reread and resync.
 </bootstrapping_a_fresh_session>
