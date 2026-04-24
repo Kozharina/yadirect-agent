@@ -288,3 +288,116 @@ class BudgetCapCheck:
                 )
             )
         return AccountBudgetSnapshot(campaigns=next_campaigns)
+
+
+# --------------------------------------------------------------------------
+# Kill-switch #2 — Max CPC per campaign.
+#
+# Blocks bid updates that would push a keyword's CPC above the cap
+# configured for its owning campaign. Independent of BudgetCapCheck:
+# shares only `CheckResult` and the auditor-driven validation style
+# (no negative bids, no duplicate ids, no unknown fields).
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class KeywordSnapshot:
+    """Snapshot of one keyword's current bid-relevant state."""
+
+    keyword_id: int
+    campaign_id: int
+    current_search_bid_rub: float | None = None
+    current_network_bid_rub: float | None = None
+
+
+@dataclass(frozen=True)
+class AccountBidSnapshot:
+    """Every keyword we care about, with its owning campaign and bids."""
+
+    keywords: list[KeywordSnapshot] = field(default_factory=list)
+
+    def find(self, keyword_id: int) -> KeywordSnapshot | None:
+        """Return the snapshot entry for ``keyword_id`` or None."""
+        for k in self.keywords:
+            if k.keyword_id == keyword_id:
+                return k
+        return None
+
+
+class ProposedBidChange(BaseModel):
+    """Safety-layer bid-change proposal.
+
+    Deliberately *not* ``services.bidding.BidUpdate`` — safety is a
+    lower layer than services, so the caller maps its own DTO onto
+    this one before running the check. Validation constraints come
+    from the HIGH findings security-auditor raised on KS#1:
+    - negative bids would shift the comparison and bypass the cap
+    - extra="forbid" so future fields need explicit support
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    keyword_id: int
+    new_search_bid_rub: float | None = Field(default=None, ge=0)
+    new_network_bid_rub: float | None = Field(default=None, ge=0)
+
+
+class MaxCpcPolicy(BaseModel):
+    """Kill-switch #2 policy slice.
+
+    ``campaign_max_cpc_rub`` maps campaign_id → hard cap on any single
+    bid (search or network) within that campaign. A campaign without
+    an entry is unconstrained *by this check* (the account-level
+    BudgetCapCheck still applies). There is no global default cap —
+    if a cap matters, it must be set explicitly.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    campaign_max_cpc_rub: dict[int, float] = Field(
+        default_factory=dict,
+        description="Max allowed single-bid value per campaign_id, in RUB.",
+    )
+
+
+def load_max_cpc_policy(path: Path) -> MaxCpcPolicy:
+    """Read ``agent_policy.yml`` and extract the max-CPC slice.
+
+    Unknown top-level keys are tolerated so the same YAML file can
+    carry fields for every kill-switch without needing a matching
+    loader per slice.
+    """
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    fields = {k: raw[k] for k in ("campaign_max_cpc_rub",) if k in raw}
+    return MaxCpcPolicy.model_validate(fields)
+
+
+def _find_duplicate_keyword_ids(updates: list[ProposedBidChange]) -> list[int]:
+    """Return keyword_ids that appear more than once in ``updates``,
+    in order of first duplicate occurrence. Empty list means unique."""
+    seen: set[int] = set()
+    dupes: list[int] = []
+    for u in updates:
+        if u.keyword_id in seen and u.keyword_id not in dupes:
+            dupes.append(u.keyword_id)
+        seen.add(u.keyword_id)
+    return dupes
+
+
+class MaxCpcCheck:
+    """Block bid updates that would exceed the per-campaign CPC cap.
+
+    Skeleton — always blocks. Real logic lands in the next commit.
+    """
+
+    def __init__(self, policy: MaxCpcPolicy) -> None:
+        self._policy = policy
+
+    def check(
+        self,
+        snapshot: AccountBidSnapshot,
+        updates: list[ProposedBidChange],
+    ) -> CheckResult:
+        _ = snapshot
+        _ = updates
+        return CheckResult.blocked_result("not implemented")
