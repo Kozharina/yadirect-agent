@@ -312,12 +312,23 @@ class BudgetCapCheck:
 
 @dataclass(frozen=True)
 class KeywordSnapshot:
-    """Snapshot of one keyword's current bid-relevant state."""
+    """Snapshot of one keyword's safety-relevant state.
+
+    - KS#2 (max CPC) reads ``campaign_id`` + current bids.
+    - KS#4 (QS guardrail) reads ``quality_score`` + current bids (to
+      detect increases).
+
+    ``quality_score`` is a Direct 0-10 score; ``None`` means unknown
+    (new keyword, Direct hasn't scored it yet). KS#4 treats unknown
+    QS as "skip, don't block" — a missing signal is not evidence of
+    a low QS.
+    """
 
     keyword_id: int
     campaign_id: int
     current_search_bid_rub: float | None = None
     current_network_bid_rub: float | None = None
+    quality_score: int | None = None
 
 
 @dataclass(frozen=True)
@@ -595,3 +606,64 @@ class NegativeKeywordFloorCheck:
                 )
 
         return CheckResult.ok_result()
+
+
+# --------------------------------------------------------------------------
+# Kill-switch #4 — Quality Score guardrail.
+#
+# QS is a *constraint*, not an objective. Refuse to raise a bid on a
+# keyword whose current QS is below policy, because raising CPC on a
+# low-QS keyword both wastes money (low QS → high actual CPC per click)
+# and risks further QS degradation at serving time. Source:
+# docs/TECHNICAL_SPEC.md §M2.0 rule 4 and §M2.6.
+#
+# Explicitly *not* in this PR (see BACKLOG):
+# - §M2.6 campaign-median QS tracking over 7 days.
+# - Alert emission when medial QS drops >1 point.
+# Those need historical snapshots; KS#4 here is the single-point
+# gate that fires at plan-check time.
+# --------------------------------------------------------------------------
+
+
+class QualityScoreGuardPolicy(BaseModel):
+    """Kill-switch #4 policy slice.
+
+    ``min_quality_score_for_bid_increase`` is the Direct QS floor below
+    which an explicit bid increase is refused. Direct QS is a 0-10
+    integer; policy defaults to 5 per §M2.1.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    min_quality_score_for_bid_increase: int = Field(
+        default=5,
+        ge=0,
+        le=10,
+        description="Keywords with QS below this value may not be bid up.",
+    )
+
+
+def load_quality_score_guard_policy(path: Path) -> QualityScoreGuardPolicy:
+    """Read ``agent_policy.yml`` and extract the QS-guardrail slice."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    fields = {k: raw[k] for k in ("min_quality_score_for_bid_increase",) if k in raw}
+    return QualityScoreGuardPolicy.model_validate(fields)
+
+
+class QualityScoreGuardCheck:
+    """Block bid *increases* on keywords whose QS is below policy.
+
+    Skeleton — always blocks. Real logic lands in the next commit.
+    """
+
+    def __init__(self, policy: QualityScoreGuardPolicy) -> None:
+        self._policy = policy
+
+    def check(
+        self,
+        snapshot: AccountBidSnapshot,
+        updates: list[ProposedBidChange],
+    ) -> CheckResult:
+        _ = snapshot
+        _ = updates
+        return CheckResult.blocked_result("not implemented")

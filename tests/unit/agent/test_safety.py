@@ -26,9 +26,12 @@ from yadirect_agent.agent.safety import (
     NegativeKeywordFloorCheck,
     NegativeKeywordFloorPolicy,
     ProposedBidChange,
+    QualityScoreGuardCheck,
+    QualityScoreGuardPolicy,
     load_budget_cap_policy,
     load_max_cpc_policy,
     load_negative_keyword_floor_policy,
+    load_quality_score_guard_policy,
 )
 
 # --------------------------------------------------------------------------
@@ -962,3 +965,276 @@ class TestNegativeKeywordFloorAuditorFindings:
         # Tabs + spaces only — same problem.
         with pytest.raises(ValidationError):
             NegativeKeywordFloorPolicy(required_negative_keywords=["\t \t"])
+
+
+# ==========================================================================
+# Kill-switch #4 — Quality Score guardrail.
+# ==========================================================================
+
+
+def _kw_with_qs(
+    kid: int,
+    *,
+    campaign_id: int = 100,
+    qs: int | None = 5,
+    search: float | None = 10.0,
+    network: float | None = None,
+) -> KeywordSnapshot:
+    """Test helper: a keyword with a QS and a current bid set."""
+    return KeywordSnapshot(
+        keyword_id=kid,
+        campaign_id=campaign_id,
+        current_search_bid_rub=search,
+        current_network_bid_rub=network,
+        quality_score=qs,
+    )
+
+
+def _qs_policy(threshold: int = 5) -> QualityScoreGuardPolicy:
+    return QualityScoreGuardPolicy(min_quality_score_for_bid_increase=threshold)
+
+
+class TestQualityScoreGuardPolicyValidation:
+    def test_default_threshold_is_five(self) -> None:
+        # Per §M2.1 default — QS 5 is the tipping point where Direct
+        # starts seriously penalising CPC, so it's the de-facto floor.
+        p = QualityScoreGuardPolicy()
+        assert p.min_quality_score_for_bid_increase == 5
+
+    def test_accepts_zero_threshold(self) -> None:
+        # Zero means the kill-switch is practically disabled but
+        # intentional — policy may want to route through other guards.
+        p = _qs_policy(0)
+        assert p.min_quality_score_for_bid_increase == 0
+
+    def test_accepts_max_threshold_ten(self) -> None:
+        p = _qs_policy(10)
+        assert p.min_quality_score_for_bid_increase == 10
+
+    def test_rejects_above_ten(self) -> None:
+        # Direct QS range is 0-10; 11 is malformed.
+        with pytest.raises(ValidationError):
+            _qs_policy(11)
+
+    def test_rejects_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            _qs_policy(-1)
+
+    def test_rejects_extra_fields(self) -> None:
+        with pytest.raises(ValidationError):
+            QualityScoreGuardPolicy.model_validate({"unknown": 1})
+
+    def test_policy_is_immutable(self) -> None:
+        p = _qs_policy(5)
+        with pytest.raises(ValidationError):
+            p.min_quality_score_for_bid_increase = 9  # type: ignore[misc]
+
+
+class TestLoadQualityScoreGuardPolicy:
+    def test_loads_from_yaml(self, tmp_path: Path) -> None:
+        path = tmp_path / "agent_policy.yml"
+        path.write_text("min_quality_score_for_bid_increase: 6\n", encoding="utf-8")
+        p = load_quality_score_guard_policy(path)
+        assert p.min_quality_score_for_bid_increase == 6
+
+    def test_default_when_key_missing(self, tmp_path: Path) -> None:
+        # Missing key → default (5).
+        path = tmp_path / "agent_policy.yml"
+        path.write_text("account_daily_budget_cap_rub: 10000\n", encoding="utf-8")
+        p = load_quality_score_guard_policy(path)
+        assert p.min_quality_score_for_bid_increase == 5
+
+
+class TestQualityScoreGuardCheckHappyPath:
+    def test_ok_with_no_updates(self) -> None:
+        check = QualityScoreGuardCheck(_qs_policy(5))
+        snapshot = AccountBidSnapshot(keywords=[_kw_with_qs(1, qs=3)])
+
+        result = check.check(snapshot, [])
+
+        assert result.status == "ok"
+
+    def test_ok_when_bid_is_not_increasing(self) -> None:
+        # Same or lower bid — kill-switch #4 never blocks a decrease,
+        # regardless of QS.
+        check = QualityScoreGuardCheck(_qs_policy(5))
+        snapshot = AccountBidSnapshot(keywords=[_kw_with_qs(1, qs=2, search=10.0)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_search_bid_rub=8.0)],
+        )
+
+        assert result.status == "ok"
+
+    def test_ok_when_bid_is_increasing_and_qs_meets_threshold(self) -> None:
+        check = QualityScoreGuardCheck(_qs_policy(5))
+        snapshot = AccountBidSnapshot(keywords=[_kw_with_qs(1, qs=7, search=10.0)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_search_bid_rub=15.0)],
+        )
+
+        assert result.status == "ok"
+
+    def test_ok_when_qs_exactly_at_threshold(self) -> None:
+        # Strict `<` blocks; equality is ok.
+        check = QualityScoreGuardCheck(_qs_policy(5))
+        snapshot = AccountBidSnapshot(keywords=[_kw_with_qs(1, qs=5, search=10.0)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_search_bid_rub=15.0)],
+        )
+
+        assert result.status == "ok"
+
+    def test_ok_when_quality_score_is_unknown(self) -> None:
+        # QS=None means Direct hasn't scored this keyword yet (new
+        # keyword). A missing signal is not evidence of a bad signal;
+        # KS#4 defers. Agent should set QS before retrying.
+        check = QualityScoreGuardCheck(_qs_policy(5))
+        snapshot = AccountBidSnapshot(keywords=[_kw_with_qs(1, qs=None, search=10.0)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_search_bid_rub=15.0)],
+        )
+
+        assert result.status == "ok"
+
+    def test_ok_when_current_bid_is_unknown(self) -> None:
+        # current_search_bid_rub=None → we can't judge "increasing".
+        # Don't block by default; agent should read bids first.
+        check = QualityScoreGuardCheck(_qs_policy(5))
+        snapshot = AccountBidSnapshot(keywords=[_kw_with_qs(1, qs=2, search=None, network=None)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_search_bid_rub=15.0)],
+        )
+
+        assert result.status == "ok"
+
+
+class TestQualityScoreGuardCheckBlocks:
+    def test_blocked_when_raising_search_bid_with_low_qs(self) -> None:
+        check = QualityScoreGuardCheck(_qs_policy(5))
+        snapshot = AccountBidSnapshot(keywords=[_kw_with_qs(1, qs=3, search=10.0)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_search_bid_rub=15.0)],
+        )
+
+        assert result.status == "blocked"
+        assert result.details.get("keyword_id") == 1
+        assert result.details.get("quality_score") == 3
+        assert result.details.get("threshold") == 5
+        assert result.details.get("bid_type") == "search"
+
+    def test_blocked_when_raising_network_bid_with_low_qs(self) -> None:
+        check = QualityScoreGuardCheck(_qs_policy(5))
+        snapshot = AccountBidSnapshot(keywords=[_kw_with_qs(1, qs=3, search=None, network=5.0)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_network_bid_rub=8.0)],
+        )
+
+        assert result.status == "blocked"
+        assert result.details.get("bid_type") == "network"
+        assert result.details.get("quality_score") == 3
+
+    def test_blocks_on_search_when_both_fields_raise_low_qs(self) -> None:
+        # Pin search-before-network evaluation order (matches KS#2).
+        check = QualityScoreGuardCheck(_qs_policy(5))
+        snapshot = AccountBidSnapshot(keywords=[_kw_with_qs(1, qs=2, search=10.0, network=5.0)])
+
+        result = check.check(
+            snapshot,
+            [
+                ProposedBidChange(
+                    keyword_id=1,
+                    new_search_bid_rub=15.0,
+                    new_network_bid_rub=8.0,
+                )
+            ],
+        )
+
+        assert result.status == "blocked"
+        assert result.details.get("bid_type") == "search"
+
+    def test_first_violation_wins(self) -> None:
+        check = QualityScoreGuardCheck(_qs_policy(5))
+        snapshot = AccountBidSnapshot(
+            keywords=[
+                _kw_with_qs(1, qs=8, search=10.0),
+                _kw_with_qs(2, qs=2, search=10.0),
+            ]
+        )
+
+        result = check.check(
+            snapshot,
+            [
+                ProposedBidChange(keyword_id=1, new_search_bid_rub=15.0),
+                ProposedBidChange(keyword_id=2, new_search_bid_rub=15.0),
+            ],
+        )
+
+        assert result.status == "blocked"
+        assert result.details.get("keyword_id") == 2
+
+    def test_blocks_duplicate_keyword_ids_in_updates(self) -> None:
+        # Shared guard — already in the helper.
+        check = QualityScoreGuardCheck(_qs_policy(5))
+        snapshot = AccountBidSnapshot(keywords=[_kw_with_qs(1, qs=8)])
+
+        result = check.check(
+            snapshot,
+            [
+                ProposedBidChange(keyword_id=1, new_search_bid_rub=15.0),
+                ProposedBidChange(keyword_id=1, new_network_bid_rub=8.0),
+            ],
+        )
+
+        assert result.status == "blocked"
+        assert "duplicate" in (result.reason or "").lower()
+
+    def test_silently_skips_unknown_keyword_id(self) -> None:
+        check = QualityScoreGuardCheck(_qs_policy(5))
+        snapshot = AccountBidSnapshot(keywords=[_kw_with_qs(1, qs=8)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=999, new_search_bid_rub=15.0)],
+        )
+
+        assert result.status == "ok"
+
+    def test_does_not_block_lowering_bid_on_low_qs_keyword(self) -> None:
+        # Edge: QS is below threshold but the agent is *lowering* the
+        # bid. This is exactly what an operator would want (save money
+        # on a low-QS keyword). Must not block.
+        check = QualityScoreGuardCheck(_qs_policy(5))
+        snapshot = AccountBidSnapshot(keywords=[_kw_with_qs(1, qs=2, search=10.0)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_search_bid_rub=5.0)],
+        )
+
+        assert result.status == "ok"
+
+    def test_does_not_block_equal_bid_on_low_qs_keyword(self) -> None:
+        # Same-value update is a no-op, not an increase.
+        check = QualityScoreGuardCheck(_qs_policy(5))
+        snapshot = AccountBidSnapshot(keywords=[_kw_with_qs(1, qs=2, search=10.0)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_search_bid_rub=10.0)],
+        )
+
+        assert result.status == "ok"
