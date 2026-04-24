@@ -1,0 +1,59 @@
+# Dependabot configuration.
+#
+# Rationale: the agent links user money to a third-party advertising API
+# through a small-but-growing dependency graph. A malicious or
+# accidentally broken update — in httpx, anthropic, tenacity — would
+# land on main silently if we relied on manual bumps.
+#
+# Strategy:
+# - Weekly cadence (lower review cost than daily for a solo project).
+# - Grouped minor / patch updates to reduce noise — one PR per week per
+#   ecosystem when there's anything to bump.
+# - Labels so the PRs are filterable and the review tier is obvious.
+# - Security updates are NOT grouped and run on Dependabot's own
+#   schedule regardless of the weekly cadence.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Moscow
+    groups:
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+    labels:
+      - dependencies
+      - python
+    commit-message:
+      prefix: chore
+      prefix-development: chore
+      include: scope
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Moscow
+    groups:
+      all-actions:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+          - major
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: ci
+      include: scope
+    open-pull-requests-limit: 3

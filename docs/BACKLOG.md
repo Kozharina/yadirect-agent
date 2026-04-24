@@ -24,9 +24,6 @@ Ordered — top is what I take next.
 
 ### 🔥 Before M2 (safety)
 
-- [ ] **PR-B: security baseline** — `SECURITY.md` (disclosure policy via
-      GitHub Security Advisories) + `.github/dependabot.yml` (weekly
-      grouped) + enable CodeQL workflow. `chore: / docs:`, TDD exempt.
 - [ ] **M7.1 dotyazhka**: `tests/unit/services/test_bidding.py` +
       `tests/unit/services/test_semantics.py`. First proper TDD PR:
       tests per behaviour, red commit → green commit pairs visible.
@@ -167,6 +164,12 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **PR-B: security baseline** — `SECURITY.md` (GH private advisory
+      workflow), `.github/dependabot.yml` (weekly, grouped, labeled
+      `dependencies`/`python` and `github-actions`),
+      `.github/workflows/codeql.yml` (push + PR + weekly cron, pack
+      `security-and-quality`, Python only).
+- [x] **docs(backlog): introduce BACKLOG.md + rules** — merged as #5.
 - [x] **PR-A: coverage gate** — `pytest-cov` (`--cov-fail-under=78`),
       `pytest-randomly`, `pytest-timeout=10` with two retry tests
       explicitly marked `timeout=60`. Merged as #4.
