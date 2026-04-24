@@ -24,9 +24,6 @@ Ordered — top is what I take next.
 
 ### 🔥 Before M2 (safety)
 
-- [ ] **PR-C: `yadirect-agent doctor` command** — env + Anthropic +
-      Direct sandbox + policy-file diagnostics. TDD. See
-      [§M1.4](./TECHNICAL_SPEC.md) context for CLI conventions.
 
 ### 🛡️ M2 — safety layer (one PR per kill-switch)
 
@@ -171,6 +168,12 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **PR-C: yadirect-agent doctor command** — four checks
+      (env / policy file / Anthropic ping / Direct sandbox ping),
+      coloured table output, exit 2 on any failure. Delivered as
+      a clean RED → GREEN pair: failing tests + skeleton first,
+      real implementations + typer wiring second. Coverage 85.7%
+      → 87.0%.
 - [x] **M7.1 dotyazhka** — `test_semantics.py` (20 tests covering
       normalize / _cluster_key / collect / validate_with_direct) +
       `test_bidding.py` (6 tests pinning rubles→micro conversion,
