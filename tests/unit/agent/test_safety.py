@@ -34,12 +34,16 @@ from yadirect_agent.agent.safety import (
     ProposedBidChange,
     QualityScoreGuardCheck,
     QualityScoreGuardPolicy,
+    QueryDriftCheck,
+    QueryDriftPolicy,
+    SearchQueriesSnapshot,
     load_budget_balance_drift_policy,
     load_budget_cap_policy,
     load_conversion_integrity_policy,
     load_max_cpc_policy,
     load_negative_keyword_floor_policy,
     load_quality_score_guard_policy,
+    load_query_drift_policy,
 )
 
 # --------------------------------------------------------------------------
@@ -1900,4 +1904,226 @@ class TestConversionIntegrityAuditorFindings:
 
         result = check.check(baseline, current)
 
+        assert result.status == "ok"
+
+
+# ==========================================================================
+# Kill-switch #7 — Query drift detector.
+# ==========================================================================
+
+
+def _queries(*qs: str, counter_id: int = 1) -> SearchQueriesSnapshot:
+    return SearchQueriesSnapshot(counter_id=counter_id, queries=list(qs))
+
+
+def _qd_policy(max_share: float = 0.4) -> QueryDriftPolicy:
+    return QueryDriftPolicy(max_new_query_share=max_share)
+
+
+class TestQueryDriftPolicyValidation:
+    def test_default_share_is_forty_percent(self) -> None:
+        p = QueryDriftPolicy()
+        assert p.max_new_query_share == 0.4
+
+    def test_accepts_boundary_values(self) -> None:
+        for v in (0.0, 0.5, 1.0):
+            assert _qd_policy(v).max_new_query_share == v
+
+    def test_rejects_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            _qd_policy(-0.1)
+
+    def test_rejects_above_one(self) -> None:
+        with pytest.raises(ValidationError):
+            _qd_policy(1.5)
+
+    def test_rejects_extra_fields(self) -> None:
+        with pytest.raises(ValidationError):
+            QueryDriftPolicy.model_validate({"unknown": 1})
+
+    def test_policy_is_immutable(self) -> None:
+        p = _qd_policy()
+        with pytest.raises(ValidationError):
+            p.max_new_query_share = 0.5  # type: ignore[misc]
+
+
+class TestLoadQueryDriftPolicy:
+    def test_loads_from_yaml(self, tmp_path: Path) -> None:
+        path = tmp_path / "agent_policy.yml"
+        path.write_text("max_new_query_share: 0.25\n", encoding="utf-8")
+        p = load_query_drift_policy(path)
+        assert p.max_new_query_share == 0.25
+
+    def test_default_when_key_missing(self, tmp_path: Path) -> None:
+        path = tmp_path / "agent_policy.yml"
+        path.write_text("account_daily_budget_cap_rub: 5000\n", encoding="utf-8")
+        p = load_query_drift_policy(path)
+        assert p.max_new_query_share == 0.4
+
+
+class TestSearchQueriesSnapshotNormalisation:
+    def test_normalises_case_whitespace_and_dedupes(self) -> None:
+        s = _queries("Купить обувь", "купить  обувь", "  КУПИТЬ обувь  ")
+        assert s.normalised() == frozenset({"купить обувь"})
+
+    def test_drops_empty_and_whitespace_only(self) -> None:
+        s = _queries("", "   ", "купить обувь")
+        assert s.normalised() == frozenset({"купить обувь"})
+
+    def test_empty_snapshot_returns_empty_frozenset(self) -> None:
+        s = _queries()
+        assert s.normalised() == frozenset()
+
+
+class TestQueryDriftHappyPath:
+    def test_ok_when_current_is_subset_of_baseline(self) -> None:
+        check = QueryDriftCheck(_qd_policy(0.4))
+        baseline = _queries("a", "b", "c", "d", "e")
+        current = _queries("a", "b")  # zero new
+
+        result = check.check(baseline, current)
+
+        assert result.status == "ok"
+
+    def test_ok_when_new_share_below_threshold(self) -> None:
+        # Threshold 0.4. Current: a,b,c,d (4 queries), baseline has
+        # a,b,c (3 present), new = {d} → 1/4 = 0.25 < 0.4.
+        check = QueryDriftCheck(_qd_policy(0.4))
+        baseline = _queries("a", "b", "c")
+        current = _queries("a", "b", "c", "d")
+
+        result = check.check(baseline, current)
+
+        assert result.status == "ok"
+
+    def test_ok_when_new_share_exactly_at_threshold(self) -> None:
+        # Strict `>` blocks; equality is ok. 2 new out of 5 = 0.4.
+        check = QueryDriftCheck(_qd_policy(0.4))
+        baseline = _queries("a", "b", "c")
+        current = _queries("a", "b", "c", "d", "e")  # 2 new / 5 current
+
+        result = check.check(baseline, current)
+
+        assert result.status == "ok"
+
+    def test_case_and_whitespace_variants_match(self) -> None:
+        # "Купить обувь" in baseline and "  КУПИТЬ обувь  " in current
+        # must be treated as the same query.
+        check = QueryDriftCheck(_qd_policy(0.4))
+        baseline = _queries("Купить обувь")
+        current = _queries("  купить  обувь  ")  # same after normalisation
+
+        result = check.check(baseline, current)
+
+        assert result.status == "ok"
+
+
+class TestQueryDriftBlocks:
+    def test_blocked_when_new_share_above_threshold(self) -> None:
+        # 3 new / 5 current = 0.6 > 0.4.
+        check = QueryDriftCheck(_qd_policy(0.4))
+        baseline = _queries("a", "b", "c")
+        current = _queries("a", "b", "new1", "new2", "new3")
+
+        result = check.check(baseline, current)
+
+        assert result.status == "blocked"
+        assert result.details.get("new_share") == pytest.approx(0.6)
+        assert result.details.get("threshold") == 0.4
+        # sample of offending queries surfaces for human review.
+        sample = result.details.get("new_queries_sample", [])
+        assert set(sample) <= {"new1", "new2", "new3"}
+        assert result.details.get("current_size") == 5
+        assert result.details.get("new_count") == 3
+
+    def test_blocked_when_all_queries_are_new(self) -> None:
+        check = QueryDriftCheck(_qd_policy(0.4))
+        baseline = _queries("a", "b")
+        current = _queries("x", "y", "z")  # 100% new
+
+        result = check.check(baseline, current)
+
+        assert result.status == "blocked"
+        assert result.details.get("new_share") == pytest.approx(1.0)
+
+    def test_blocks_on_counter_id_mismatch(self) -> None:
+        # Same safeguard as KS#6: the two snapshots must describe the
+        # same Metrika counter.
+        check = QueryDriftCheck(_qd_policy(0.4))
+        baseline = SearchQueriesSnapshot(counter_id=1, queries=["a"])
+        current = SearchQueriesSnapshot(counter_id=2, queries=["a"])
+
+        result = check.check(baseline, current)
+
+        assert result.status == "blocked"
+        assert "counter_id" in (result.reason or "").lower()
+
+
+class TestQueryDriftEdgeCases:
+    def test_warns_when_baseline_is_empty(self) -> None:
+        # First-run / missing-backfill. Same pattern as KS#5/KS#6.
+        check = QueryDriftCheck(_qd_policy(0.4))
+        baseline = _queries()
+        current = _queries("a", "b", "c")
+
+        result = check.check(baseline, current)
+
+        assert result.status == "warn"
+        assert "baseline" in (result.reason or "").lower()
+
+    def test_warns_when_current_is_empty(self) -> None:
+        # No search queries observed — likely an ops issue, not
+        # necessarily drift. Warn instead of block so the pipeline
+        # surfaces it without aborting everything.
+        check = QueryDriftCheck(_qd_policy(0.4))
+        baseline = _queries("a", "b")
+        current = _queries()
+
+        result = check.check(baseline, current)
+
+        assert result.status == "warn"
+
+    def test_warns_when_both_are_empty(self) -> None:
+        check = QueryDriftCheck(_qd_policy(0.4))
+        baseline = _queries()
+        current = _queries()
+
+        result = check.check(baseline, current)
+
+        assert result.status == "warn"
+
+    def test_baseline_whitespace_and_case_do_not_inflate_drift(self) -> None:
+        # Corner case: baseline has "ОБУВЬ" and "обувь " as two raw
+        # entries; they must collapse to one before comparison.
+        check = QueryDriftCheck(_qd_policy(0.4))
+        baseline = _queries("ОБУВЬ", "обувь ")
+        current = _queries("обувь", "сапоги")  # 50% new — above threshold
+
+        # But the baseline's two raw entries collapse to {"обувь"}, so
+        # this is 50% new regardless. Block.
+        result = check.check(baseline, current)
+
+        assert result.status == "blocked"
+        assert result.details.get("current_size") == 2
+        assert result.details.get("new_count") == 1
+
+    def test_max_share_zero_blocks_any_new_query(self) -> None:
+        # Operator wants zero drift tolerance.
+        check = QueryDriftCheck(_qd_policy(0.0))
+        baseline = _queries("a", "b")
+        current = _queries("a", "b", "c")
+
+        result = check.check(baseline, current)
+
+        assert result.status == "blocked"
+
+    def test_max_share_one_permits_all_new(self) -> None:
+        check = QueryDriftCheck(_qd_policy(1.0))
+        baseline = _queries("a")
+        current = _queries("x", "y", "z")  # 100% new
+
+        result = check.check(baseline, current)
+
+        # 1.0 means "anything up to 100% is ok" — strict `>` means
+        # even 100% passes (1.0 not > 1.0).
         assert result.status == "ok"

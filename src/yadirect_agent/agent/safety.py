@@ -1154,3 +1154,98 @@ class ConversionIntegrityCheck:
             baseline_total=baseline_total,
             current_total=current_total,
         )
+
+
+# --------------------------------------------------------------------------
+# Kill-switch #7 — Query drift detector.
+#
+# Second system-level gatekeeper (alongside KS#6). Compares two sets
+# of observed search queries — baseline (e.g. last week) and current
+# (e.g. today) — and blocks when the share of *new* queries (present
+# in current, absent in baseline) exceeds a configured fraction.
+# Signals that Direct may have started showing ads to an unintended
+# audience (broad-match drift, bid-strategy anomaly, etc).
+#
+# Matching is case- and whitespace-insensitive and Unicode-canonical
+# (NFC) via the shared ``_normalize_keyword`` helper introduced for
+# KS#3. Duplicate entries within a snapshot collapse to one via set
+# semantics.
+#
+# Out of scope for this PR (BACKLOG):
+# - Real Metrika / Direct API integration (§M6).
+# - Reach-weighted drift (new queries with many impressions vs a
+#   handful) — today the check is population-based, not impression-
+#   weighted. A future refinement could require baseline/current
+#   impressions per query.
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SearchQueriesSnapshot:
+    """Distinct search queries observed over one reporting window.
+
+    ``queries`` is a list on the wire (YAML / API) but folds to a
+    normalised set for comparison. Callers shouldn't assume the list
+    is deduplicated or canonicalised; that work happens in
+    ``normalised()``.
+    """
+
+    counter_id: int
+    queries: list[str] = field(default_factory=list)
+
+    def normalised(self) -> frozenset[str]:
+        """Return the set of NFC / stripped / lower-cased non-empty queries."""
+        out: set[str] = set()
+        for q in self.queries:
+            norm = _normalize_keyword(q)
+            if norm:
+                out.add(norm)
+        return frozenset(out)
+
+
+class QueryDriftPolicy(BaseModel):
+    """Kill-switch #7 policy slice.
+
+    ``max_new_query_share`` is the strict upper bound on
+    ``|new_queries| / |current_queries|`` before the plan is refused.
+    Default 0.4 per §M2.1 — a run where 40%+ of today's queries did
+    not exist a week ago is almost always an audience-targeting
+    anomaly worth a human's eyes.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    max_new_query_share: float = Field(
+        default=0.4,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Max share of current queries that may be absent from the baseline snapshot, in [0, 1]."
+        ),
+    )
+
+
+def load_query_drift_policy(path: Path) -> QueryDriftPolicy:
+    """Read ``agent_policy.yml`` and extract the query-drift slice."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    fields = {k: raw[k] for k in ("max_new_query_share",) if k in raw}
+    return QueryDriftPolicy.model_validate(fields)
+
+
+class QueryDriftCheck:
+    """Block plans when today's query mix drifted too far from baseline.
+
+    Skeleton — always blocks. Real logic lands in the next commit.
+    """
+
+    def __init__(self, policy: QueryDriftPolicy) -> None:
+        self._policy = policy
+
+    def check(
+        self,
+        baseline: SearchQueriesSnapshot,
+        current: SearchQueriesSnapshot,
+    ) -> CheckResult:
+        _ = baseline
+        _ = current
+        return CheckResult.blocked_result("not implemented")
