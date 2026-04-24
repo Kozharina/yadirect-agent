@@ -778,3 +778,76 @@ class QualityScoreGuardCheck:
         if new is None or current is None:
             return False
         return new > current
+
+
+# --------------------------------------------------------------------------
+# Kill-switch #5 — Budget-balance drift.
+#
+# Refuses plans that would shift a single campaign's share of the daily
+# account budget by more than a configured number of percentage points
+# vs. a baseline (yesterday's) distribution. Protects against the
+# "agent poured everything into one campaign overnight" failure mode.
+# Source: docs/TECHNICAL_SPEC.md §M2.0 rule 5.
+#
+# First kill-switch with a temporal dimension: the check takes two
+# snapshots (baseline + current) and projects changes onto the current
+# to produce a "projected" distribution, then compares per-campaign
+# shares. Distances are in absolute percentage points.
+#
+# Out of scope for this PR (BACKLOG): historical snapshot store with
+# rolling windows, cross-day baseline rotation, alerts on sustained
+# drift. Here the check is a single-call function that treats the
+# `baseline` argument as ground truth.
+# --------------------------------------------------------------------------
+
+
+class BudgetBalanceDriftPolicy(BaseModel):
+    """Kill-switch #5 policy slice.
+
+    ``max_shift_pct_per_day`` is the hard ceiling on how much any
+    single campaign's share of the active daily budget may move in
+    absolute percentage points between yesterday's baseline and the
+    projected state after changes apply. A default of ``0.3`` matches
+    §M2.1 (a 30-percentage-point shift is already enough to materially
+    restructure an account's delivery profile).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    max_shift_pct_per_day: float = Field(
+        default=0.3,
+        gt=0,
+        le=1,
+        description=(
+            "Max absolute change in a campaign's share of account-level "
+            "active budget, expressed as a [0, 1] fraction of total."
+        ),
+    )
+
+
+def load_budget_balance_drift_policy(path: Path) -> BudgetBalanceDriftPolicy:
+    """Read ``agent_policy.yml`` and extract the balance-drift slice."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    fields = {k: raw[k] for k in ("max_shift_pct_per_day",) if k in raw}
+    return BudgetBalanceDriftPolicy.model_validate(fields)
+
+
+class BudgetBalanceDriftCheck:
+    """Block plans that redistribute account budget too aggressively.
+
+    Skeleton — always blocks. Real logic lands in the next commit.
+    """
+
+    def __init__(self, policy: BudgetBalanceDriftPolicy) -> None:
+        self._policy = policy
+
+    def check(
+        self,
+        baseline: AccountBudgetSnapshot,
+        snapshot: AccountBudgetSnapshot,
+        changes: list[BudgetChange],
+    ) -> CheckResult:
+        _ = baseline
+        _ = snapshot
+        _ = changes
+        return CheckResult.blocked_result("not implemented")
