@@ -85,7 +85,7 @@ def test_doctor_exits_nonzero_when_any_check_fails(
 
     monkeypatch.setattr(cli_module, "_run_doctor_checks", fake_run_checks)
 
-    result = runner.invoke(app, ["doctor"])
+    result = runner.invoke(cli_module.app, ["doctor"])
 
     assert result.exit_code == 2, result.output
     assert "fail" in result.output.lower()
@@ -109,7 +109,7 @@ def test_doctor_warn_does_not_set_failure_exit(
 
     monkeypatch.setattr(cli_module, "_run_doctor_checks", fake_run_checks)
 
-    result = runner.invoke(app, ["doctor"])
+    result = runner.invoke(cli_module.app, ["doctor"])
 
     assert result.exit_code == 0, result.output
     assert "warn" in result.output.lower()
