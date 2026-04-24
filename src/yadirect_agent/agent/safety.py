@@ -27,12 +27,13 @@ rather than ``ImportError`` (wrong reason).
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 CheckStatus = Literal["ok", "blocked", "warn"]
 
@@ -77,13 +78,22 @@ class CheckResult:
 
 @dataclass(frozen=True)
 class CampaignBudget:
-    """Snapshot of one campaign's budget-relevant state."""
+    """Snapshot of one campaign's safety-relevant state.
+
+    Used by every kill-switch that needs per-campaign context:
+    - KS#1 (budget caps) reads ``daily_budget_rub`` + ``state`` + ``group``.
+    - KS#3 (negative-keyword floor) reads ``negative_keywords``.
+
+    Future kill-switches can add fields with defaults; existing tests
+    stay green because nothing constructs this shape positionally.
+    """
 
     id: int
     name: str
     daily_budget_rub: float
     state: str  # "ON" | "SUSPENDED" | "OFF" | "ENDED" | ...
     group: str | None = None  # None = no group label; unscoped by group caps
+    negative_keywords: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True)
@@ -450,6 +460,138 @@ class MaxCpcCheck:
                     bid_type="network",
                     proposed_rub=u.new_network_bid_rub,
                     cap_rub=cap,
+                )
+
+        return CheckResult.ok_result()
+
+
+# --------------------------------------------------------------------------
+# Kill-switch #3 — Negative-keyword floor.
+#
+# Refuses to resume a campaign that does not carry every phrase in the
+# required-negatives list. Source: docs/TECHNICAL_SPEC.md §M2.0 rule 3
+# and docs/PRIOR_ART.md "Agentic PPC Campaign Management". Reuses the
+# KS#1 data shapes (CampaignBudget, AccountBudgetSnapshot, BudgetChange)
+# because every resume is already represented there as
+# BudgetChange(new_state="ON").
+# --------------------------------------------------------------------------
+
+
+class NegativeKeywordFloorPolicy(BaseModel):
+    """Kill-switch #3 policy slice.
+
+    Matching is case-insensitive, whitespace-trimmed, and
+    Unicode-normalised (NFC) — an operator writing ``"Бесплатно"`` in
+    YAML must match a campaign's existing ``"бесплатно "`` without
+    manual curation, and NFC/NFD encoding differences from the API
+    must not create false mismatches.
+
+    Empty/whitespace-only entries are rejected at load time: a ``""``
+    would collapse to an empty required-set element, blocking every
+    resume and creating a denial-of-service on the safety gate
+    (security-auditor MEDIUM finding on KS#3).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    required_negative_keywords: list[str] = Field(
+        default_factory=list,
+        description="Phrases every campaign must carry before being resumed.",
+    )
+
+    @field_validator("required_negative_keywords")
+    @classmethod
+    def _reject_blank_entries(cls, values: list[str]) -> list[str]:
+        for v in values:
+            if not v or not v.strip():
+                msg = "required_negative_keywords must not contain empty or whitespace-only entries"
+                raise ValueError(msg)
+        return values
+
+
+def load_negative_keyword_floor_policy(path: Path) -> NegativeKeywordFloorPolicy:
+    """Read ``agent_policy.yml`` and extract the negative-keyword floor slice."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    fields = {k: raw[k] for k in ("required_negative_keywords",) if k in raw}
+    return NegativeKeywordFloorPolicy.model_validate(fields)
+
+
+def _normalize_keyword(phrase: str) -> str:
+    """Fold a phrase for case-insensitive, whitespace-forgiving,
+    Unicode-canonicalised comparison.
+
+    Normalisation order: NFC first (so NFD-decomposed input from the
+    API folds to the canonical composed form), then strip whitespace,
+    then lowercase. Keeps safety-layer independent of
+    services.semantics.
+
+    Without the NFC step, a campaign keyword returned by the Direct
+    API in NFD form (where each combining letter like U+0439 CYRILLIC
+    SMALL LETTER SHORT I decomposes into U+0438 + U+0306) would not
+    match a policy written in the composed NFC form. That's a silent
+    false-positive block in one direction and a potential false
+    negative in the other. Auditor HIGH finding on KS#3.
+    """
+    return unicodedata.normalize("NFC", phrase).strip().lower()
+
+
+class NegativeKeywordFloorCheck:
+    """Block resume operations on campaigns lacking the required negatives.
+
+    Pipeline:
+    1. Reject the whole batch if any campaign_id appears twice in
+       ``changes`` (shared guard with KS#1/#2).
+    2. If the policy's required list is empty, every resume is fine.
+    3. For each change whose ``new_state == "ON"`` (a resume), look
+       the campaign up in the snapshot. Unknown ids skip silently
+       (BACKLOG item covers the warn-level surfacing).
+    4. Normalise required and existing negatives (strip + lower), then
+       verify that the campaign's set is a superset of the required.
+       Block on the first campaign missing anything.
+
+    Non-resume changes (pause, budget-only) are not this kill-switch's
+    concern and pass through.
+    """
+
+    def __init__(self, policy: NegativeKeywordFloorPolicy) -> None:
+        self._policy = policy
+
+    def check(
+        self,
+        snapshot: AccountBudgetSnapshot,
+        changes: list[BudgetChange],
+    ) -> CheckResult:
+        duplicates = _find_duplicate_ids(changes)
+        if duplicates:
+            first = duplicates[0]
+            return CheckResult.blocked_result(
+                f"duplicate campaign_id in changes: {first}",
+                campaign_id=first,
+                duplicates=duplicates,
+            )
+
+        required = {_normalize_keyword(p) for p in self._policy.required_negative_keywords}
+        if not required:
+            return CheckResult.ok_result()
+
+        by_id = {c.id: c for c in snapshot.campaigns}
+        for change in changes:
+            if change.new_state != "ON":
+                continue
+            campaign = by_id.get(change.campaign_id)
+            if campaign is None:
+                # tech-debt: surface as warn in M2.3 audit.
+                continue
+            existing = {_normalize_keyword(kw) for kw in campaign.negative_keywords}
+            missing = sorted(required - existing)
+            if missing:
+                return CheckResult.blocked_result(
+                    (
+                        f"campaign {campaign.id} is missing required negative "
+                        f"keywords: {', '.join(missing)}"
+                    ),
+                    campaign_id=campaign.id,
+                    missing=missing,
                 )
 
         return CheckResult.ok_result()

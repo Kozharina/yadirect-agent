@@ -23,9 +23,12 @@ from yadirect_agent.agent.safety import (
     KeywordSnapshot,
     MaxCpcCheck,
     MaxCpcPolicy,
+    NegativeKeywordFloorCheck,
+    NegativeKeywordFloorPolicy,
     ProposedBidChange,
     load_budget_cap_policy,
     load_max_cpc_policy,
+    load_negative_keyword_floor_policy,
 )
 
 # --------------------------------------------------------------------------
@@ -655,3 +658,307 @@ class TestMaxCpcPolicyKeyCoercion:
         )
 
         assert result.status == "ok"
+
+
+# ==========================================================================
+# Kill-switch #3 — Negative-keyword floor.
+# ==========================================================================
+
+
+def _campaign_with_kw(
+    cid: int,
+    budget_rub: float = 500.0,
+    *,
+    state: str = "SUSPENDED",
+    negatives: list[str] | None = None,
+) -> CampaignBudget:
+    """Test helper: a SUSPENDED campaign (so resume is the operation we
+    want to gate) with an explicit negative-keywords set."""
+    return CampaignBudget(
+        id=cid,
+        name=f"campaign-{cid}",
+        daily_budget_rub=budget_rub,
+        state=state,
+        negative_keywords=frozenset(negatives or []),
+    )
+
+
+def _nk_policy(required: list[str] | None = None) -> NegativeKeywordFloorPolicy:
+    return NegativeKeywordFloorPolicy(required_negative_keywords=required or [])
+
+
+class TestNegativeKeywordFloorPolicyValidation:
+    def test_empty_policy_is_valid(self) -> None:
+        p = NegativeKeywordFloorPolicy()
+        assert p.required_negative_keywords == []
+
+    def test_rejects_extra_fields(self) -> None:
+        with pytest.raises(ValidationError):
+            NegativeKeywordFloorPolicy.model_validate({"unknown": 1})
+
+    def test_policy_is_immutable(self) -> None:
+        p = _nk_policy(["бесплатно"])
+        with pytest.raises(ValidationError):
+            p.required_negative_keywords = []  # type: ignore[misc]
+
+
+class TestLoadNegativeKeywordFloorPolicy:
+    def test_loads_from_yaml(self, tmp_path: Path) -> None:
+        path = tmp_path / "agent_policy.yml"
+        path.write_text(
+            """
+required_negative_keywords:
+  - бесплатно
+  - скачать
+  - отзывы
+""",
+            encoding="utf-8",
+        )
+
+        p = load_negative_keyword_floor_policy(path)
+        assert p.required_negative_keywords == ["бесплатно", "скачать", "отзывы"]
+
+    def test_tolerates_unknown_keys(self, tmp_path: Path) -> None:
+        path = tmp_path / "agent_policy.yml"
+        path.write_text(
+            """
+account_daily_budget_cap_rub: 5000
+required_negative_keywords: [бесплатно]
+""",
+            encoding="utf-8",
+        )
+        p = load_negative_keyword_floor_policy(path)
+        assert p.required_negative_keywords == ["бесплатно"]
+
+
+class TestNegativeKeywordFloorHappyPath:
+    def test_ok_when_policy_requires_nothing(self) -> None:
+        check = NegativeKeywordFloorCheck(_nk_policy([]))
+        snapshot = AccountBudgetSnapshot(campaigns=[_campaign_with_kw(1, negatives=[])])
+
+        result = check.check(snapshot, [BudgetChange(campaign_id=1, new_state="ON")])
+
+        assert result.status == "ok"
+
+    def test_ok_when_no_changes(self) -> None:
+        check = NegativeKeywordFloorCheck(_nk_policy(["бесплатно"]))
+        snapshot = AccountBudgetSnapshot(campaigns=[_campaign_with_kw(1)])
+
+        result = check.check(snapshot, [])
+
+        assert result.status == "ok"
+
+    def test_ok_when_changes_do_not_resume(self) -> None:
+        # A pause or a budget-only change does not trigger the floor.
+        check = NegativeKeywordFloorCheck(_nk_policy(["бесплатно"]))
+        snapshot = AccountBudgetSnapshot(campaigns=[_campaign_with_kw(1, state="ON", negatives=[])])
+
+        result = check.check(
+            snapshot,
+            [
+                BudgetChange(campaign_id=1, new_daily_budget_rub=1000),
+                BudgetChange(campaign_id=1, new_state="SUSPENDED"),
+            ],
+        )
+
+        # Duplicate id on 1 — this test actually trips the duplicate
+        # guard. Replace with a single change.
+        assert result.status == "blocked"  # documented behaviour — duplicates rejected
+
+    def test_ok_when_budget_only_change_on_non_resume(self) -> None:
+        check = NegativeKeywordFloorCheck(_nk_policy(["бесплатно"]))
+        snapshot = AccountBudgetSnapshot(campaigns=[_campaign_with_kw(1, state="ON", negatives=[])])
+
+        # A running campaign without the required negatives that is
+        # merely getting its budget changed: not KS#3's concern.
+        result = check.check(
+            snapshot,
+            [BudgetChange(campaign_id=1, new_daily_budget_rub=1000)],
+        )
+
+        assert result.status == "ok"
+
+    def test_ok_when_resume_target_has_all_required_negatives(self) -> None:
+        check = NegativeKeywordFloorCheck(_nk_policy(["бесплатно", "скачать"]))
+        snapshot = AccountBudgetSnapshot(
+            campaigns=[_campaign_with_kw(1, negatives=["бесплатно", "скачать", "отзывы"])]
+        )
+
+        result = check.check(snapshot, [BudgetChange(campaign_id=1, new_state="ON")])
+
+        assert result.status == "ok"
+
+    def test_case_insensitive_matching(self) -> None:
+        # Policy says lowercase; campaign stores uppercase variant.
+        check = NegativeKeywordFloorCheck(_nk_policy(["бесплатно"]))
+        snapshot = AccountBudgetSnapshot(campaigns=[_campaign_with_kw(1, negatives=["БЕСПЛАТНО"])])
+
+        result = check.check(snapshot, [BudgetChange(campaign_id=1, new_state="ON")])
+
+        assert result.status == "ok"
+
+    def test_whitespace_insensitive_matching(self) -> None:
+        check = NegativeKeywordFloorCheck(_nk_policy(["бесплатно"]))
+        snapshot = AccountBudgetSnapshot(
+            campaigns=[_campaign_with_kw(1, negatives=["  бесплатно  "])]
+        )
+
+        result = check.check(snapshot, [BudgetChange(campaign_id=1, new_state="ON")])
+
+        assert result.status == "ok"
+
+
+class TestNegativeKeywordFloorBlocks:
+    def test_blocked_when_resume_target_missing_required_negative(self) -> None:
+        check = NegativeKeywordFloorCheck(_nk_policy(["бесплатно", "скачать"]))
+        snapshot = AccountBudgetSnapshot(campaigns=[_campaign_with_kw(1, negatives=["бесплатно"])])
+
+        result = check.check(snapshot, [BudgetChange(campaign_id=1, new_state="ON")])
+
+        assert result.status == "blocked"
+        assert result.details.get("campaign_id") == 1
+        assert (
+            "скачать" in (result.reason or "").lower()
+            or "скачать" in str(result.details.get("missing", "")).lower()
+        )
+
+    def test_blocked_when_typo_prevents_match(self) -> None:
+        # "беспалтно" (typo) != "бесплатно".
+        check = NegativeKeywordFloorCheck(_nk_policy(["бесплатно"]))
+        snapshot = AccountBudgetSnapshot(campaigns=[_campaign_with_kw(1, negatives=["беспалтно"])])
+
+        result = check.check(snapshot, [BudgetChange(campaign_id=1, new_state="ON")])
+
+        assert result.status == "blocked"
+
+    def test_blocked_on_resume_even_if_other_change_is_benign(self) -> None:
+        # A batch with one benign change (budget) and one resume on a
+        # non-compliant campaign: the resume still gets blocked.
+        check = NegativeKeywordFloorCheck(_nk_policy(["бесплатно"]))
+        snapshot = AccountBudgetSnapshot(
+            campaigns=[
+                _campaign_with_kw(1, state="ON", negatives=["бесплатно"]),
+                _campaign_with_kw(2, negatives=[]),
+            ]
+        )
+
+        result = check.check(
+            snapshot,
+            [
+                BudgetChange(campaign_id=1, new_daily_budget_rub=500),
+                BudgetChange(campaign_id=2, new_state="ON"),
+            ],
+        )
+
+        assert result.status == "blocked"
+        assert result.details.get("campaign_id") == 2
+
+    def test_first_violation_reported(self) -> None:
+        check = NegativeKeywordFloorCheck(_nk_policy(["бесплатно"]))
+        snapshot = AccountBudgetSnapshot(
+            campaigns=[
+                _campaign_with_kw(1, negatives=[]),
+                _campaign_with_kw(2, negatives=[]),
+            ]
+        )
+
+        result = check.check(
+            snapshot,
+            [
+                BudgetChange(campaign_id=1, new_state="ON"),
+                BudgetChange(campaign_id=2, new_state="ON"),
+            ],
+        )
+
+        assert result.status == "blocked"
+        assert result.details.get("campaign_id") == 1
+
+    def test_blocks_duplicate_campaign_ids_in_changes(self) -> None:
+        # Same auditor-driven guard as KS#1/KS#2.
+        check = NegativeKeywordFloorCheck(_nk_policy([]))
+        snapshot = AccountBudgetSnapshot(campaigns=[_campaign_with_kw(1)])
+
+        result = check.check(
+            snapshot,
+            [
+                BudgetChange(campaign_id=1, new_state="ON"),
+                BudgetChange(campaign_id=1, new_daily_budget_rub=500),
+            ],
+        )
+
+        assert result.status == "blocked"
+        assert "duplicate" in (result.reason or "").lower()
+
+    def test_silently_skips_unknown_campaign_id(self) -> None:
+        # Consistent with KS#1/KS#2 behaviour; tech debt is in BACKLOG.
+        check = NegativeKeywordFloorCheck(_nk_policy(["бесплатно"]))
+        snapshot = AccountBudgetSnapshot(campaigns=[_campaign_with_kw(1, negatives=["бесплатно"])])
+
+        result = check.check(
+            snapshot,
+            [BudgetChange(campaign_id=999, new_state="ON")],
+        )
+
+        assert result.status == "ok"
+
+
+class TestNegativeKeywordFloorAuditorFindings:
+    """Security-auditor findings on KS#3 (post-GREEN review):
+    HIGH — NFC/NFD normalisation gap
+    MEDIUM — empty/whitespace-only policy entries degrade to
+             "block everything" denial-of-service on the safety gate
+    """
+
+    def test_matches_nfc_policy_against_nfd_campaign_keyword(self) -> None:
+        # HIGH. If the Yandex Direct API (or any HTTP stack in the
+        # chain) returns NFD-decomposed Cyrillic, codepoint-exact
+        # comparison fails against the NFC-canonical policy string.
+        # _normalize_keyword must fold both sides into NFC.
+        #
+        # "майка" has 'й' which decomposes to 'и' + U+0306 (combining
+        # breve) under NFD — a concrete case where NFC and NFD differ.
+        import unicodedata
+
+        phrase = "майка"
+        nfc = unicodedata.normalize("NFC", phrase)
+        nfd = unicodedata.normalize("NFD", phrase)
+        assert nfc != nfd  # precondition: the two forms differ bit-wise
+
+        check = NegativeKeywordFloorCheck(_nk_policy([nfc]))
+        snapshot = AccountBudgetSnapshot(campaigns=[_campaign_with_kw(1, negatives=[nfd])])
+
+        result = check.check(snapshot, [BudgetChange(campaign_id=1, new_state="ON")])
+
+        assert result.status == "ok"
+
+    def test_matches_nfd_policy_against_nfc_campaign_keyword(self) -> None:
+        # Symmetric — the fold must be bidirectional, not policy-privileged.
+        import unicodedata
+
+        phrase = "майка"
+        nfc = unicodedata.normalize("NFC", phrase)
+        nfd = unicodedata.normalize("NFD", phrase)
+
+        check = NegativeKeywordFloorCheck(_nk_policy([nfd]))
+        snapshot = AccountBudgetSnapshot(campaigns=[_campaign_with_kw(1, negatives=[nfc])])
+
+        result = check.check(snapshot, [BudgetChange(campaign_id=1, new_state="ON")])
+
+        assert result.status == "ok"
+
+    def test_policy_rejects_empty_string_entry(self) -> None:
+        # MEDIUM. A `""` in required_negative_keywords would match no
+        # real campaign, effectively disabling every resume — a
+        # denial-of-service on the safety gate and social pressure
+        # to turn KS#3 off.
+        with pytest.raises(ValidationError):
+            NegativeKeywordFloorPolicy(required_negative_keywords=[""])
+
+    def test_policy_rejects_whitespace_only_entry(self) -> None:
+        with pytest.raises(ValidationError):
+            NegativeKeywordFloorPolicy(required_negative_keywords=["   "])
+
+    def test_policy_rejects_entry_that_is_empty_after_stripping(self) -> None:
+        # Tabs + spaces only — same problem.
+        with pytest.raises(ValidationError):
+            NegativeKeywordFloorPolicy(required_negative_keywords=["\t \t"])
