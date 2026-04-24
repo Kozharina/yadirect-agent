@@ -17,7 +17,7 @@ from typing import Any, ClassVar
 import pytest
 from typer.testing import CliRunner
 
-from yadirect_agent.cli.main import app
+import yadirect_agent.cli.main as cli_module
 
 
 @pytest.fixture
@@ -39,7 +39,7 @@ def _patch_bootstrap(monkeypatch: pytest.MonkeyPatch, settings: Any) -> None:
 
 def test_doctor_command_exists_and_is_discoverable(runner: CliRunner) -> None:
     # Smoke: `doctor --help` must not fail and must mention the command.
-    result = runner.invoke(app, ["doctor", "--help"])
+    result = runner.invoke(cli_module.app, ["doctor", "--help"])
 
     assert result.exit_code == 0
     assert "doctor" in result.stdout.lower()
@@ -53,7 +53,6 @@ def test_doctor_exits_zero_when_every_check_is_ok(
     # Replace the checks pipeline with a single all-ok fake so we exercise
     # the command's orchestration without depending on individual check
     # implementations.
-    import yadirect_agent.cli.main as cli_module
     from yadirect_agent.cli.doctor import CheckResult
 
     async def fake_run_checks(_settings: Any) -> list[CheckResult]:
@@ -63,7 +62,7 @@ def test_doctor_exits_zero_when_every_check_is_ok(
 
     monkeypatch.setattr(cli_module, "_run_doctor_checks", fake_run_checks)
 
-    result = runner.invoke(app, ["doctor"])
+    result = runner.invoke(cli_module.app, ["doctor"])
 
     assert result.exit_code == 0, result.output
     assert "ok" in result.output.lower()
