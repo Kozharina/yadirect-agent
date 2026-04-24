@@ -997,12 +997,10 @@ class GoalConversions:
         # bool is a subclass of int — reject explicitly so True/False
         # don't slip in as 1/0.
         if isinstance(self.conversions, bool) or not isinstance(self.conversions, int):
-            msg = (
-                "GoalConversions.conversions must be int, got " f"{type(self.conversions).__name__}"
-            )
+            msg = f"GoalConversions.conversions must be int, got {type(self.conversions).__name__}"
             raise TypeError(msg)
         if self.conversions < 0:
-            msg = "GoalConversions.conversions must be non-negative, got " f"{self.conversions}"
+            msg = f"GoalConversions.conversions must be non-negative, got {self.conversions}"
             raise ValueError(msg)
 
 
