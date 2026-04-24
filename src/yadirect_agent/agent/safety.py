@@ -653,7 +653,26 @@ def load_quality_score_guard_policy(path: Path) -> QualityScoreGuardPolicy:
 class QualityScoreGuardCheck:
     """Block bid *increases* on keywords whose QS is below policy.
 
-    Skeleton — always blocks. Real logic lands in the next commit.
+    Pipeline:
+    1. Duplicate keyword_id in ``updates`` → reject the whole batch
+       (shared guard with KS#1/#2/#3).
+    2. For each update, look up the keyword. Unknown ids skip
+       (consistent BACKLOG follow-up for M2.3 audit).
+    3. If QS is unknown (None) — defer. Missing signal ≠ bad signal;
+       operator should backfill QS before retrying.
+    4. If QS ≥ threshold — nothing to say.
+    5. QS < threshold: check each bid field against its current value
+       in the snapshot. A strict increase is blocked; equality and
+       decrease pass. If the current value is unknown, we can't tell
+       if it's an increase, so we defer.
+    6. Search field is checked before network — the order is part of
+       the documented contract (pinned in tests).
+
+    What never blocks:
+    - Lowering or holding a bid (the operator is doing the right
+      thing on a low-QS keyword).
+    - Bid on a keyword the snapshot doesn't include (silent skip).
+    - Bid when either current or new value is None on that field.
     """
 
     def __init__(self, policy: QualityScoreGuardPolicy) -> None:
@@ -664,6 +683,67 @@ class QualityScoreGuardCheck:
         snapshot: AccountBidSnapshot,
         updates: list[ProposedBidChange],
     ) -> CheckResult:
-        _ = snapshot
-        _ = updates
-        return CheckResult.blocked_result("not implemented")
+        duplicates = _find_duplicate_keyword_ids(updates)
+        if duplicates:
+            first = duplicates[0]
+            return CheckResult.blocked_result(
+                f"duplicate keyword_id in updates: {first}",
+                keyword_id=first,
+                duplicates=duplicates,
+            )
+
+        threshold = self._policy.min_quality_score_for_bid_increase
+
+        for u in updates:
+            kw = snapshot.find(u.keyword_id)
+            if kw is None:
+                continue
+            if kw.quality_score is None:
+                continue
+            if kw.quality_score >= threshold:
+                continue
+
+            # QS strictly below threshold — inspect each bid field for
+            # an increase.
+            if self._is_increase(u.new_search_bid_rub, kw.current_search_bid_rub):
+                return CheckResult.blocked_result(
+                    (
+                        f"search bid increase on keyword {u.keyword_id} refused: "
+                        f"QS {kw.quality_score} is below threshold {threshold}"
+                    ),
+                    keyword_id=u.keyword_id,
+                    campaign_id=kw.campaign_id,
+                    quality_score=kw.quality_score,
+                    threshold=threshold,
+                    bid_type="search",
+                    current_rub=kw.current_search_bid_rub,
+                    proposed_rub=u.new_search_bid_rub,
+                )
+            if self._is_increase(u.new_network_bid_rub, kw.current_network_bid_rub):
+                return CheckResult.blocked_result(
+                    (
+                        f"network bid increase on keyword {u.keyword_id} refused: "
+                        f"QS {kw.quality_score} is below threshold {threshold}"
+                    ),
+                    keyword_id=u.keyword_id,
+                    campaign_id=kw.campaign_id,
+                    quality_score=kw.quality_score,
+                    threshold=threshold,
+                    bid_type="network",
+                    current_rub=kw.current_network_bid_rub,
+                    proposed_rub=u.new_network_bid_rub,
+                )
+
+        return CheckResult.ok_result()
+
+    @staticmethod
+    def _is_increase(new: float | None, current: float | None) -> bool:
+        """Return True if ``new`` strictly exceeds ``current``.
+
+        If either side is None the answer is False — a missing value
+        means we cannot prove an increase, so we defer rather than
+        block.
+        """
+        if new is None or current is None:
+            return False
+        return new > current
