@@ -28,6 +28,7 @@ rather than ``ImportError`` (wrong reason).
 from __future__ import annotations
 
 import math
+import re
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -559,14 +560,18 @@ def load_negative_keyword_floor_policy(path: Path) -> NegativeKeywordFloorPolicy
     return NegativeKeywordFloorPolicy.model_validate(fields)
 
 
+_INTERNAL_WS_RE = re.compile(r"\s+")
+
+
 def _normalize_keyword(phrase: str) -> str:
     """Fold a phrase for case-insensitive, whitespace-forgiving,
     Unicode-canonicalised comparison.
 
     Normalisation order: NFC first (so NFD-decomposed input from the
-    API folds to the canonical composed form), then strip whitespace,
-    then lowercase. Keeps safety-layer independent of
-    services.semantics.
+    API folds to the canonical composed form), then collapse internal
+    whitespace runs to a single space (multi-word search queries like
+    "купить  обувь" must match "купить обувь"), then strip, then
+    lowercase. Keeps safety-layer independent of services.semantics.
 
     Without the NFC step, a campaign keyword returned by the Direct
     API in NFD form (where each combining letter like U+0439 CYRILLIC
@@ -574,8 +579,13 @@ def _normalize_keyword(phrase: str) -> str:
     match a policy written in the composed NFC form. That's a silent
     false-positive block in one direction and a potential false
     negative in the other. Auditor HIGH finding on KS#3.
+
+    Internal-whitespace collapse added for KS#7: search queries are
+    multi-word and users / reports sometimes include stray extra
+    spaces. The KS#3 tests still pass because they only use trailing/
+    leading whitespace and single-word phrases.
     """
-    return unicodedata.normalize("NFC", phrase).strip().lower()
+    return _INTERNAL_WS_RE.sub(" ", unicodedata.normalize("NFC", phrase)).strip().lower()
 
 
 class NegativeKeywordFloorCheck:
@@ -1235,8 +1245,21 @@ def load_query_drift_policy(path: Path) -> QueryDriftPolicy:
 class QueryDriftCheck:
     """Block plans when today's query mix drifted too far from baseline.
 
-    Skeleton — always blocks. Real logic lands in the next commit.
+    Pipeline:
+    0. counter_id mismatch between snapshots → blocked (same safeguard
+       as KS#6; comparing different counters is meaningless).
+    1. Empty baseline or empty current → warn. No reference point or
+       no data to compare; pipeline can decide whether a warn aborts
+       autonomous operation (M2.2).
+    2. Normalise both sides (shared _normalize_keyword — NFC, strip,
+       lower). Collapses case/whitespace/encoding variants that would
+       otherwise inflate the drift metric.
+    3. new_share = |current - baseline| / |current|. Strict `>`
+       threshold blocks; equality passes so operators can set an
+       exact ceiling.
     """
+
+    _SAMPLE_LIMIT = 10
 
     def __init__(self, policy: QueryDriftPolicy) -> None:
         self._policy = policy
@@ -1246,6 +1269,55 @@ class QueryDriftCheck:
         baseline: SearchQueriesSnapshot,
         current: SearchQueriesSnapshot,
     ) -> CheckResult:
-        _ = baseline
-        _ = current
-        return CheckResult.blocked_result("not implemented")
+        if baseline.counter_id != current.counter_id:
+            return CheckResult.blocked_result(
+                (
+                    f"snapshot counter_id mismatch: baseline="
+                    f"{baseline.counter_id}, current={current.counter_id}"
+                ),
+                baseline_counter_id=baseline.counter_id,
+                current_counter_id=current.counter_id,
+            )
+
+        baseline_set = baseline.normalised()
+        current_set = current.normalised()
+
+        if not baseline_set:
+            return CheckResult.warn_result(
+                "baseline has no queries; drift check cannot apply",
+                baseline_size=0,
+                current_size=len(current_set),
+            )
+        if not current_set:
+            return CheckResult.warn_result(
+                "current has no queries; drift check cannot apply",
+                baseline_size=len(baseline_set),
+                current_size=0,
+            )
+
+        new_queries = current_set - baseline_set
+        new_count = len(new_queries)
+        current_size = len(current_set)
+        new_share = new_count / current_size
+
+        threshold = self._policy.max_new_query_share
+        if new_share > threshold:
+            # Surface a small sample of the offending queries so a
+            # human reviewer can paste them into the search-term
+            # report without re-running analysis.
+            sample = sorted(new_queries)[: self._SAMPLE_LIMIT]
+            return CheckResult.blocked_result(
+                (f"new-query share {new_share:.3f} exceeds threshold {threshold}"),
+                new_share=new_share,
+                threshold=threshold,
+                current_size=current_size,
+                baseline_size=len(baseline_set),
+                new_count=new_count,
+                new_queries_sample=sample,
+            )
+
+        return CheckResult.ok_result(
+            new_share=new_share,
+            baseline_size=len(baseline_set),
+            current_size=current_size,
+        )
