@@ -24,10 +24,6 @@ Ordered — top is what I take next.
 
 ### 🔥 Before M2 (safety)
 
-- [ ] **M7.1 dotyazhka**: `tests/unit/services/test_bidding.py` +
-      `tests/unit/services/test_semantics.py`. First proper TDD PR:
-      tests per behaviour, red commit → green commit pairs visible.
-      Raises coverage gate 78 → 80 in the same PR.
 - [ ] **PR-C: `yadirect-agent doctor` command** — env + Anthropic +
       Direct sandbox + policy-file diagnostics. TDD. See
       [§M1.4](./TECHNICAL_SPEC.md) context for CLI conventions.
@@ -127,8 +123,6 @@ Accumulated work that isn't blocking but will sting later.
 - [ ] `make test-cov` gate vs. `make test` default — think about
       whether `check` should run `test-cov` instead of plain `test`
       to keep the gate enforced locally, not only in CI.
-- [ ] **Raise coverage gate 78 → 80** once M7.1 dotyazhka lands. Gate
-      value lives in two places (CI yaml and Makefile) — raise both.
 - [ ] **Pre-branch ritual in CLAUDE.md** — bug hit once: creating a
       new branch without first `git switch main && git pull --ff-only`
       led to stale base and a merge conflict. Add an explicit
@@ -177,6 +171,14 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M7.1 dotyazhka** — `test_semantics.py` (20 tests covering
+      normalize / _cluster_key / collect / validate_with_direct) +
+      `test_bidding.py` (6 tests pinning rubles→micro conversion,
+      empty-list no-op, batching). First real TDD PR: a visible
+      `test:` → `fix:` pair drove a real bug fix in
+      `_cluster_key`'s all-stop-words fallback (was returning the
+      raw phrase; now returns a normalised key). Coverage 78.9% →
+      85.7%; gate raised 78 → 80.
 - [x] **CodeQL first-scan cleanup** — 2 real `Note` alerts fixed in
       code (`test_campaigns.py` dotted-path monkeypatch; unused `limit`
       params prefixed with `_`). 3 Protocol-stub false positives
