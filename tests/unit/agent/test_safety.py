@@ -822,6 +822,22 @@ class TestNegativeKeywordFloorHappyPath:
 
         assert result.status == "ok"
 
+    def test_multi_word_negative_keyword_internal_whitespace_collapses(self) -> None:
+        # Cross-kill-switch regression guard (auditor MEDIUM on KS#7):
+        # `_normalize_keyword` grew an internal-whitespace collapse
+        # when KS#7 landed. This test pins that KS#3 now treats a
+        # double-space variant of a multi-word phrase as the same
+        # phrase. Policy "бесплатно скачать" (single space) matches
+        # campaign "бесплатно  скачать" (double space).
+        check = NegativeKeywordFloorCheck(_nk_policy(["бесплатно скачать"]))
+        snapshot = AccountBudgetSnapshot(
+            campaigns=[_campaign_with_kw(1, negatives=["бесплатно  скачать"])]
+        )
+
+        result = check.check(snapshot, [BudgetChange(campaign_id=1, new_state="ON")])
+
+        assert result.status == "ok"
+
 
 class TestNegativeKeywordFloorBlocks:
     def test_blocked_when_resume_target_missing_required_negative(self) -> None:
@@ -2127,3 +2143,17 @@ class TestQueryDriftEdgeCases:
         # 1.0 means "anything up to 100% is ok" — strict `>` means
         # even 100% passes (1.0 not > 1.0).
         assert result.status == "ok"
+
+    def test_empty_current_warns_even_with_zero_threshold(self) -> None:
+        # Auditor-flagged ordering guarantee: the empty-current
+        # warn branch runs before the ratio comparison, so a
+        # threshold=0.0 policy (which would normally block any new
+        # query) still emits warn when current has no queries
+        # rather than escalating to block.
+        check = QueryDriftCheck(_qd_policy(0.0))
+        baseline = _queries("a", "b")
+        current = _queries()
+
+        result = check.check(baseline, current)
+
+        assert result.status == "warn"

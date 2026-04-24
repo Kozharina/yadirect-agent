@@ -524,11 +524,19 @@ class MaxCpcCheck:
 class NegativeKeywordFloorPolicy(BaseModel):
     """Kill-switch #3 policy slice.
 
-    Matching is case-insensitive, whitespace-trimmed, and
-    Unicode-normalised (NFC) — an operator writing ``"Бесплатно"`` in
-    YAML must match a campaign's existing ``"бесплатно "`` without
-    manual curation, and NFC/NFD encoding differences from the API
-    must not create false mismatches.
+    Matching is case-insensitive, whitespace-tolerant on *all*
+    whitespace positions (leading, trailing, and internal runs
+    between words), and Unicode-normalised (NFC) — an operator
+    writing ``"Бесплатно скачать"`` in YAML must match a campaign's
+    existing ``"бесплатно  скачать "`` without manual curation, and
+    NFC/NFD encoding differences from the API must not create false
+    mismatches.
+
+    Internal-whitespace folding is shared with KS#7 via
+    ``_normalize_keyword``. Multi-word phrases with stray double
+    spaces fold to single spaces before comparison — see
+    ``test_multi_word_negative_keyword_internal_whitespace_collapses``
+    in the test suite for the pinned behaviour.
 
     Empty/whitespace-only entries are rejected at load time: a ``""``
     would collapse to an empty required-set element, blocking every
@@ -1305,6 +1313,12 @@ class QueryDriftCheck:
             # Surface a small sample of the offending queries so a
             # human reviewer can paste them into the search-term
             # report without re-running analysis.
+            #
+            # privacy-note: these are raw (normalised but not
+            # redacted) user queries. Direct search terms can
+            # contain names, addresses, or medical phrases. The
+            # audit sink (M2.3) must hash or truncate this list
+            # before log persistence. BACKLOG item tracked.
             sample = sorted(new_queries)[: self._SAMPLE_LIMIT]
             return CheckResult.blocked_result(
                 (f"new-query share {new_share:.3f} exceeds threshold {threshold}"),

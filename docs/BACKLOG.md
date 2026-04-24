@@ -31,8 +31,6 @@ Each one is TDD, with `security-auditor` sub-agent review before merge.
 All seven reference
 [`docs/PRIOR_ART.md`](./PRIOR_ART.md) → "Agentic PPC Campaign Management".
 
-- [ ] **Kill-switch #7 — Query drift detector** (§M2.0 rule 7):
-      weekly new-query-share alert.
 - [ ] **M2.1 + M2.2: Policy schema & `plan → confirm → execute`** —
       `agent/safety.py::Policy` (pydantic), `agent_policy.yml` loader,
       `@requires_plan` decorator, `pending_plans.jsonl`,
@@ -87,6 +85,24 @@ the PR merges or is abandoned.
 ## Tech debt / follow-ups
 
 Accumulated work that isn't blocking but will sting later.
+
+- [ ] **Query-drift follow-ups from KS#7 review**:
+  - PRIVACY / M2.3: **Hash or truncate `new_queries_sample` in the
+    audit sink path.** KS#7's `CheckResult.details` surfaces up to
+    10 raw user search queries for operator review — Direct search
+    terms can contain names, addresses, medical phrases. M2.3
+    audit sink must redact before log persistence.
+  - DESIGN: **Population-based vs reach-weighted drift.** KS#7
+    counts distinct queries, so 100 low-impression noise queries
+    weigh as much as one high-impression anomaly. Consider an
+    impression-weighted variant once Metrika integration (M6)
+    provides per-query volume.
+  - DESIGN: **List-vs-set-size divergence on SearchQueriesSnapshot.**
+    No code path reads `len(snapshot.queries)` today; the check
+    always goes through `normalised()`. If a future developer adds
+    a raw-count read without going through the set, the
+    duplicate-padding surface activates. Consider a guard or a
+    `__post_init__` note on the dataclass.
 
 - [ ] **Conversion-integrity follow-ups from KS#6 review**
       (architectural items, for M2.2 pipeline wiring):
@@ -277,6 +293,17 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2 Kill-switch #7 — Query drift detector** — second
+      system-level gatekeeper. `QueryDriftCheck(baseline, current)`
+      compares normalised query sets, blocks when
+      `|new_queries|/|current|` exceeds `max_new_query_share`
+      (default 0.4). Shared `_normalize_keyword` extended with
+      internal-whitespace collapse (also benefits KS#3; pinned by
+      `test_multi_word_negative_keyword_internal_whitespace_collapses`).
+      Counter-id mismatch rejected upfront; empty baseline /
+      current → warn. 26 new tests (176 safety, 299 total).
+      **M2.0 complete** — all 7 kill-switches delivered and
+      security-audited. Coverage 91.5%.
 - [x] **M2 Kill-switch #6 — Conversion integrity** —
       `ConversionIntegrityCheck` is a system-level gatekeeper
       (no `changes` arg). Signature: `check(baseline, current)`.
