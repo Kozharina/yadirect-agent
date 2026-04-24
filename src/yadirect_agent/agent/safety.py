@@ -27,6 +27,7 @@ rather than ``ImportError`` (wrong reason).
 
 from __future__ import annotations
 
+import math
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -835,7 +836,26 @@ def load_budget_balance_drift_policy(path: Path) -> BudgetBalanceDriftPolicy:
 class BudgetBalanceDriftCheck:
     """Block plans that redistribute account budget too aggressively.
 
-    Skeleton — always blocks. Real logic lands in the next commit.
+    Pipeline:
+    1. Duplicate campaign_id in ``changes`` → reject whole batch.
+    2. Project ``changes`` onto ``snapshot`` (reuse BudgetCapCheck's
+       projection semantics: state flips first-class, unknown ids
+       silently dropped).
+    3. Compute baseline active total and projected active total.
+       If either is zero, defer — no reference distribution, any
+       allocation today is "new" and shouldn't be called drift.
+    4. For every campaign that appears in baseline or projected,
+       compute its share in each, and take the absolute difference.
+       Campaigns missing from one side contribute share = 0 on that
+       side.
+    5. Strictly greater than ``max_shift_pct_per_day`` → block on
+       that first campaign; equality is ok.
+
+    Only ``state == "ON"`` campaigns contribute to the totals —
+    suspended or ended campaigns don't spend, so their budget numbers
+    are noise for drift. Pausing a previously-active campaign moves
+    its share from its prior value to 0 (which IS a drift the operator
+    may want to block on).
     """
 
     def __init__(self, policy: BudgetBalanceDriftPolicy) -> None:
@@ -847,7 +867,60 @@ class BudgetBalanceDriftCheck:
         snapshot: AccountBudgetSnapshot,
         changes: list[BudgetChange],
     ) -> CheckResult:
-        _ = baseline
-        _ = snapshot
-        _ = changes
-        return CheckResult.blocked_result("not implemented")
+        duplicates = _find_duplicate_ids(changes)
+        if duplicates:
+            first = duplicates[0]
+            return CheckResult.blocked_result(
+                f"duplicate campaign_id in changes: {first}",
+                campaign_id=first,
+                duplicates=duplicates,
+            )
+
+        projected = BudgetCapCheck._project(snapshot, changes)
+
+        baseline_total = baseline.total_active_budget_rub()
+        projected_total = projected.total_active_budget_rub()
+
+        # Defer when either reference point is missing. Any observed
+        # distribution is "new," not drift.
+        if baseline_total == 0 or projected_total == 0:
+            return CheckResult.ok_result()
+
+        threshold = self._policy.max_shift_pct_per_day
+
+        baseline_active = {
+            c.id: c.daily_budget_rub / baseline_total for c in baseline.campaigns if c.state == "ON"
+        }
+        projected_active = {
+            c.id: c.daily_budget_rub / projected_total
+            for c in projected.campaigns
+            if c.state == "ON"
+        }
+
+        all_ids = sorted(baseline_active.keys() | projected_active.keys())
+        for cid in all_ids:
+            before = baseline_active.get(cid, 0.0)
+            after = projected_active.get(cid, 0.0)
+            shift = abs(after - before)
+            # IEEE 754: values that should mathematically equal
+            # threshold often come out slightly above due to
+            # rounding (e.g. 0.8-0.5 ≈ 0.30000000000000004).
+            # `math.isclose` gives us a tolerance so "exactly at
+            # threshold" inputs stay ok instead of flickering blocked.
+            if shift > threshold and not math.isclose(
+                shift, threshold, rel_tol=1e-9, abs_tol=1e-12
+            ):
+                return CheckResult.blocked_result(
+                    (
+                        f"campaign {cid} share would shift "
+                        f"{shift * 100:.1f}pp (threshold "
+                        f"{threshold * 100:.0f}pp)"
+                    ),
+                    campaign_id=cid,
+                    shift_pct=shift,
+                    threshold=threshold,
+                    baseline_share=before,
+                    projected_share=after,
+                )
+
+        return CheckResult.ok_result(projected_total_rub=projected_total)
