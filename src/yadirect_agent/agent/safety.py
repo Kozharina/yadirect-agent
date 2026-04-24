@@ -77,13 +77,22 @@ class CheckResult:
 
 @dataclass(frozen=True)
 class CampaignBudget:
-    """Snapshot of one campaign's budget-relevant state."""
+    """Snapshot of one campaign's safety-relevant state.
+
+    Used by every kill-switch that needs per-campaign context:
+    - KS#1 (budget caps) reads ``daily_budget_rub`` + ``state`` + ``group``.
+    - KS#3 (negative-keyword floor) reads ``negative_keywords``.
+
+    Future kill-switches can add fields with defaults; existing tests
+    stay green because nothing constructs this shape positionally.
+    """
 
     id: int
     name: str
     daily_budget_rub: float
     state: str  # "ON" | "SUSPENDED" | "OFF" | "ENDED" | ...
     group: str | None = None  # None = no group label; unscoped by group caps
+    negative_keywords: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True)
@@ -453,3 +462,67 @@ class MaxCpcCheck:
                 )
 
         return CheckResult.ok_result()
+
+
+# --------------------------------------------------------------------------
+# Kill-switch #3 — Negative-keyword floor.
+#
+# Refuses to resume a campaign that does not carry every phrase in the
+# required-negatives list. Source: docs/TECHNICAL_SPEC.md §M2.0 rule 3
+# and docs/PRIOR_ART.md "Agentic PPC Campaign Management". Reuses the
+# KS#1 data shapes (CampaignBudget, AccountBudgetSnapshot, BudgetChange)
+# because every resume is already represented there as
+# BudgetChange(new_state="ON").
+# --------------------------------------------------------------------------
+
+
+class NegativeKeywordFloorPolicy(BaseModel):
+    """Kill-switch #3 policy slice.
+
+    Matching is case-insensitive and whitespace-trimmed — an operator
+    writing ``"Бесплатно"`` in YAML must match a campaign's existing
+    ``"бесплатно "`` without manual curation.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    required_negative_keywords: list[str] = Field(
+        default_factory=list,
+        description="Phrases every campaign must carry before being resumed.",
+    )
+
+
+def load_negative_keyword_floor_policy(path: Path) -> NegativeKeywordFloorPolicy:
+    """Read ``agent_policy.yml`` and extract the negative-keyword floor slice."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    fields = {k: raw[k] for k in ("required_negative_keywords",) if k in raw}
+    return NegativeKeywordFloorPolicy.model_validate(fields)
+
+
+def _normalize_keyword(phrase: str) -> str:
+    """Fold a phrase for case-insensitive, whitespace-forgiving comparison.
+
+    Keeps safety-layer independent of services.semantics. A phrase that
+    differs only in case or leading/trailing whitespace must compare
+    equal for the purposes of this check.
+    """
+    return phrase.strip().lower()
+
+
+class NegativeKeywordFloorCheck:
+    """Block resume operations on campaigns lacking the required negatives.
+
+    Skeleton — always blocks. Real logic lands in the next commit.
+    """
+
+    def __init__(self, policy: NegativeKeywordFloorPolicy) -> None:
+        self._policy = policy
+
+    def check(
+        self,
+        snapshot: AccountBudgetSnapshot,
+        changes: list[BudgetChange],
+    ) -> CheckResult:
+        _ = snapshot
+        _ = changes
+        return CheckResult.blocked_result("not implemented")
