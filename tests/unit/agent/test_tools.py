@@ -138,7 +138,7 @@ async def test_list_campaigns_default_returns_all(
 ) -> None:
     from yadirect_agent.services.campaigns import CampaignService
 
-    async def fake_list_all(self: CampaignService, limit: int = 500) -> list:
+    async def fake_list_all(self: CampaignService, _limit: int = 500) -> list:
         return []
 
     async def fake_list_active(self: CampaignService, limit: int = 200) -> list:
@@ -354,7 +354,7 @@ async def test_list_campaigns_summary_shape(
 ) -> None:
     from yadirect_agent.services.campaigns import CampaignService
 
-    async def fake_list_all(self: CampaignService, limit: int = 500) -> list:
+    async def fake_list_all(self: CampaignService, _limit: int = 500) -> list:
         return [
             # Use the pydantic Campaign model via the service's internal conversion.
             Campaign(
@@ -372,7 +372,7 @@ async def test_list_campaigns_summary_shape(
     # service method to produce summaries directly.
     from yadirect_agent.services.campaigns import CampaignSummary
 
-    async def fake_summaries(self: CampaignService, limit: int = 500) -> list[CampaignSummary]:
+    async def fake_summaries(self: CampaignService, _limit: int = 500) -> list[CampaignSummary]:
         return [
             CampaignSummary(
                 id=1,

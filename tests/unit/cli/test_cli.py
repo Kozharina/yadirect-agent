@@ -51,7 +51,7 @@ def test_list_campaigns_json_output(
 ) -> None:
     from yadirect_agent.services.campaigns import CampaignService
 
-    async def fake_list_all(self: CampaignService, limit: int = 500) -> list:
+    async def fake_list_all(self: CampaignService, _limit: int = 500) -> list:
         return [
             CampaignSummary(
                 id=1,
@@ -88,7 +88,7 @@ def test_list_campaigns_empty_state(
 ) -> None:
     from yadirect_agent.services.campaigns import CampaignService
 
-    async def fake_list_all(self: CampaignService, limit: int = 500) -> list:
+    async def fake_list_all(self: CampaignService, _limit: int = 500) -> list:
         return []
 
     monkeypatch.setattr(CampaignService, "list_all", fake_list_all)

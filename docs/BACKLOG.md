@@ -164,6 +164,11 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **CodeQL first-scan cleanup** — 2 real `Note` alerts fixed in
+      code (`test_campaigns.py` dotted-path monkeypatch; unused `limit`
+      params prefixed with `_`). 3 Protocol-stub false positives
+      dismissed in the Security tab with reason "false positive —
+      `...` is the idiomatic `typing.Protocol` method body".
 - [x] **PR-B: security baseline** — `SECURITY.md` (GH private advisory
       workflow), `.github/dependabot.yml` (weekly, grouped, labeled
       `dependencies`/`python` and `github-actions`),

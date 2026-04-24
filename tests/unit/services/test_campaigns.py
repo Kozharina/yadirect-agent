@@ -91,10 +91,10 @@ def fake_direct(monkeypatch: pytest.MonkeyPatch) -> _FakeDirectService:
 
     # CampaignService does `from ..clients.direct import DirectService`, so we
     # patch the symbol where it is *used* (services.campaigns) in addition to
-    # the source module — standard monkeypatch gotcha.
-    import yadirect_agent.services.campaigns as svc_module
-
-    monkeypatch.setattr(svc_module, "DirectService", _factory)
+    # the source module — standard monkeypatch gotcha. Use a dotted-path string
+    # so we avoid mixing `import X` and `from X import Y` forms for the same
+    # module (CodeQL py/unnecessary-import-alias).
+    monkeypatch.setattr("yadirect_agent.services.campaigns.DirectService", _factory)
     monkeypatch.setattr(direct_module, "DirectService", _factory)
     return fake
 
