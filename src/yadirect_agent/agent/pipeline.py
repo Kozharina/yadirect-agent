@@ -53,6 +53,7 @@ Responsibilities explicitly deferred:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
@@ -143,6 +144,78 @@ _STAGE_ALLOWED: dict[RolloutStage, frozenset[str]] = {
 def _is_mutating_action(action: str) -> bool:
     """Mutating = anything outside the read-only set."""
     return action not in _READ_ONLY_ACTIONS
+
+
+# --------------------------------------------------------------------------
+# Required snapshots per mutating action.
+#
+# Closes the auditor CRITICAL finding: an empty ``ReviewContext`` used to
+# let every check be skipped and the plan auto-allowed. The pipeline
+# now requires the appropriate snapshot to be present before a
+# mutating action is considered, and rejects the plan otherwise.
+#
+# A "required" snapshot here is the one whose corresponding per-op
+# check must run for the action to be considered checked. Temporal
+# gatekeepers (KS#6/#7) remain optional at the pipeline level —
+# they're cross-cutting; the next-PR decorator will wire them in.
+# --------------------------------------------------------------------------
+
+
+_BUDGET_SNAPSHOT_ACTIONS: frozenset[str] = frozenset(
+    {
+        "pause_campaigns",
+        "resume_campaigns",
+        "set_campaign_budget",
+        "add_negative_keywords",
+        "archive_campaigns",
+        # NB: create_campaign is deliberately absent. A freshly-created
+        # campaign has no spend-to-date to cap-check against; the budget
+        # ceiling kicks in the moment the operator calls set_campaign_budget
+        # (which *is* in this set). Structural creation falls through to
+        # the gatekeepers + approval tier and defaults to confirm.
+    }
+)
+_BID_SNAPSHOT_ACTIONS: frozenset[str] = frozenset(
+    {
+        "set_keyword_bids",
+        "add_keywords",
+        "set_keyword_state",
+    }
+)
+
+
+def _required_snapshots(action: str) -> tuple[bool, bool]:
+    """Return (needs_budget_snapshot, needs_bid_snapshot) for ``action``."""
+    return (
+        action in _BUDGET_SNAPSHOT_ACTIONS,
+        action in _BID_SNAPSHOT_ACTIONS,
+    )
+
+
+# --------------------------------------------------------------------------
+# Approval tiers — which mutating actions auto-run vs require confirm.
+#
+# The auditor HIGH finding: the original pipeline auto-allowed every
+# mutating action that wasn't pause/resume/add_negative_keywords. That
+# silently covers budget edits, keyword creation, campaign structure,
+# and more — all of which should default to "human-in-the-loop" until
+# an explicit policy knob says otherwise.
+#
+# Today the policy only exposes three auto-approve knobs (pause, resume,
+# negative_keywords). Every other mutating action defaults to ``confirm``
+# even when all kill-switches pass. When more fine-grained knobs land
+# (auto_approve_budget_change, auto_approve_structural_change, etc.),
+# this table grows.
+# --------------------------------------------------------------------------
+
+
+_AUTO_APPROVABLE_ACTIONS: frozenset[str] = frozenset(
+    {
+        "pause_campaigns",
+        "resume_campaigns",
+        "add_negative_keywords",
+    }
+)
 
 
 # --------------------------------------------------------------------------
@@ -314,6 +387,26 @@ class SafetyPipeline:
         if not _is_mutating_action(normalised_action):
             return SafetyDecision(status="allow", reason="read-only")
 
+        # 2a. Mutating action requires the appropriate snapshot present.
+        #     Without this guard an empty ReviewContext would route every
+        #     per-op check to "skipped" and produce an auto-allow. Auditor
+        #     CRITICAL finding on this PR.
+        needs_budget, needs_bid = _required_snapshots(normalised_action)
+        missing: list[str] = []
+        if needs_budget and context.budget_snapshot is None:
+            missing.append("budget_snapshot")
+        if needs_bid and context.bid_snapshot is None:
+            missing.append("bid_snapshot")
+        if missing:
+            return SafetyDecision(
+                status="reject",
+                reason=(
+                    f"mutating action {normalised_action!r} requires snapshot "
+                    f"data that was not supplied: {missing}"
+                ),
+                skipped_checks=[],
+            )
+
         # 3. System-level gatekeepers (KS#6 + KS#7). If either blocks,
         #    the entire plan is rejected regardless of per-op content.
         blocking: list[CheckResult] = []
@@ -451,15 +544,10 @@ class SafetyPipeline:
                 skipped_checks=skipped,
             )
 
-        # 7. Record approved bids in session state so a follow-up
-        #    plan can be gated against them.
-        for bid in context.bid_changes:
-            ceiling = max(
-                bid.new_search_bid_rub or 0.0,
-                bid.new_network_bid_rub or 0.0,
-            )
-            if ceiling > 0:
-                self._session.record_approved_bid(bid.keyword_id, ceiling)
+        # 7. (Session-bid register is updated by the executor via
+        #    ``on_applied`` *after* the API call succeeds, not here.
+        #    Recording at review time would poison the TOCTOU guard on
+        #    executor failure — auditor HIGH on this PR.)
 
         return SafetyDecision(
             status="allow",
@@ -468,6 +556,27 @@ class SafetyPipeline:
             skipped_checks=skipped,
         )
 
+    def on_applied(self, context: ReviewContext) -> None:
+        """Callback for the executor to invoke *after* the plan's write
+        succeeded against the live API.
+
+        Updates the session TOCTOU register so the next review sees the
+        actual new baseline. Called with the same ``context`` that
+        ``review`` saw — in particular, the same ``bid_changes`` list.
+
+        Executor must NOT call this on failed writes. Doing so poisons
+        the TOCTOU register with a ceiling that isn't reflected in the
+        actual account state, causing legitimate retries to look like
+        fresh increases.
+        """
+        for bid in context.bid_changes:
+            ceiling = max(
+                bid.new_search_bid_rub or 0.0,
+                bid.new_network_bid_rub or 0.0,
+            )
+            if ceiling > 0:
+                self._session.record_approved_bid(bid.keyword_id, ceiling)
+
     # ------------------------------------------------------------------
     # Internals.
     # ------------------------------------------------------------------
@@ -475,17 +584,19 @@ class SafetyPipeline:
     @staticmethod
     def _run_check(
         name: str,
-        runner: object,  # Callable[[], CheckResult | None]
+        runner: Callable[[], CheckResult | None],
         blocking: list[CheckResult],
         warnings: list[CheckResult],
         skipped: list[str],
     ) -> None:
-        """Dispatch to a single check; route result into the right bucket."""
-        # Runner is a zero-arg callable returning CheckResult | None
-        # (None means "data missing, skip"). Kept as ``object`` in the
-        # signature so mypy doesn't complain about the lambdas above
-        # returning nested ternary expressions.
-        result: CheckResult | None = runner()  # type: ignore[operator]
+        """Dispatch to a single check; route result into the right bucket.
+
+        A ``None`` return means "data missing — skip" and the check name is
+        added to ``skipped``. Otherwise the ``CheckResult`` is routed by
+        status: ``blocked`` → blocking list, ``warn`` → warnings list,
+        ``ok`` → dropped (only non-ok results surface to callers).
+        """
+        result = runner()
         if result is None:
             skipped.append(name)
             return
@@ -493,7 +604,6 @@ class SafetyPipeline:
             blocking.append(result)
         elif result.status == "warn":
             warnings.append(result)
-        # "ok" — not collected; only blocking/warnings need to flow out.
 
     def _check_session_bid_ceiling(self, context: ReviewContext) -> CheckResult | None:
         """Raise a block if any bid_change exceeds the session's prior approval."""
@@ -517,23 +627,32 @@ class SafetyPipeline:
         return None
 
     def _requires_confirmation(self, action: str) -> bool:
-        """Map action → whether the current approval tier auto-approves it.
+        """Return True when the action needs explicit human approval.
 
-        Read-only is already handled earlier. The remaining question is
-        whether the pipeline should surface a ``confirm`` decision for
-        mutating actions that policy marks as human-only.
+        Policy exposes three auto-approve knobs today (pause, resume,
+        negatives). The pipeline consults those for the matching action
+        class.
+
+        **Default posture for every other mutating action is confirm.**
+        Kill-switches catching the dangerous cases is necessary but not
+        sufficient — budget edits, bid edits, keyword creation, and
+        campaign/ad-group/ad structure changes all produce durable
+        state on a real money-spending account and should route past
+        an operator by default. Operators who want to auto-approve a
+        class (e.g. nightly-reportable budget edits within policy
+        thresholds) can opt in when the next policy knob lands.
+
+        This closes auditor HIGH on this PR.
         """
-        # Pause actions.
-        if action in {"pause_campaigns"} and not self._policy.auto_approve_pause:
-            return True
-        # Resume actions.
-        if action in {"resume_campaigns"} and not self._policy.auto_approve_resume:
-            return True
-        # Negative keyword additions.
-        # Everything else (budget edits, bid edits, structural changes)
-        # is covered by per-op kill-switches KS#1-KS#5 that already ran.
-        # The approval tier policy only gates the four "which class of
-        # op auto-runs" knobs from §M2.1.
-        return (
-            action in {"add_negative_keywords"} and not self._policy.auto_approve_negative_keywords
-        )
+        # Whitelist paths: the three § M2.1 tiers that can auto-approve.
+        if action == "pause_campaigns":
+            return not self._policy.auto_approve_pause
+        if action == "resume_campaigns":
+            return not self._policy.auto_approve_resume
+        if action == "add_negative_keywords":
+            return not self._policy.auto_approve_negative_keywords
+
+        # Whitelisted auto-approvable actions handled above. Every
+        # other mutating action requires confirm until a dedicated
+        # policy knob is added.
+        return action not in _AUTO_APPROVABLE_ACTIONS

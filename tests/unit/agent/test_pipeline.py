@@ -172,19 +172,43 @@ class TestRolloutStage:
         assert "shadow" in result.reason
 
     def test_assist_allows_pause_but_rejects_budget(self) -> None:
+        # Pause goes through (with the budget snapshot required by
+        # mutating-action guard); budget edit is not in assist stage.
         pipe = SafetyPipeline(_policy(rollout_stage="assist"))
-        assert pipe.review(_plan("pause_campaigns"), _ctx()).status == "allow"
-        assert pipe.review(_plan("set_campaign_budget"), _ctx()).status == "reject"
+        snap = AccountBudgetSnapshot(
+            campaigns=[CampaignBudget(id=1, name="c", daily_budget_rub=100, state="ON")]
+        )
+        assert pipe.review(_plan("pause_campaigns"), _ctx(budget_snapshot=snap)).status == "allow"
+        assert (
+            pipe.review(_plan("set_campaign_budget"), _ctx(budget_snapshot=snap)).status == "reject"
+        )
 
-    def test_autonomy_light_allows_budget_edits(self) -> None:
+    def test_autonomy_light_requires_confirmation_on_budget_edit(self) -> None:
+        # set_campaign_budget is not on the auto-approve whitelist
+        # (auditor HIGH), so default posture is `confirm` even when
+        # the kill-switches pass.
         pipe = SafetyPipeline(_policy(rollout_stage="autonomy_light"))
-        result = pipe.review(_plan("set_campaign_budget"), _ctx())
-        assert result.status == "allow"
+        snap = AccountBudgetSnapshot(
+            campaigns=[CampaignBudget(id=1, name="c", daily_budget_rub=100, state="ON")]
+        )
+        result = pipe.review(
+            _plan("set_campaign_budget"),
+            _ctx(
+                budget_snapshot=snap,
+                budget_changes=[BudgetChange(campaign_id=1, new_daily_budget_rub=200)],
+            ),
+        )
+        assert result.status == "confirm"
 
-    def test_autonomy_full_allows_create_campaign(self) -> None:
+    def test_autonomy_full_requires_confirmation_on_create_campaign(self) -> None:
+        # Structural changes also default to confirm until an explicit
+        # auto-approve knob lands.
         pipe = SafetyPipeline(_policy(rollout_stage="autonomy_full"))
         result = pipe.review(_plan("create_campaign"), _ctx())
-        assert result.status == "allow"
+        # create_campaign is not in the required-snapshot map, so this
+        # passes the snapshot guard. It falls through to the approval
+        # tier and gets `confirm` by default.
+        assert result.status == "confirm"
 
     def test_unknown_action_rejected_even_in_autonomy_full(self) -> None:
         # Defence in depth — a completely unknown action string can't
@@ -222,12 +246,20 @@ class TestReadOnlyShortCircuit:
 # --------------------------------------------------------------------------
 
 
+def _budget_snap() -> AccountBudgetSnapshot:
+    """Minimal budget snapshot for mutating actions that require it."""
+    return AccountBudgetSnapshot(
+        campaigns=[CampaignBudget(id=1, name="c", daily_budget_rub=100, state="ON")]
+    )
+
+
 class TestSystemGatekeepers:
     def test_conversion_collapse_blocks_mutating_plan(self) -> None:
         pipe = SafetyPipeline(_policy(conversion_min_total=10))
         result = pipe.review(
             _plan("pause_campaigns"),
             _ctx(
+                budget_snapshot=_budget_snap(),
                 conversions_baseline=ConversionsSnapshot(
                     counter_id=1,
                     goals=[GoalConversions(goal_id=1, goal_name="g", conversions=100)],
@@ -244,6 +276,7 @@ class TestSystemGatekeepers:
         result = pipe.review(
             _plan("pause_campaigns"),
             _ctx(
+                budget_snapshot=_budget_snap(),
                 queries_baseline=SearchQueriesSnapshot(counter_id=1, queries=["a", "b"]),
                 queries_current=SearchQueriesSnapshot(counter_id=1, queries=["a", "x", "y", "z"]),
             ),
@@ -275,7 +308,9 @@ class TestPerOperationChecks:
         )
         assert result.status == "reject"
 
-    def test_budget_cap_passes_under_cap(self) -> None:
+    def test_budget_cap_passes_under_cap_but_requires_confirm(self) -> None:
+        # set_campaign_budget is not auto-approvable; after all checks
+        # pass the pipeline returns `confirm`.
         pipe = SafetyPipeline(_policy(account_cap=10_000))
         snap = AccountBudgetSnapshot(
             campaigns=[CampaignBudget(id=1, name="c1", daily_budget_rub=5_000, state="ON")]
@@ -287,7 +322,7 @@ class TestPerOperationChecks:
                 budget_changes=[BudgetChange(campaign_id=1, new_daily_budget_rub=7_000)],
             ),
         )
-        assert result.status == "allow"
+        assert result.status == "confirm"
 
     def test_max_cpc_blocks_over_cap_bid(self) -> None:
         pipe = SafetyPipeline(_policy(max_cpc_by_campaign={100: 20.0}))
@@ -319,28 +354,68 @@ class TestPerOperationChecks:
 class TestApprovalTiers:
     def test_resume_requires_confirmation_when_flag_off(self) -> None:
         pipe = SafetyPipeline(_policy(auto_approve_resume=False))
-        result = pipe.review(_plan("resume_campaigns"), _ctx())
+        result = pipe.review(_plan("resume_campaigns"), _ctx(budget_snapshot=_budget_snap()))
         assert result.status == "confirm"
-        assert "resume" in result.reason
 
     def test_resume_allowed_when_flag_on(self) -> None:
         pipe = SafetyPipeline(_policy(auto_approve_resume=True))
-        result = pipe.review(_plan("resume_campaigns"), _ctx())
+        result = pipe.review(_plan("resume_campaigns"), _ctx(budget_snapshot=_budget_snap()))
         assert result.status == "allow"
 
     def test_pause_auto_approved_by_default(self) -> None:
         pipe = SafetyPipeline(_policy())
-        result = pipe.review(_plan("pause_campaigns"), _ctx())
+        result = pipe.review(_plan("pause_campaigns"), _ctx(budget_snapshot=_budget_snap()))
         assert result.status == "allow"
 
     def test_pause_requires_confirmation_when_flag_off(self) -> None:
         pipe = SafetyPipeline(_policy(auto_approve_pause=False))
-        result = pipe.review(_plan("pause_campaigns"), _ctx())
+        result = pipe.review(_plan("pause_campaigns"), _ctx(budget_snapshot=_budget_snap()))
         assert result.status == "confirm"
 
     def test_negative_keywords_require_confirmation_when_flag_off(self) -> None:
         pipe = SafetyPipeline(_policy(auto_approve_negative_keywords=False))
-        result = pipe.review(_plan("add_negative_keywords"), _ctx())
+        result = pipe.review(_plan("add_negative_keywords"), _ctx(budget_snapshot=_budget_snap()))
+        assert result.status == "confirm"
+
+    def test_budget_edit_requires_confirmation_by_default(self) -> None:
+        # Auditor HIGH: the original pipeline auto-allowed budget edits.
+        # Default posture is now `confirm` for actions not on the
+        # auto-approve whitelist.
+        pipe = SafetyPipeline(_policy())
+        snap = _budget_snap()
+        result = pipe.review(
+            _plan("set_campaign_budget"),
+            _ctx(
+                budget_snapshot=snap,
+                budget_changes=[BudgetChange(campaign_id=1, new_daily_budget_rub=150)],
+            ),
+        )
+        assert result.status == "confirm"
+
+    def test_create_campaign_requires_confirmation_by_default(self) -> None:
+        pipe = SafetyPipeline(_policy())
+        result = pipe.review(_plan("create_campaign"), _ctx())
+        assert result.status == "confirm"
+
+    def test_set_keyword_bids_requires_confirmation_by_default(self) -> None:
+        pipe = SafetyPipeline(_policy())
+        bid_snap = AccountBidSnapshot(
+            keywords=[
+                KeywordSnapshot(
+                    keyword_id=1,
+                    campaign_id=100,
+                    current_search_bid_rub=5.0,
+                    quality_score=7,
+                )
+            ]
+        )
+        result = pipe.review(
+            _plan("set_keyword_bids"),
+            _ctx(
+                bid_snapshot=bid_snap,
+                bid_changes=[ProposedBidChange(keyword_id=1, new_search_bid_rub=8.0)],
+            ),
+        )
         assert result.status == "confirm"
 
 
@@ -350,48 +425,29 @@ class TestApprovalTiers:
 
 
 class TestSessionTOCTOU:
-    def test_second_call_higher_than_first_approved_bid_is_rejected(self) -> None:
-        # First call: propose bid=10.0 against snapshot where current=8.0 →
-        # approved. Pipeline records max_approved_bid_per_keyword[1]=10.0.
-        # Second call: propose bid=12.0 against a fresh snapshot where
-        # current=10.0 (i.e. already applied). Per-snapshot max_cpc
-        # check would pass (no cap configured), but session TOCTOU
-        # sees 12.0 > 10.0 and blocks.
+    def test_second_call_higher_than_first_recorded_bid_is_rejected(self) -> None:
+        # Executor records a successful first apply at 10.0 via
+        # on_applied. Second review proposes 12.0 → session TOCTOU
+        # sees 12.0 > 10.0 and blocks even though per-snapshot checks
+        # would pass individually.
         session = SessionState()
         pipe = SafetyPipeline(_policy(), session_state=session)
-        snap1 = AccountBidSnapshot(
-            keywords=[
-                KeywordSnapshot(
-                    keyword_id=1,
-                    campaign_id=100,
-                    current_search_bid_rub=8.0,
-                )
-            ]
+        snap = AccountBidSnapshot(
+            keywords=[KeywordSnapshot(keyword_id=1, campaign_id=100, current_search_bid_rub=10.0)]
         )
 
-        first = pipe.review(
-            _plan("set_keyword_bids", plan_id="p1"),
-            _ctx(
-                bid_snapshot=snap1,
-                bid_changes=[ProposedBidChange(keyword_id=1, new_search_bid_rub=10.0)],
-            ),
+        # Simulate prior successful apply.
+        prior_context = _ctx(
+            bid_snapshot=snap,
+            bid_changes=[ProposedBidChange(keyword_id=1, new_search_bid_rub=10.0)],
         )
-        assert first.status == "allow"
+        pipe.on_applied(prior_context)
         assert session.approved_bid_ceiling(1) == 10.0
 
-        snap2 = AccountBidSnapshot(
-            keywords=[
-                KeywordSnapshot(
-                    keyword_id=1,
-                    campaign_id=100,
-                    current_search_bid_rub=10.0,  # reflects the first call
-                )
-            ]
-        )
         second = pipe.review(
             _plan("set_keyword_bids", plan_id="p2"),
             _ctx(
-                bid_snapshot=snap2,
+                bid_snapshot=snap,
                 bid_changes=[ProposedBidChange(keyword_id=1, new_search_bid_rub=12.0)],
             ),
         )
@@ -402,22 +458,16 @@ class TestSessionTOCTOU:
         session = SessionState()
         pipe = SafetyPipeline(_policy(), session_state=session)
         snap = AccountBidSnapshot(
-            keywords=[
-                KeywordSnapshot(
-                    keyword_id=1,
-                    campaign_id=100,
-                    current_search_bid_rub=5.0,
-                )
-            ]
+            keywords=[KeywordSnapshot(keyword_id=1, campaign_id=100, current_search_bid_rub=5.0)]
         )
-        pipe.review(
-            _plan("set_keyword_bids", plan_id="p1"),
+        # Prior apply at 10.0.
+        pipe.on_applied(
             _ctx(
                 bid_snapshot=snap,
                 bid_changes=[ProposedBidChange(keyword_id=1, new_search_bid_rub=10.0)],
-            ),
+            )
         )
-        # Then lower.
+        # Then propose lower.
         result = pipe.review(
             _plan("set_keyword_bids", plan_id="p2"),
             _ctx(
@@ -425,7 +475,26 @@ class TestSessionTOCTOU:
                 bid_changes=[ProposedBidChange(keyword_id=1, new_search_bid_rub=3.0)],
             ),
         )
-        assert result.status == "allow"
+        assert result.status == "confirm"  # bid edits need confirm; not reject.
+
+    def test_review_does_not_record_session_state(self) -> None:
+        # Auditor HIGH: recording in review poisons the TOCTOU register
+        # on executor failure. review() must leave session untouched;
+        # executor calls on_applied only after a successful write.
+        session = SessionState()
+        pipe = SafetyPipeline(_policy(), session_state=session)
+        snap = AccountBidSnapshot(
+            keywords=[KeywordSnapshot(keyword_id=1, campaign_id=100, current_search_bid_rub=5.0)]
+        )
+        pipe.review(
+            _plan("set_keyword_bids"),
+            _ctx(
+                bid_snapshot=snap,
+                bid_changes=[ProposedBidChange(keyword_id=1, new_search_bid_rub=9.0)],
+            ),
+        )
+        # No on_applied called → session register untouched.
+        assert session.approved_bid_ceiling(1) is None
 
 
 # --------------------------------------------------------------------------
@@ -433,19 +502,43 @@ class TestSessionTOCTOU:
 # --------------------------------------------------------------------------
 
 
-class TestSkippedChecks:
-    def test_missing_budget_snapshot_skips_budget_cap_check(self) -> None:
+class TestRequiredSnapshots:
+    """Auditor CRITICAL: empty ReviewContext used to let every check be
+    skipped and the plan auto-allowed. Pipeline now rejects mutating
+    actions that arrive without the appropriate snapshot.
+    """
+
+    def test_missing_budget_snapshot_rejects_budget_edit(self) -> None:
         pipe = SafetyPipeline(_policy())
         result = pipe.review(
             _plan("set_campaign_budget"),
             _ctx(budget_snapshot=None),
         )
-        assert result.status == "allow"
-        assert "budget_cap" in result.skipped_checks
+        assert result.status == "reject"
+        assert "budget_snapshot" in result.reason
 
-    def test_missing_baselines_skip_temporal_checks(self) -> None:
+    def test_missing_bid_snapshot_rejects_bid_edit(self) -> None:
+        pipe = SafetyPipeline(_policy())
+        result = pipe.review(
+            _plan("set_keyword_bids"),
+            _ctx(bid_snapshot=None),
+        )
+        assert result.status == "reject"
+        assert "bid_snapshot" in result.reason
+
+    def test_missing_budget_snapshot_rejects_pause(self) -> None:
+        # Even a reversible action like pause must carry context — the
+        # pipeline cannot run KS#1 without a snapshot.
         pipe = SafetyPipeline(_policy())
         result = pipe.review(_plan("pause_campaigns"), _ctx())
+        assert result.status == "reject"
+
+    def test_missing_baselines_do_not_block_mutating_action(self) -> None:
+        # Temporal baselines (conversion / query drift) are optional;
+        # missing them skips those gatekeepers but doesn't reject the
+        # plan when the required per-op snapshot is present.
+        pipe = SafetyPipeline(_policy())
+        result = pipe.review(_plan("pause_campaigns"), _ctx(budget_snapshot=_budget_snap()))
         assert result.status == "allow"
         assert "conversion_integrity" in result.skipped_checks
         assert "query_drift" in result.skipped_checks
