@@ -28,6 +28,7 @@ rather than ``ImportError`` (wrong reason).
 from __future__ import annotations
 
 import math
+import re
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -523,11 +524,19 @@ class MaxCpcCheck:
 class NegativeKeywordFloorPolicy(BaseModel):
     """Kill-switch #3 policy slice.
 
-    Matching is case-insensitive, whitespace-trimmed, and
-    Unicode-normalised (NFC) — an operator writing ``"Бесплатно"`` in
-    YAML must match a campaign's existing ``"бесплатно "`` without
-    manual curation, and NFC/NFD encoding differences from the API
-    must not create false mismatches.
+    Matching is case-insensitive, whitespace-tolerant on *all*
+    whitespace positions (leading, trailing, and internal runs
+    between words), and Unicode-normalised (NFC) — an operator
+    writing ``"Бесплатно скачать"`` in YAML must match a campaign's
+    existing ``"бесплатно  скачать "`` without manual curation, and
+    NFC/NFD encoding differences from the API must not create false
+    mismatches.
+
+    Internal-whitespace folding is shared with KS#7 via
+    ``_normalize_keyword``. Multi-word phrases with stray double
+    spaces fold to single spaces before comparison — see
+    ``test_multi_word_negative_keyword_internal_whitespace_collapses``
+    in the test suite for the pinned behaviour.
 
     Empty/whitespace-only entries are rejected at load time: a ``""``
     would collapse to an empty required-set element, blocking every
@@ -559,14 +568,18 @@ def load_negative_keyword_floor_policy(path: Path) -> NegativeKeywordFloorPolicy
     return NegativeKeywordFloorPolicy.model_validate(fields)
 
 
+_INTERNAL_WS_RE = re.compile(r"\s+")
+
+
 def _normalize_keyword(phrase: str) -> str:
     """Fold a phrase for case-insensitive, whitespace-forgiving,
     Unicode-canonicalised comparison.
 
     Normalisation order: NFC first (so NFD-decomposed input from the
-    API folds to the canonical composed form), then strip whitespace,
-    then lowercase. Keeps safety-layer independent of
-    services.semantics.
+    API folds to the canonical composed form), then collapse internal
+    whitespace runs to a single space (multi-word search queries like
+    "купить  обувь" must match "купить обувь"), then strip, then
+    lowercase. Keeps safety-layer independent of services.semantics.
 
     Without the NFC step, a campaign keyword returned by the Direct
     API in NFD form (where each combining letter like U+0439 CYRILLIC
@@ -574,8 +587,13 @@ def _normalize_keyword(phrase: str) -> str:
     match a policy written in the composed NFC form. That's a silent
     false-positive block in one direction and a potential false
     negative in the other. Auditor HIGH finding on KS#3.
+
+    Internal-whitespace collapse added for KS#7: search queries are
+    multi-word and users / reports sometimes include stray extra
+    spaces. The KS#3 tests still pass because they only use trailing/
+    leading whitespace and single-word phrases.
     """
-    return unicodedata.normalize("NFC", phrase).strip().lower()
+    return _INTERNAL_WS_RE.sub(" ", unicodedata.normalize("NFC", phrase)).strip().lower()
 
 
 class NegativeKeywordFloorCheck:
@@ -1153,4 +1171,167 @@ class ConversionIntegrityCheck:
         return CheckResult.ok_result(
             baseline_total=baseline_total,
             current_total=current_total,
+        )
+
+
+# --------------------------------------------------------------------------
+# Kill-switch #7 — Query drift detector.
+#
+# Second system-level gatekeeper (alongside KS#6). Compares two sets
+# of observed search queries — baseline (e.g. last week) and current
+# (e.g. today) — and blocks when the share of *new* queries (present
+# in current, absent in baseline) exceeds a configured fraction.
+# Signals that Direct may have started showing ads to an unintended
+# audience (broad-match drift, bid-strategy anomaly, etc).
+#
+# Matching is case- and whitespace-insensitive and Unicode-canonical
+# (NFC) via the shared ``_normalize_keyword`` helper introduced for
+# KS#3. Duplicate entries within a snapshot collapse to one via set
+# semantics.
+#
+# Out of scope for this PR (BACKLOG):
+# - Real Metrika / Direct API integration (§M6).
+# - Reach-weighted drift (new queries with many impressions vs a
+#   handful) — today the check is population-based, not impression-
+#   weighted. A future refinement could require baseline/current
+#   impressions per query.
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SearchQueriesSnapshot:
+    """Distinct search queries observed over one reporting window.
+
+    ``queries`` is a list on the wire (YAML / API) but folds to a
+    normalised set for comparison. Callers shouldn't assume the list
+    is deduplicated or canonicalised; that work happens in
+    ``normalised()``.
+    """
+
+    counter_id: int
+    queries: list[str] = field(default_factory=list)
+
+    def normalised(self) -> frozenset[str]:
+        """Return the set of NFC / stripped / lower-cased non-empty queries."""
+        out: set[str] = set()
+        for q in self.queries:
+            norm = _normalize_keyword(q)
+            if norm:
+                out.add(norm)
+        return frozenset(out)
+
+
+class QueryDriftPolicy(BaseModel):
+    """Kill-switch #7 policy slice.
+
+    ``max_new_query_share`` is the strict upper bound on
+    ``|new_queries| / |current_queries|`` before the plan is refused.
+    Default 0.4 per §M2.1 — a run where 40%+ of today's queries did
+    not exist a week ago is almost always an audience-targeting
+    anomaly worth a human's eyes.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    max_new_query_share: float = Field(
+        default=0.4,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Max share of current queries that may be absent from the baseline snapshot, in [0, 1]."
+        ),
+    )
+
+
+def load_query_drift_policy(path: Path) -> QueryDriftPolicy:
+    """Read ``agent_policy.yml`` and extract the query-drift slice."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    fields = {k: raw[k] for k in ("max_new_query_share",) if k in raw}
+    return QueryDriftPolicy.model_validate(fields)
+
+
+class QueryDriftCheck:
+    """Block plans when today's query mix drifted too far from baseline.
+
+    Pipeline:
+    0. counter_id mismatch between snapshots → blocked (same safeguard
+       as KS#6; comparing different counters is meaningless).
+    1. Empty baseline or empty current → warn. No reference point or
+       no data to compare; pipeline can decide whether a warn aborts
+       autonomous operation (M2.2).
+    2. Normalise both sides (shared _normalize_keyword — NFC, strip,
+       lower). Collapses case/whitespace/encoding variants that would
+       otherwise inflate the drift metric.
+    3. new_share = |current - baseline| / |current|. Strict `>`
+       threshold blocks; equality passes so operators can set an
+       exact ceiling.
+    """
+
+    _SAMPLE_LIMIT = 10
+
+    def __init__(self, policy: QueryDriftPolicy) -> None:
+        self._policy = policy
+
+    def check(
+        self,
+        baseline: SearchQueriesSnapshot,
+        current: SearchQueriesSnapshot,
+    ) -> CheckResult:
+        if baseline.counter_id != current.counter_id:
+            return CheckResult.blocked_result(
+                (
+                    f"snapshot counter_id mismatch: baseline="
+                    f"{baseline.counter_id}, current={current.counter_id}"
+                ),
+                baseline_counter_id=baseline.counter_id,
+                current_counter_id=current.counter_id,
+            )
+
+        baseline_set = baseline.normalised()
+        current_set = current.normalised()
+
+        if not baseline_set:
+            return CheckResult.warn_result(
+                "baseline has no queries; drift check cannot apply",
+                baseline_size=0,
+                current_size=len(current_set),
+            )
+        if not current_set:
+            return CheckResult.warn_result(
+                "current has no queries; drift check cannot apply",
+                baseline_size=len(baseline_set),
+                current_size=0,
+            )
+
+        new_queries = current_set - baseline_set
+        new_count = len(new_queries)
+        current_size = len(current_set)
+        new_share = new_count / current_size
+
+        threshold = self._policy.max_new_query_share
+        if new_share > threshold:
+            # Surface a small sample of the offending queries so a
+            # human reviewer can paste them into the search-term
+            # report without re-running analysis.
+            #
+            # privacy-note: these are raw (normalised but not
+            # redacted) user queries. Direct search terms can
+            # contain names, addresses, or medical phrases. The
+            # audit sink (M2.3) must hash or truncate this list
+            # before log persistence. BACKLOG item tracked.
+            sample = sorted(new_queries)[: self._SAMPLE_LIMIT]
+            return CheckResult.blocked_result(
+                (f"new-query share {new_share:.3f} exceeds threshold {threshold}"),
+                new_share=new_share,
+                threshold=threshold,
+                current_size=current_size,
+                baseline_size=len(baseline_set),
+                new_count=new_count,
+                new_queries_sample=sample,
+            )
+
+        return CheckResult.ok_result(
+            new_share=new_share,
+            baseline_size=len(baseline_set),
+            current_size=current_size,
         )
