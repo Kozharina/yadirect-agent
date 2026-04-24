@@ -74,7 +74,6 @@ def test_doctor_exits_nonzero_when_any_check_fails(
     monkeypatch: pytest.MonkeyPatch,
     _patch_bootstrap: None,
 ) -> None:
-    import yadirect_agent.cli.main as cli_module
     from yadirect_agent.cli.doctor import CheckResult
 
     async def fake_run_checks(_settings: Any) -> list[CheckResult]:
@@ -98,7 +97,6 @@ def test_doctor_warn_does_not_set_failure_exit(
 ) -> None:
     # A warning (e.g. policy file missing) is not a fail — we still want
     # the command to exit cleanly so it composes in cron-style pipelines.
-    import yadirect_agent.cli.main as cli_module
     from yadirect_agent.cli.doctor import CheckResult
 
     async def fake_run_checks(_settings: Any) -> list[CheckResult]:
