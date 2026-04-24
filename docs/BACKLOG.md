@@ -92,6 +92,23 @@ the PR merges or is abandoned.
 
 Accumulated work that isn't blocking but will sting later.
 
+- [ ] **M2.2 part 3 executor must-haves** (from SafetyPipeline
+      second-pass auditor review; block apply-plan merge):
+  - **Executor must call `SafetyPipeline.on_applied(context)`
+    exactly once after a successful API write**, and must NOT call
+    it on failure or timeout. The session TOCTOU register (max
+    approved bid per keyword) degrades silently to the per-snapshot
+    ceiling alone if this contract breaks. Acceptance test: write a
+    regression that exercises the failure path — plan allowed,
+    executor raises, next review of the same keyword at a higher
+    bid must NOT slip past the session cap.
+  - **Plan must carry the exact `ReviewContext` that produced the
+    decision** (not a rebuilt one at execute time), so
+    `on_applied` records bids against the same snapshot the
+    decision was made on. Alternatively, persist the minimal
+    identity (keyword_id → approved ceiling) inside
+    `OperationPlan.args` and reconstruct at apply time.
+
 - [ ] **M2.2 pipeline must-haves** (from M2.1 auditor review; block
       M2.2 merge, not just landing):
   - **`rollout_stage` enforcement** — today the field is stored but
