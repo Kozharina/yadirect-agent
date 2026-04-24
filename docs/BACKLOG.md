@@ -325,6 +325,21 @@ Last 10 items (newest at top). Older items are available via
       bug that had been hitting KS PRs as `ruff format --check`
       CI failures on code that passed locally. Bumping ruff is
       now a 3-file operation documented in both config comments.
+- [x] **M2.2 data layer — OperationPlan + PendingPlansStore** —
+      first slice of §M2.2. `OperationPlan` frozen pydantic model
+      (plan_id / created_at / action / resource_type / resource_ids
+      / args / preview / reason / status / trace_id).
+      `PendingPlansStore` is an append-only JSONL: `append`,
+      `list_pending`, `get`, `update_status`. Status updates append
+      a new row rather than rewrite, so the file doubles as a
+      tamper-evident audit trail until M2.3 audit sink ships.
+      Readers collapse-by-id keeping latest. Robust to blank lines
+      and corrupt rows. CLI `yadirect-agent plans list [--all]` and
+      `plans show <id>` render pending/all plans via rich table and
+      per-plan detail view. `generate_plan_id()` gives URL-safe
+      16-hex-char ids. 28 new tests (plans + CLI smoke; 350 total).
+      Orchestrator / @requires_plan decorator / apply-plan
+      executor land in the next PR.
 - [x] **M2.1 — Unified Policy schema** — single frozen pydantic
       `Policy` aggregates all 7 slice-policies plus §M2.1's four
       groups (approval tiers, per-op thresholds, forbidden_ops,
