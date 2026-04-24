@@ -354,19 +354,6 @@ async def test_list_campaigns_summary_shape(
 ) -> None:
     from yadirect_agent.services.campaigns import CampaignService
 
-    async def fake_list_all(self: CampaignService, _limit: int = 500) -> list:
-        return [
-            # Use the pydantic Campaign model via the service's internal conversion.
-            Campaign(
-                Id=1,
-                Name="alpha",
-                State=CampaignState.ON,
-                Status=CampaignStatus.ACCEPTED,
-                Type="TEXT_CAMPAIGN",
-                DailyBudget=DailyBudget(amount=500_000_000, mode="STANDARD"),
-            )
-        ]
-
     # The service wraps `Campaign` in `CampaignSummary`. The tool converts
     # that summary to a dict. We bypass `DirectService` by patching the
     # service method to produce summaries directly.
