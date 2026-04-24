@@ -103,17 +103,29 @@ class AccountBudgetSnapshot:
         )
 
 
-@dataclass(frozen=True)
-class BudgetChange:
+# Direct states we recognise. Kept as a Literal (not a StrEnum) so
+# pydantic produces a tight schema error on typos like "on" / "enabled".
+BudgetChangeState = Literal["ON", "OFF", "SUSPENDED", "ENDED", "CONVERTED", "ARCHIVED"]
+
+
+class BudgetChange(BaseModel):
     """A proposed change to a single campaign's budget-relevant state.
 
     A field set to ``None`` means "leave that property as-is". This lets
     a single object describe a budget change, a resume/pause, or both.
+
+    Validated at construction (security-auditor review, HIGH findings):
+    - ``new_daily_budget_rub`` must be ``>= 0``; negatives would shrink
+      the projected total and bypass the cap.
+    - ``new_state`` must match Direct's actual enum; free strings like
+      ``"on"`` would bypass the ``state == "ON"`` filter in totals.
     """
 
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     campaign_id: int
-    new_daily_budget_rub: float | None = None
-    new_state: str | None = None
+    new_daily_budget_rub: float | None = Field(default=None, ge=0)
+    new_state: BudgetChangeState | None = None
 
 
 # --------------------------------------------------------------------------
@@ -141,6 +153,19 @@ class BudgetCapPolicy(BaseModel):
         default_factory=dict,
         description="Optional per-group ceilings (group name → RUB).",
     )
+
+
+def _find_duplicate_ids(changes: list[BudgetChange]) -> list[int]:
+    """Return campaign_ids that appear more than once in ``changes``, in
+    the order of their first duplicate occurrence. Empty list means
+    every id is unique."""
+    seen: set[int] = set()
+    dupes: list[int] = []
+    for c in changes:
+        if c.campaign_id in seen and c.campaign_id not in dupes:
+            dupes.append(c.campaign_id)
+        seen.add(c.campaign_id)
+    return dupes
 
 
 def load_budget_cap_policy(path: Path) -> BudgetCapPolicy:
@@ -187,6 +212,19 @@ class BudgetCapCheck:
         snapshot: AccountBudgetSnapshot,
         changes: list[BudgetChange],
     ) -> CheckResult:
+        duplicates = _find_duplicate_ids(changes)
+        if duplicates:
+            # security-auditor HIGH finding: `_project` would silently
+            # keep only the last BudgetChange for a given id, letting an
+            # adversarial caller hide a budget spike behind a later
+            # state flip. Refuse the whole batch instead.
+            first = duplicates[0]
+            return CheckResult.blocked_result(
+                f"duplicate campaign_id in changes: {first}",
+                campaign_id=first,
+                duplicates=duplicates,
+            )
+
         projected = self._project(snapshot, changes)
 
         account_total = projected.total_active_budget_rub()
@@ -218,6 +256,8 @@ class BudgetCapCheck:
         snapshot: AccountBudgetSnapshot,
         changes: list[BudgetChange],
     ) -> AccountBudgetSnapshot:
+        # Duplicate-id rejection happens in `check()` before this point,
+        # so building a dict here is safe.
         """Return a new snapshot with every change applied.
 
         Changes not matching any existing campaign are silently ignored
