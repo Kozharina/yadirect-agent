@@ -22,6 +22,10 @@ from yadirect_agent.agent.safety import (
     BudgetChange,
     CampaignBudget,
     CheckResult,
+    ConversionIntegrityCheck,
+    ConversionIntegrityPolicy,
+    ConversionsSnapshot,
+    GoalConversions,
     KeywordSnapshot,
     MaxCpcCheck,
     MaxCpcPolicy,
@@ -32,6 +36,7 @@ from yadirect_agent.agent.safety import (
     QualityScoreGuardPolicy,
     load_budget_balance_drift_policy,
     load_budget_cap_policy,
+    load_conversion_integrity_policy,
     load_max_cpc_policy,
     load_negative_keyword_floor_policy,
     load_quality_score_guard_policy,
@@ -1582,3 +1587,261 @@ class TestBudgetBalanceDriftEdgeCases:
 
         # Campaign 2 went from 50% → 0% (50pp drop).
         assert result.status == "blocked"
+
+
+# ==========================================================================
+# Kill-switch #6 — Conversion integrity.
+# ==========================================================================
+
+
+def _goals(*specs: tuple[int, int]) -> list[GoalConversions]:
+    """Helper: [(goal_id, conversions), ...] → list[GoalConversions]."""
+    return [
+        GoalConversions(goal_id=gid, goal_name=f"goal-{gid}", conversions=n) for gid, n in specs
+    ]
+
+
+def _snap(goals: list[GoalConversions], *, counter_id: int = 1) -> ConversionsSnapshot:
+    return ConversionsSnapshot(counter_id=counter_id, goals=goals)
+
+
+def _ci_policy(
+    *,
+    min_total: int = 1,
+    min_ratio: float = 0.5,
+    require_goals: bool = True,
+) -> ConversionIntegrityPolicy:
+    return ConversionIntegrityPolicy(
+        min_conversions_total=min_total,
+        min_ratio_vs_baseline=min_ratio,
+        require_all_baseline_goals_present=require_goals,
+    )
+
+
+class TestConversionIntegrityPolicyValidation:
+    def test_default_policy_is_sensible(self) -> None:
+        p = ConversionIntegrityPolicy()
+        assert p.min_conversions_total == 1
+        assert p.min_ratio_vs_baseline == 0.5
+        assert p.require_all_baseline_goals_present is True
+
+    def test_rejects_negative_min_total(self) -> None:
+        with pytest.raises(ValidationError):
+            ConversionIntegrityPolicy(min_conversions_total=-1)
+
+    def test_rejects_ratio_above_one(self) -> None:
+        with pytest.raises(ValidationError):
+            ConversionIntegrityPolicy(min_ratio_vs_baseline=1.5)
+
+    def test_rejects_negative_ratio(self) -> None:
+        with pytest.raises(ValidationError):
+            ConversionIntegrityPolicy(min_ratio_vs_baseline=-0.1)
+
+    def test_rejects_extra_fields(self) -> None:
+        with pytest.raises(ValidationError):
+            ConversionIntegrityPolicy.model_validate({"unknown": 1})
+
+    def test_policy_is_immutable(self) -> None:
+        p = _ci_policy()
+        with pytest.raises(ValidationError):
+            p.min_conversions_total = 100  # type: ignore[misc]
+
+
+class TestLoadConversionIntegrityPolicy:
+    def test_loads_from_yaml(self, tmp_path: Path) -> None:
+        path = tmp_path / "agent_policy.yml"
+        path.write_text(
+            """
+min_conversions_total: 10
+min_ratio_vs_baseline: 0.7
+require_all_baseline_goals_present: false
+""",
+            encoding="utf-8",
+        )
+
+        p = load_conversion_integrity_policy(path)
+        assert p.min_conversions_total == 10
+        assert p.min_ratio_vs_baseline == 0.7
+        assert p.require_all_baseline_goals_present is False
+
+    def test_tolerates_unknown_keys(self, tmp_path: Path) -> None:
+        path = tmp_path / "agent_policy.yml"
+        path.write_text(
+            """
+account_daily_budget_cap_rub: 5000
+min_conversions_total: 5
+""",
+            encoding="utf-8",
+        )
+        p = load_conversion_integrity_policy(path)
+        assert p.min_conversions_total == 5
+
+
+class TestConversionsSnapshot:
+    def test_total_conversions_sums_goals(self) -> None:
+        s = _snap(_goals((1, 10), (2, 5)))
+        assert s.total_conversions() == 15
+
+    def test_goal_ids_returns_set(self) -> None:
+        s = _snap(_goals((1, 10), (2, 5)))
+        assert s.goal_ids() == {1, 2}
+
+    def test_find_returns_goal(self) -> None:
+        s = _snap(_goals((1, 10), (2, 5)))
+        assert s.find(2) is not None
+        assert s.find(2).conversions == 5  # type: ignore[union-attr]
+        assert s.find(999) is None
+
+    def test_empty_snapshot_totals_zero(self) -> None:
+        s = _snap([])
+        assert s.total_conversions() == 0
+        assert s.goal_ids() == set()
+
+
+class TestConversionIntegrityHappyPath:
+    def test_ok_when_current_matches_baseline(self) -> None:
+        check = ConversionIntegrityCheck(_ci_policy())
+        baseline = _snap(_goals((1, 100), (2, 50)))
+        current = _snap(_goals((1, 100), (2, 50)))
+
+        result = check.check(baseline, current)
+
+        assert result.status == "ok"
+
+    def test_ok_when_current_is_higher_than_baseline(self) -> None:
+        check = ConversionIntegrityCheck(_ci_policy())
+        baseline = _snap(_goals((1, 100)))
+        current = _snap(_goals((1, 300)))
+
+        result = check.check(baseline, current)
+
+        assert result.status == "ok"
+
+    def test_ok_when_new_goal_appears_in_current(self) -> None:
+        # Additive change — a new goal doesn't break tracking.
+        check = ConversionIntegrityCheck(_ci_policy())
+        baseline = _snap(_goals((1, 100)))
+        current = _snap(_goals((1, 100), (99, 5)))
+
+        result = check.check(baseline, current)
+
+        assert result.status == "ok"
+
+    def test_ok_when_ratio_exactly_at_threshold(self) -> None:
+        # Strict `<` blocks; equality is ok.
+        check = ConversionIntegrityCheck(_ci_policy(min_ratio=0.5))
+        baseline = _snap(_goals((1, 100)))
+        current = _snap(_goals((1, 50)))  # ratio 0.5 exactly
+
+        result = check.check(baseline, current)
+
+        assert result.status == "ok"
+
+
+class TestConversionIntegrityBlocks:
+    def test_blocked_when_total_below_absolute_minimum(self) -> None:
+        # No conversions at all for a whole window — tracking almost
+        # certainly broken, block writes.
+        check = ConversionIntegrityCheck(_ci_policy(min_total=1))
+        baseline = _snap(_goals((1, 100)))
+        current = _snap([])  # zero conversions
+
+        result = check.check(baseline, current)
+
+        assert result.status == "blocked"
+        assert (
+            "minimum" in (result.reason or "").lower() or "total" in (result.reason or "").lower()
+        )
+        assert result.details.get("current_total") == 0
+        assert result.details.get("min_total") == 1
+
+    def test_blocked_when_ratio_below_threshold(self) -> None:
+        check = ConversionIntegrityCheck(_ci_policy(min_ratio=0.5))
+        baseline = _snap(_goals((1, 100)))
+        current = _snap(_goals((1, 40)))  # ratio 0.4 < 0.5
+
+        result = check.check(baseline, current)
+
+        assert result.status == "blocked"
+        assert result.details.get("current_total") == 40
+        assert result.details.get("baseline_total") == 100
+        assert result.details.get("ratio") == 0.4
+        assert result.details.get("min_ratio") == 0.5
+
+    def test_blocked_when_baseline_goal_is_missing_in_current(self) -> None:
+        # Goal 2 disappeared — could mean the goal was deleted or
+        # tracking for it broke. Block until a human checks.
+        check = ConversionIntegrityCheck(_ci_policy())
+        baseline = _snap(_goals((1, 100), (2, 50)))
+        current = _snap(_goals((1, 100)))  # goal 2 missing
+
+        result = check.check(baseline, current)
+
+        assert result.status == "blocked"
+        missing = result.details.get("missing_goal_ids", [])
+        assert 2 in missing
+
+    def test_missing_goal_check_can_be_disabled(self) -> None:
+        # If an operator intentionally removed a goal, they can turn
+        # off the presence check via policy.
+        check = ConversionIntegrityCheck(_ci_policy(require_goals=False))
+        baseline = _snap(_goals((1, 100), (2, 50)))
+        current = _snap(_goals((1, 100)))
+
+        result = check.check(baseline, current)
+
+        assert result.status == "ok"
+
+    def test_blocks_first_failure(self) -> None:
+        # Multiple failures in one snapshot — return the first.
+        # Ordering: total-floor → ratio → missing-goals. Pinning so a
+        # refactor that reorders is visible.
+        check = ConversionIntegrityCheck(_ci_policy(min_total=10, min_ratio=0.8))
+        baseline = _snap(_goals((1, 100), (2, 50)))
+        current = _snap([])  # 0 total → trips min_total first
+
+        result = check.check(baseline, current)
+
+        assert result.status == "blocked"
+        assert result.details.get("current_total") == 0
+
+
+class TestConversionIntegrityEdgeCases:
+    def test_warns_when_baseline_is_empty(self) -> None:
+        # First-ever run with no historical data. Same pattern as
+        # KS#5: emit warn so M2.3 audit surfaces it and M2.2
+        # pipeline can refuse autonomous operation until the
+        # baseline is filled.
+        check = ConversionIntegrityCheck(_ci_policy())
+        baseline = _snap([])
+        current = _snap(_goals((1, 10)))
+
+        result = check.check(baseline, current)
+
+        assert result.status == "warn"
+        assert "baseline" in (result.reason or "").lower()
+
+    def test_warns_when_baseline_total_is_zero(self) -> None:
+        # Goals exist in baseline but carried zero conversions —
+        # either a low-traffic period or tracking was already broken.
+        # Not blocked; a warn is the honest stance.
+        check = ConversionIntegrityCheck(_ci_policy())
+        baseline = _snap(_goals((1, 0), (2, 0)))
+        current = _snap(_goals((1, 10)))
+
+        result = check.check(baseline, current)
+
+        assert result.status == "warn"
+
+    def test_min_total_zero_disables_absolute_floor(self) -> None:
+        # Zero floor means "don't check"; a completely empty current
+        # is then allowed as long as ratio and goals survive.
+        check = ConversionIntegrityCheck(_ci_policy(min_total=0, require_goals=False))
+        baseline = _snap([])
+        current = _snap([])
+
+        result = check.check(baseline, current)
+
+        # baseline empty → warn by the empty-baseline branch, not
+        # blocked by the absolute floor.
+        assert result.status == "warn"

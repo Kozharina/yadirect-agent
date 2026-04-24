@@ -947,3 +947,117 @@ class BudgetBalanceDriftCheck:
             baseline_total_rub=baseline_total,
             projected_total_rub=projected_total,
         )
+
+
+# --------------------------------------------------------------------------
+# Kill-switch #6 — Conversion integrity.
+#
+# Unlike KS#1-#5, this is not a per-operation guard — it's a
+# system-level gatekeeper that runs once before any write plan and
+# blocks *every* write when Metrika tracking looks broken. Three
+# classes of failure:
+#   1. Volume collapse — current conversions are far below baseline,
+#      suggesting the tracking pixel died, a tag manager update wiped
+#      it, or a privacy-setting change killed collection.
+#   2. Absolute floor — current conversions below a minimum count per
+#      window, catching "zero conversions for a whole day" cases.
+#   3. Missing goals — a goal that existed in baseline is not in
+#      the current snapshot, suggesting it was deleted or misconfigured.
+#
+# The check's signature is (baseline, current) — no `changes` list.
+# The pipeline runner (M2.2) reads the result; a `blocked` result
+# aborts the whole plan before any write executes. A `warn` result
+# (e.g. baseline empty on first-ever run) is surfaced but does not
+# itself block writes — M2.3 audit sink records it.
+#
+# Out of scope here (BACKLOG): real Metrika integration
+# (`MetrikaService.get_report` in M6), rolling-window arithmetic,
+# per-goal sensitivity tuning.
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GoalConversions:
+    """Conversions for one Metrika goal over the snapshot window."""
+
+    goal_id: int
+    goal_name: str
+    conversions: int
+
+
+@dataclass(frozen=True)
+class ConversionsSnapshot:
+    """Metrika conversions observed over one reporting window.
+
+    The window size and anchor are the caller's concern; this shape
+    only carries the counts. The check compares two snapshots for
+    the same counter_id — it does not attempt to reason about time.
+    """
+
+    counter_id: int
+    goals: list[GoalConversions] = field(default_factory=list)
+
+    def total_conversions(self) -> int:
+        return sum(g.conversions for g in self.goals)
+
+    def goal_ids(self) -> set[int]:
+        return {g.goal_id for g in self.goals}
+
+    def find(self, goal_id: int) -> GoalConversions | None:
+        for g in self.goals:
+            if g.goal_id == goal_id:
+                return g
+        return None
+
+
+class ConversionIntegrityPolicy(BaseModel):
+    """Kill-switch #6 policy slice.
+
+    Three knobs, each can be disabled independently:
+
+    - ``min_conversions_total`` — absolute floor on ``current``'s
+      total count. Zero means the floor is disabled.
+    - ``min_ratio_vs_baseline`` — ratio current/baseline must be ≥
+      this. Zero disables the ratio check; 1.0 demands no drop at
+      all (rarely useful).
+    - ``require_all_baseline_goals_present`` — if True, every
+      goal_id in baseline must exist in current (current may have
+      new goals — additive changes are fine).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    min_conversions_total: int = Field(default=1, ge=0)
+    min_ratio_vs_baseline: float = Field(default=0.5, ge=0.0, le=1.0)
+    require_all_baseline_goals_present: bool = True
+
+
+def load_conversion_integrity_policy(path: Path) -> ConversionIntegrityPolicy:
+    """Read ``agent_policy.yml`` and extract the conversion-integrity slice."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    keys = (
+        "min_conversions_total",
+        "min_ratio_vs_baseline",
+        "require_all_baseline_goals_present",
+    )
+    fields = {k: raw[k] for k in keys if k in raw}
+    return ConversionIntegrityPolicy.model_validate(fields)
+
+
+class ConversionIntegrityCheck:
+    """Block all writes when Metrika tracking looks broken.
+
+    Skeleton — always blocks. Real logic lands in the next commit.
+    """
+
+    def __init__(self, policy: ConversionIntegrityPolicy) -> None:
+        self._policy = policy
+
+    def check(
+        self,
+        baseline: ConversionsSnapshot,
+        current: ConversionsSnapshot,
+    ) -> CheckResult:
+        _ = baseline
+        _ = current
+        return CheckResult.blocked_result("not implemented")
