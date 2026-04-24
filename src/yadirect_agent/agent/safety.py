@@ -512,7 +512,19 @@ def _normalize_keyword(phrase: str) -> str:
 class NegativeKeywordFloorCheck:
     """Block resume operations on campaigns lacking the required negatives.
 
-    Skeleton — always blocks. Real logic lands in the next commit.
+    Pipeline:
+    1. Reject the whole batch if any campaign_id appears twice in
+       ``changes`` (shared guard with KS#1/#2).
+    2. If the policy's required list is empty, every resume is fine.
+    3. For each change whose ``new_state == "ON"`` (a resume), look
+       the campaign up in the snapshot. Unknown ids skip silently
+       (BACKLOG item covers the warn-level surfacing).
+    4. Normalise required and existing negatives (strip + lower), then
+       verify that the campaign's set is a superset of the required.
+       Block on the first campaign missing anything.
+
+    Non-resume changes (pause, budget-only) are not this kill-switch's
+    concern and pass through.
     """
 
     def __init__(self, policy: NegativeKeywordFloorPolicy) -> None:
@@ -523,6 +535,37 @@ class NegativeKeywordFloorCheck:
         snapshot: AccountBudgetSnapshot,
         changes: list[BudgetChange],
     ) -> CheckResult:
-        _ = snapshot
-        _ = changes
-        return CheckResult.blocked_result("not implemented")
+        duplicates = _find_duplicate_ids(changes)
+        if duplicates:
+            first = duplicates[0]
+            return CheckResult.blocked_result(
+                f"duplicate campaign_id in changes: {first}",
+                campaign_id=first,
+                duplicates=duplicates,
+            )
+
+        required = {_normalize_keyword(p) for p in self._policy.required_negative_keywords}
+        if not required:
+            return CheckResult.ok_result()
+
+        by_id = {c.id: c for c in snapshot.campaigns}
+        for change in changes:
+            if change.new_state != "ON":
+                continue
+            campaign = by_id.get(change.campaign_id)
+            if campaign is None:
+                # tech-debt: surface as warn in M2.3 audit.
+                continue
+            existing = {_normalize_keyword(kw) for kw in campaign.negative_keywords}
+            missing = sorted(required - existing)
+            if missing:
+                return CheckResult.blocked_result(
+                    (
+                        f"campaign {campaign.id} is missing required negative "
+                        f"keywords: {', '.join(missing)}"
+                    ),
+                    campaign_id=campaign.id,
+                    missing=missing,
+                )
+
+        return CheckResult.ok_result()
