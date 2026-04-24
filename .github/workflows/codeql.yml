@@ -1,0 +1,57 @@
+# CodeQL — GitHub-native static analysis for Python.
+#
+# Rationale: catches common security-relevant patterns (unsanitised
+# shell, unsafe deserialisation, missing auth checks, SQL injection,
+# etc.) on every push. It's a low-signal security net; most of our
+# real safety lives in the policy layer, but CodeQL catches the kind
+# of mistakes that slip through review.
+#
+# Cadence: on push to main, on PR to main, and weekly on Monday so a
+# new CodeQL rule set applied by GitHub isn't missed.
+
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Monday 07:00 Europe/Moscow = 04:00 UTC.
+    - cron: "0 4 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # 'security-and-quality' is the broader pack; it catches more
+          # maintainability issues in addition to pure security bugs.
+          # If noise becomes a problem, drop to 'security-extended'.
+          queries: security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
