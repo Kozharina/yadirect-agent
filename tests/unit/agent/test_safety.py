@@ -900,3 +900,65 @@ class TestNegativeKeywordFloorBlocks:
         )
 
         assert result.status == "ok"
+
+
+class TestNegativeKeywordFloorAuditorFindings:
+    """Security-auditor findings on KS#3 (post-GREEN review):
+    HIGH — NFC/NFD normalisation gap
+    MEDIUM — empty/whitespace-only policy entries degrade to
+             "block everything" denial-of-service on the safety gate
+    """
+
+    def test_matches_nfc_policy_against_nfd_campaign_keyword(self) -> None:
+        # HIGH. If the Yandex Direct API (or any HTTP stack in the
+        # chain) returns NFD-decomposed Cyrillic, codepoint-exact
+        # comparison fails against the NFC-canonical policy string.
+        # _normalize_keyword must fold both sides into NFC.
+        #
+        # "майка" has 'й' which decomposes to 'и' + U+0306 (combining
+        # breve) under NFD — a concrete case where NFC and NFD differ.
+        import unicodedata
+
+        phrase = "майка"
+        nfc = unicodedata.normalize("NFC", phrase)
+        nfd = unicodedata.normalize("NFD", phrase)
+        assert nfc != nfd  # precondition: the two forms differ bit-wise
+
+        check = NegativeKeywordFloorCheck(_nk_policy([nfc]))
+        snapshot = AccountBudgetSnapshot(campaigns=[_campaign_with_kw(1, negatives=[nfd])])
+
+        result = check.check(snapshot, [BudgetChange(campaign_id=1, new_state="ON")])
+
+        assert result.status == "ok"
+
+    def test_matches_nfd_policy_against_nfc_campaign_keyword(self) -> None:
+        # Symmetric — the fold must be bidirectional, not policy-privileged.
+        import unicodedata
+
+        phrase = "майка"
+        nfc = unicodedata.normalize("NFC", phrase)
+        nfd = unicodedata.normalize("NFD", phrase)
+
+        check = NegativeKeywordFloorCheck(_nk_policy([nfd]))
+        snapshot = AccountBudgetSnapshot(campaigns=[_campaign_with_kw(1, negatives=[nfc])])
+
+        result = check.check(snapshot, [BudgetChange(campaign_id=1, new_state="ON")])
+
+        assert result.status == "ok"
+
+    def test_policy_rejects_empty_string_entry(self) -> None:
+        # MEDIUM. A `""` in required_negative_keywords would match no
+        # real campaign, effectively disabling every resume — a
+        # denial-of-service on the safety gate and social pressure
+        # to turn KS#3 off.
+        with pytest.raises(ValidationError):
+            NegativeKeywordFloorPolicy(required_negative_keywords=[""])
+
+    def test_policy_rejects_whitespace_only_entry(self) -> None:
+        with pytest.raises(ValidationError):
+            NegativeKeywordFloorPolicy(required_negative_keywords=["   "])
+
+    def test_policy_rejects_entry_that_is_empty_after_stripping(self) -> None:
+        # Tabs + spaces only — same problem.
+        with pytest.raises(ValidationError):
+            NegativeKeywordFloorPolicy(required_negative_keywords=["\t \t"])

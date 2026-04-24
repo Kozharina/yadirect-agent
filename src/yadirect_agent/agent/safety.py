@@ -27,12 +27,13 @@ rather than ``ImportError`` (wrong reason).
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 CheckStatus = Literal["ok", "blocked", "warn"]
 
@@ -479,9 +480,16 @@ class MaxCpcCheck:
 class NegativeKeywordFloorPolicy(BaseModel):
     """Kill-switch #3 policy slice.
 
-    Matching is case-insensitive and whitespace-trimmed — an operator
-    writing ``"Бесплатно"`` in YAML must match a campaign's existing
-    ``"бесплатно "`` without manual curation.
+    Matching is case-insensitive, whitespace-trimmed, and
+    Unicode-normalised (NFC) — an operator writing ``"Бесплатно"`` in
+    YAML must match a campaign's existing ``"бесплатно "`` without
+    manual curation, and NFC/NFD encoding differences from the API
+    must not create false mismatches.
+
+    Empty/whitespace-only entries are rejected at load time: a ``""``
+    would collapse to an empty required-set element, blocking every
+    resume and creating a denial-of-service on the safety gate
+    (security-auditor MEDIUM finding on KS#3).
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -490,6 +498,15 @@ class NegativeKeywordFloorPolicy(BaseModel):
         default_factory=list,
         description="Phrases every campaign must carry before being resumed.",
     )
+
+    @field_validator("required_negative_keywords")
+    @classmethod
+    def _reject_blank_entries(cls, values: list[str]) -> list[str]:
+        for v in values:
+            if not v or not v.strip():
+                msg = "required_negative_keywords must not contain empty or whitespace-only entries"
+                raise ValueError(msg)
+        return values
 
 
 def load_negative_keyword_floor_policy(path: Path) -> NegativeKeywordFloorPolicy:
@@ -500,13 +517,22 @@ def load_negative_keyword_floor_policy(path: Path) -> NegativeKeywordFloorPolicy
 
 
 def _normalize_keyword(phrase: str) -> str:
-    """Fold a phrase for case-insensitive, whitespace-forgiving comparison.
+    """Fold a phrase for case-insensitive, whitespace-forgiving,
+    Unicode-canonicalised comparison.
 
-    Keeps safety-layer independent of services.semantics. A phrase that
-    differs only in case or leading/trailing whitespace must compare
-    equal for the purposes of this check.
+    Normalisation order: NFC first (so NFD-decomposed input from the
+    API folds to the canonical composed form), then strip whitespace,
+    then lowercase. Keeps safety-layer independent of
+    services.semantics.
+
+    Without the NFC step, a campaign keyword returned by the Direct
+    API in NFD form (where each combining letter like U+0439 CYRILLIC
+    SMALL LETTER SHORT I decomposes into U+0438 + U+0306) would not
+    match a policy written in the composed NFC form. That's a silent
+    false-positive block in one direction and a potential false
+    negative in the other. Auditor HIGH finding on KS#3.
     """
-    return phrase.strip().lower()
+    return unicodedata.normalize("NFC", phrase).strip().lower()
 
 
 class NegativeKeywordFloorCheck:

@@ -31,8 +31,6 @@ Each one is TDD, with `security-auditor` sub-agent review before merge.
 All seven reference
 [`docs/PRIOR_ART.md`](./PRIOR_ART.md) → "Agentic PPC Campaign Management".
 
-- [ ] **Kill-switch #3 — Negative-keyword floor** (§M2.0 rule 3):
-      required minimum list (e.g. free/скачать/отзывы/вакансии).
 - [ ] **Kill-switch #4 — Quality Score guardrail + protected metric**
       (§M2.0 rule 4, §M2.6). QS as constraint, never objective;
       monitor-only, alert on > 1-point drop over 7 days.
@@ -96,6 +94,32 @@ the PR merges or is abandoned.
 ## Tech debt / follow-ups
 
 Accumulated work that isn't blocking but will sting later.
+
+- [ ] **Negative-keyword-floor follow-ups from security-auditor
+      review** (logged during M2 Kill-switch #3; lower severity /
+      design-level, not current bypasses):
+  - DESIGN: **Phrase-modifier semantics** — Yandex Direct lets
+    negatives carry modifiers like `"отзывы +клиентов"` (plus-form
+    forcing exact match). KS#3's set-equality treats that as
+    distinct from bare `"отзывы"` and blocks the resume (safe
+    default), but operators will hit false positives. Document
+    in TECHNICAL_SPEC when M2.1 lands the full Policy.
+  - DESIGN: **Duplicate/redundant policy entries silently collapsed
+    by set construction** — `["бесплатно", "Бесплатно"]` folds to
+    one phrase. Matching works; operator gets no feedback that
+    their policy contains redundant entries. Add a load-time warn
+    when `len(normalised_set) < len(input_list)` in M2.1's policy
+    loader.
+  - DESIGN: **Multi-campaign violation aggregation** — KS#3 (like
+    KS#1/#2) returns on the first violation. Multi-resume plans
+    require round-trips for the operator to discover every
+    non-compliant campaign. M2.2 pipeline orchestrator should
+    consider collecting all violations before presenting a verdict.
+  - DESIGN: **ENDED → ON transitions** — Direct may not honour a
+    resume on ENDED/ARCHIVED campaigns at the API layer, but our
+    projection treats them as spending once `new_state="ON"` is
+    applied. Add a campaign-state whitelist to BudgetChange if
+    the API's silent-ignore starts creating projection drift.
 
 - [ ] **Max-CPC follow-ups from security-auditor review** (logged
       during M2 Kill-switch #2; deferred as lower severity / out of
@@ -204,6 +228,18 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2 Kill-switch #3 — Negative-keyword floor** —
+      `NegativeKeywordFloorCheck` refuses to resume a campaign that
+      does not carry every required negative keyword. Reuses KS#1
+      shapes (AccountBudgetSnapshot, BudgetChange). CampaignBudget
+      grows `negative_keywords: frozenset[str]` default-empty, so
+      existing KS#1/#2 tests stay green. Local `_normalize_keyword`
+      applies NFC → strip → lower; case- and whitespace-insensitive
+      and Unicode-canonical. Policy rejects empty/whitespace-only
+      entries via a `@field_validator`. 24 new tests (71 safety, 194
+      across the suite). Reviewed by `security-auditor` before
+      merge — HIGH finding (NFC/NFD) and MEDIUM finding
+      (empty-string DoS) closed; 4 design notes added below.
 - [x] **M2 Kill-switch #2 — Max CPC per campaign** — `MaxCpcCheck`
       enforces per-campaign CPC caps on bid updates. Adds
       `KeywordSnapshot`, `AccountBidSnapshot`, `ProposedBidChange`
