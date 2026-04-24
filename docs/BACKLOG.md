@@ -31,9 +31,6 @@ Each one is TDD, with `security-auditor` sub-agent review before merge.
 All seven reference
 [`docs/PRIOR_ART.md`](./PRIOR_ART.md) → "Agentic PPC Campaign Management".
 
-- [ ] **Kill-switch #1 — Budget caps** (§M2.0 rule 1, most important:
-      spent budget is irreversible). Account-level and
-      campaign-group-level hard ceilings.
 - [ ] **Kill-switch #2 — Max CPC per campaign** (§M2.0 rule 2).
 - [ ] **Kill-switch #3 — Negative-keyword floor** (§M2.0 rule 3):
       required minimum list (e.g. free/скачать/отзывы/вакансии).
@@ -100,6 +97,25 @@ the PR merges or is abandoned.
 ## Tech debt / follow-ups
 
 Accumulated work that isn't blocking but will sting later.
+
+- [ ] **Budget-cap follow-ups from security-auditor review** (logged
+      during M2 Kill-switch #1; deferred as lower severity):
+  - LOW: unmatched campaign ids in `BudgetChange` list are silently
+    dropped by `BudgetCapCheck._project`. Surface them as a warn-
+    level annotation in `CheckResult.details` so M2.3 audit sink
+    can log them.
+  - MEDIUM: `load_budget_cap_policy` accepts `account_daily_budget_cap_rub: 0`
+    silently — effectively disables the agent without a warning.
+    Emit a warning (or hard-fail) at load time when M2.1 lands the
+    full Policy loader.
+  - DESIGN: `warn` CheckResult status is defined but never returned.
+    Define approaching-cap thresholds (e.g. 80% / 90% of cap →
+    warn) in M2.1 so the status is not dead code across the seven
+    kill-switches.
+  - DESIGN: agent-supplied `group` labels on `CampaignBudget` are
+    trusted. M2.2 snapshot-builder must enforce that group labels
+    come only from the Direct API / trusted config, never from
+    agent-proposed changes.
 
 - [ ] `clients/direct.py` methods with no `respx` tests:
       `get_adgroups`, `get_ads`, `add_keywords`, `set_keyword_bids`,
@@ -168,6 +184,15 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2 Kill-switch #1 — Budget caps** — `agent/safety.py` with
+      `BudgetCapPolicy`, `AccountBudgetSnapshot`, `BudgetChange`
+      (frozen pydantic BaseModel with Field(ge=0) on budget and
+      Literal on state), `BudgetCapCheck`, `CheckResult`. YAML loader
+      tolerates M2.1+ keys. `agent_policy.example.yml` shipped.
+      26 tests across happy/account/group/suspended semantics +
+      auditor-driven HIGH/MEDIUM fixes (negative budget, unknown
+      state string, duplicate ids in changes list). Reviewed by
+      `security-auditor` sub-agent before merge.
 - [x] **PR-C: yadirect-agent doctor command** — four checks
       (env / policy file / Anthropic ping / Direct sandbox ping),
       coloured table output, exit 2 on any failure. Delivered as
