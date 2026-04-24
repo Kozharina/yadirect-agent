@@ -31,6 +31,7 @@ from yadirect_agent.agent.safety import (
     MaxCpcPolicy,
     NegativeKeywordFloorCheck,
     NegativeKeywordFloorPolicy,
+    Policy,
     ProposedBidChange,
     QualityScoreGuardCheck,
     QualityScoreGuardPolicy,
@@ -42,6 +43,7 @@ from yadirect_agent.agent.safety import (
     load_conversion_integrity_policy,
     load_max_cpc_policy,
     load_negative_keyword_floor_policy,
+    load_policy,
     load_quality_score_guard_policy,
     load_query_drift_policy,
 )
@@ -2157,3 +2159,284 @@ class TestQueryDriftEdgeCases:
         result = check.check(baseline, current)
 
         assert result.status == "warn"
+
+
+# ==========================================================================
+# M2.1 — Unified Policy schema.
+# ==========================================================================
+
+
+class TestPolicyConstruction:
+    def test_minimal_policy_requires_only_budget_cap(self) -> None:
+        # account_daily_budget_cap_rub is the one field that must be
+        # set explicitly — everything else has a defensible default.
+        p = Policy(budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=10_000))
+        assert p.budget_cap.account_daily_budget_cap_rub == 10_000
+        # Sub-slices default to empty / permissive.
+        assert p.max_cpc.campaign_max_cpc_rub == {}
+        assert p.negative_keyword_floor.required_negative_keywords == []
+        assert p.quality_score_guard.min_quality_score_for_bid_increase == 5
+        assert p.budget_balance_drift.max_shift_pct_per_day == 0.3
+        assert p.conversion_integrity.min_conversions_total == 1
+        assert p.query_drift.max_new_query_share == 0.4
+
+    def test_default_approval_tiers_match_spec(self) -> None:
+        p = Policy(budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=10_000))
+        # §M2.1: auto-approve read-only + pause + negative keywords;
+        # NOT resume.
+        assert p.auto_approve_readonly is True
+        assert p.auto_approve_pause is True
+        assert p.auto_approve_resume is False
+        assert p.auto_approve_negative_keywords is True
+
+    def test_default_thresholds_match_spec(self) -> None:
+        p = Policy(budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=10_000))
+        assert p.max_daily_budget_change_pct == 0.2
+        assert p.max_bid_increase_pct == 0.5
+        assert p.max_bid_change_per_day_pct == 0.25
+        assert p.max_bulk_size == 50
+
+    def test_default_forbidden_operations_match_spec(self) -> None:
+        p = Policy(budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=10_000))
+        assert set(p.forbidden_operations) == {
+            "delete_campaigns",
+            "delete_ads",
+            "archive_campaigns_bulk",
+        }
+
+    def test_default_rollout_stage_is_shadow(self) -> None:
+        # The most conservative stage — new deployments start here.
+        p = Policy(budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=10_000))
+        assert p.rollout_stage == "shadow"
+
+    def test_policy_is_frozen(self) -> None:
+        p = Policy(budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=10_000))
+        with pytest.raises(ValidationError):
+            p.rollout_stage = "autonomy_full"  # type: ignore[misc]
+
+    def test_policy_rejects_extra_top_level_fields(self) -> None:
+        # A typo in agent_policy.yml must be a loud error, not a
+        # silent fallback to defaults.
+        with pytest.raises(ValidationError):
+            Policy.model_validate(
+                {
+                    "budget_cap": {"account_daily_budget_cap_rub": 10_000},
+                    "totally_not_a_real_field": True,
+                }
+            )
+
+    def test_rejects_invalid_rollout_stage(self) -> None:
+        with pytest.raises(ValidationError):
+            Policy.model_validate(
+                {
+                    "budget_cap": {"account_daily_budget_cap_rub": 10_000},
+                    "rollout_stage": "yolo",
+                }
+            )
+
+    def test_accepts_all_rollout_stages(self) -> None:
+        for stage in ("shadow", "assist", "autonomy_light", "autonomy_full"):
+            p = Policy(
+                budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=10_000),
+                rollout_stage=stage,  # type: ignore[arg-type]
+            )
+            assert p.rollout_stage == stage
+
+    def test_rejects_zero_max_bulk_size(self) -> None:
+        with pytest.raises(ValidationError):
+            Policy(
+                budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=10_000),
+                max_bulk_size=0,
+            )
+
+
+class TestLoadPolicyFromFlatYaml:
+    def test_loads_minimal_yaml(self, tmp_path: Path) -> None:
+        path = tmp_path / "agent_policy.yml"
+        path.write_text("account_daily_budget_cap_rub: 5000\n", encoding="utf-8")
+
+        policy = load_policy(path)
+
+        assert policy.budget_cap.account_daily_budget_cap_rub == 5000
+
+    def test_loads_fields_from_every_kill_switch(self, tmp_path: Path) -> None:
+        path = tmp_path / "agent_policy.yml"
+        path.write_text(
+            """
+account_daily_budget_cap_rub: 10000
+campaign_group_caps_rub:
+  brand: 3000
+campaign_max_cpc_rub:
+  100: 25.0
+required_negative_keywords:
+  - бесплатно
+min_quality_score_for_bid_increase: 6
+max_shift_pct_per_day: 0.25
+min_conversions_total: 3
+min_ratio_vs_baseline: 0.7
+require_all_baseline_goals_present: false
+max_new_query_share: 0.35
+""",
+            encoding="utf-8",
+        )
+
+        policy = load_policy(path)
+
+        assert policy.budget_cap.account_daily_budget_cap_rub == 10_000
+        assert policy.budget_cap.campaign_group_caps_rub == {"brand": 3000}
+        assert policy.max_cpc.campaign_max_cpc_rub == {100: 25.0}
+        assert policy.negative_keyword_floor.required_negative_keywords == ["бесплатно"]
+        assert policy.quality_score_guard.min_quality_score_for_bid_increase == 6
+        assert policy.budget_balance_drift.max_shift_pct_per_day == 0.25
+        assert policy.conversion_integrity.min_conversions_total == 3
+        assert policy.conversion_integrity.min_ratio_vs_baseline == 0.7
+        assert policy.conversion_integrity.require_all_baseline_goals_present is False
+        assert policy.query_drift.max_new_query_share == 0.35
+
+    def test_loads_top_level_fields(self, tmp_path: Path) -> None:
+        path = tmp_path / "agent_policy.yml"
+        path.write_text(
+            """
+account_daily_budget_cap_rub: 10000
+auto_approve_resume: true
+max_daily_budget_change_pct: 0.3
+max_bid_increase_pct: 0.4
+max_bulk_size: 100
+rollout_stage: assist
+forbidden_operations:
+  - delete_campaigns
+""",
+            encoding="utf-8",
+        )
+
+        policy = load_policy(path)
+
+        assert policy.auto_approve_resume is True
+        assert policy.max_daily_budget_change_pct == 0.3
+        assert policy.max_bid_increase_pct == 0.4
+        assert policy.max_bulk_size == 100
+        assert policy.rollout_stage == "assist"
+        assert policy.forbidden_operations == ["delete_campaigns"]
+
+    def test_rejects_unknown_yaml_key(self, tmp_path: Path) -> None:
+        # A typo must not silently default — we want a loud error
+        # pointing at the offending key.
+        path = tmp_path / "agent_policy.yml"
+        path.write_text(
+            """
+account_daily_budget_cap_rub: 10000
+accuont_daliy_budget_cap_rub: 5000
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="unknown keys"):
+            load_policy(path)
+
+    def test_rejects_missing_account_cap(self, tmp_path: Path) -> None:
+        # budget_cap.account_daily_budget_cap_rub has no default —
+        # the load must fail explicitly rather than construct a
+        # permissive policy.
+        path = tmp_path / "agent_policy.yml"
+        path.write_text(
+            """
+auto_approve_resume: true
+""",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValidationError):
+            load_policy(path)
+
+    def test_loads_the_shipped_example_yml(self) -> None:
+        # Smoke test against the committed example. A regression here
+        # means we shipped a broken sample to operators.
+        example_path = Path(__file__).parent.parent.parent.parent / "agent_policy.example.yml"
+        # Only run if the file exists; otherwise skip silently.
+        if not example_path.exists():
+            pytest.skip(f"example policy not present at {example_path}")
+
+        policy = load_policy(example_path)
+        assert policy.budget_cap.account_daily_budget_cap_rub > 0
+
+
+class TestPolicyAuditorFindings:
+    """Security-auditor findings on the M2.1 unified Policy."""
+
+    def test_rejects_empty_forbidden_operations_entry(self) -> None:
+        # MEDIUM: a blank "" silently replaces defaults without
+        # providing a real block — typo or whitespace-only entries
+        # must raise.
+        with pytest.raises(ValidationError, match="forbidden_operations"):
+            Policy(
+                budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=10_000),
+                forbidden_operations=[""],
+            )
+
+    def test_rejects_whitespace_only_forbidden_operations_entry(self) -> None:
+        with pytest.raises(ValidationError, match="forbidden_operations"):
+            Policy(
+                budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=10_000),
+                forbidden_operations=["   "],
+            )
+
+    def test_forbidden_operations_are_normalised(self) -> None:
+        # Case drift and surrounding whitespace collapse so the M2.2
+        # pipeline's comparator can do a case-insensitive lookup
+        # without each call re-lowercasing.
+        policy = Policy(
+            budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=10_000),
+            forbidden_operations=["Delete_Campaigns", "  archive_campaigns_bulk  "],
+        )
+        assert policy.forbidden_operations == [
+            "delete_campaigns",
+            "archive_campaigns_bulk",
+        ]
+
+    def test_rejects_oversize_policy_file(self, tmp_path: Path) -> None:
+        # LOW: yaml.safe_load prevents arbitrary code execution but
+        # not unbounded memory expansion. Pin the 64 KiB guard.
+        path = tmp_path / "agent_policy.yml"
+        # 100 KB file — valid YAML, just huge.
+        filler = " " * (100 * 1024)
+        path.write_text(
+            f"account_daily_budget_cap_rub: 10000\n# padding:{filler}\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="safety cap"):
+            load_policy(path)
+
+    def test_key_maps_stay_in_sync_with_slice_model_fields(self) -> None:
+        # Maintenance trap: adding a field to a slice-policy without
+        # also adding the key to _*_KEYS would make load_policy
+        # silently reject the valid YAML key as "unknown". Pin the
+        # invariant.
+        from yadirect_agent.agent import safety
+
+        assert set(BudgetCapPolicy.model_fields) == safety._BUDGET_CAP_KEYS
+        assert set(MaxCpcPolicy.model_fields) == safety._MAX_CPC_KEYS
+        assert set(NegativeKeywordFloorPolicy.model_fields) == safety._NK_FLOOR_KEYS
+        assert set(QualityScoreGuardPolicy.model_fields) == safety._QS_GUARD_KEYS
+        assert set(BudgetBalanceDriftPolicy.model_fields) == safety._BALANCE_DRIFT_KEYS
+        assert set(ConversionIntegrityPolicy.model_fields) == safety._CONVERSION_KEYS
+        assert set(QueryDriftPolicy.model_fields) == safety._QUERY_DRIFT_KEYS
+
+
+class TestLoadPolicyBackwardsCompat:
+    """The individual load_*_policy helpers MUST keep working. Existing
+    kill-switch tests rely on them, and field-level callers shouldn't
+    be forced to load the unified schema if they only want one slice.
+    """
+
+    def test_load_budget_cap_policy_still_works(self, tmp_path: Path) -> None:
+        path = tmp_path / "p.yml"
+        path.write_text("account_daily_budget_cap_rub: 1500\n", encoding="utf-8")
+        p = load_budget_cap_policy(path)
+        assert p.account_daily_budget_cap_rub == 1500
+
+    def test_load_query_drift_policy_still_works(self, tmp_path: Path) -> None:
+        path = tmp_path / "p.yml"
+        path.write_text("max_new_query_share: 0.2\n", encoding="utf-8")
+        p = load_query_drift_policy(path)
+        assert p.max_new_query_share == 0.2

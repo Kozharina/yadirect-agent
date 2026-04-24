@@ -1335,3 +1335,213 @@ class QueryDriftCheck:
             baseline_size=len(baseline_set),
             current_size=current_size,
         )
+
+
+# ==========================================================================
+# M2.1 — Unified Policy schema.
+#
+# Objectives:
+# - One object the pipeline runner (M2.2) can consume instead of
+#   juggling seven separate load_*_policy calls.
+# - Add approval tiers, per-op thresholds, forbidden-ops list, and
+#   rollout_stage from §M2.1 of docs/TECHNICAL_SPEC.md. Those four
+#   groups of fields have no kill-switch of their own yet — they
+#   land here so the pipeline runner already has them available.
+# - Keep the YAML file flat so operators don't need to restructure
+#   agent_policy.yml when the full schema lands. `load_policy(path)`
+#   slices the flat dict into nested sub-policies internally.
+#
+# Backwards compatibility: the seven individual `*Policy` classes and
+# `load_*_policy` functions stay intact. Existing tests do not move.
+# This PR is additive.
+# ==========================================================================
+
+
+RolloutStage = Literal[
+    "shadow",
+    "assist",
+    "autonomy_light",
+    "autonomy_full",
+]
+
+
+class Policy(BaseModel):
+    """Everything the pipeline runner needs to decide on a plan.
+
+    Nested slice-policies carry the kill-switch rules. Top-level
+    fields carry approval tiers, per-op thresholds, forbidden ops,
+    and the rollout stage. Every field has a defensible default
+    except ``budget_cap.account_daily_budget_cap_rub`` — we refuse
+    to run without an explicit account-level spend ceiling.
+
+    ``extra="forbid"`` so a typo in agent_policy.yml becomes a loud
+    ValidationError at load time, not a silent-fallback-to-default.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    # --- Kill-switch slices (§M2.0) -----------------------------------------
+    budget_cap: BudgetCapPolicy
+    max_cpc: MaxCpcPolicy = Field(default_factory=MaxCpcPolicy)
+    negative_keyword_floor: NegativeKeywordFloorPolicy = Field(
+        default_factory=NegativeKeywordFloorPolicy
+    )
+    quality_score_guard: QualityScoreGuardPolicy = Field(default_factory=QualityScoreGuardPolicy)
+    budget_balance_drift: BudgetBalanceDriftPolicy = Field(default_factory=BudgetBalanceDriftPolicy)
+    conversion_integrity: ConversionIntegrityPolicy = Field(
+        default_factory=ConversionIntegrityPolicy
+    )
+    query_drift: QueryDriftPolicy = Field(default_factory=QueryDriftPolicy)
+
+    # --- Approval tiers (§M2.1) ---------------------------------------------
+    auto_approve_readonly: bool = True
+    # pause is always reversible — safe to auto-approve.
+    auto_approve_pause: bool = True
+    # resume starts spending money — defaults to "no".
+    auto_approve_resume: bool = False
+    # adding negative keywords only reduces traffic — auto-approve.
+    auto_approve_negative_keywords: bool = True
+
+    # --- Thresholds per single operation (§M2.1) ---------------------------
+    max_daily_budget_change_pct: float = Field(default=0.2, ge=0, le=1)
+    max_bid_increase_pct: float = Field(default=0.5, ge=0, le=10)
+    max_bid_change_per_day_pct: float = Field(default=0.25, ge=0, le=1)
+    max_bulk_size: int = Field(default=50, ge=1)
+
+    # --- Forbidden operations (always blocked) -----------------------------
+    forbidden_operations: list[str] = Field(
+        default_factory=lambda: [
+            "delete_campaigns",
+            "delete_ads",
+            "archive_campaigns_bulk",
+        ]
+    )
+
+    # --- Staged rollout (§M2.5; enforcement ships with M2.5) ---------------
+    rollout_stage: RolloutStage = "shadow"
+
+    @field_validator("forbidden_operations")
+    @classmethod
+    def _normalise_forbidden_operations(cls, values: list[str]) -> list[str]:
+        """Reject blank entries and normalise to lowercase snake_case.
+
+        Without this, a typo in ``agent_policy.yml`` silently replaces
+        the default three-entry block list with one useless entry, and
+        the other two operations become permitted. Normalisation here
+        means the M2.2 pipeline can do case-insensitive lookup without
+        having to lowercase on every comparison.
+        """
+        normalised: list[str] = []
+        for v in values:
+            stripped = v.strip()
+            if not stripped:
+                msg = "forbidden_operations must not contain empty or whitespace-only entries"
+                raise ValueError(msg)
+            normalised.append(stripped.lower())
+        return normalised
+
+
+# --------------------------------------------------------------------------
+# Flat-YAML → nested-Policy loader.
+#
+# Operators write agent_policy.yml as a single flat dict; this loader
+# routes each field to its nested slice. Unknown keys raise via the
+# top-level Policy.extra="forbid" rather than being silently dropped.
+# --------------------------------------------------------------------------
+
+
+_BUDGET_CAP_KEYS = frozenset({"account_daily_budget_cap_rub", "campaign_group_caps_rub"})
+_MAX_CPC_KEYS = frozenset({"campaign_max_cpc_rub"})
+_NK_FLOOR_KEYS = frozenset({"required_negative_keywords"})
+_QS_GUARD_KEYS = frozenset({"min_quality_score_for_bid_increase"})
+_BALANCE_DRIFT_KEYS = frozenset({"max_shift_pct_per_day"})
+_CONVERSION_KEYS = frozenset(
+    {
+        "min_conversions_total",
+        "min_ratio_vs_baseline",
+        "require_all_baseline_goals_present",
+    }
+)
+_QUERY_DRIFT_KEYS = frozenset({"max_new_query_share"})
+
+_TOP_LEVEL_KEYS = frozenset(
+    {
+        "auto_approve_readonly",
+        "auto_approve_pause",
+        "auto_approve_resume",
+        "auto_approve_negative_keywords",
+        "max_daily_budget_change_pct",
+        "max_bid_increase_pct",
+        "max_bid_change_per_day_pct",
+        "max_bulk_size",
+        "forbidden_operations",
+        "rollout_stage",
+    }
+)
+
+
+def _slice(raw: dict[str, Any], keys: frozenset[str]) -> dict[str, Any]:
+    return {k: raw[k] for k in keys if k in raw}
+
+
+_POLICY_FILE_MAX_BYTES = 64 * 1024  # 64 KiB — policy files are tiny.
+
+
+def load_policy(path: Path) -> Policy:
+    """Read ``agent_policy.yml`` and build the unified ``Policy``.
+
+    The YAML file is flat: every field lives at the top level, no
+    nesting required. This loader sorts fields into their slice
+    sub-policies before handing them to Pydantic.
+
+    Unknown keys raise ``ValidationError`` — a typo must not silently
+    become a default. Every kill-switch's slice has its own
+    ``extra="forbid"`` as a second line of defence.
+
+    File-size guard: ``yaml.safe_load`` blocks arbitrary code execution
+    but does not bound memory; a deeply-aliased "billion laughs" file
+    can expand before Pydantic ever sees it. Anything over 64 KiB is
+    almost certainly an attack or a misfile — real policies are a few
+    hundred bytes.
+    """
+    size = path.stat().st_size
+    if size > _POLICY_FILE_MAX_BYTES:
+        msg = f"agent_policy.yml is {size} bytes, exceeds {_POLICY_FILE_MAX_BYTES}-byte safety cap"
+        raise ValueError(msg)
+
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+    # Collect any keys we don't recognise and raise before Pydantic does
+    # so the message points at the offending YAML key directly.
+    known = (
+        _BUDGET_CAP_KEYS
+        | _MAX_CPC_KEYS
+        | _NK_FLOOR_KEYS
+        | _QS_GUARD_KEYS
+        | _BALANCE_DRIFT_KEYS
+        | _CONVERSION_KEYS
+        | _QUERY_DRIFT_KEYS
+        | _TOP_LEVEL_KEYS
+    )
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        msg = f"unknown keys in agent_policy.yml: {unknown}"
+        raise ValueError(msg)
+
+    top_level = _slice(raw, _TOP_LEVEL_KEYS)
+    return Policy(
+        budget_cap=BudgetCapPolicy.model_validate(_slice(raw, _BUDGET_CAP_KEYS)),
+        max_cpc=MaxCpcPolicy.model_validate(_slice(raw, _MAX_CPC_KEYS)),
+        negative_keyword_floor=NegativeKeywordFloorPolicy.model_validate(
+            _slice(raw, _NK_FLOOR_KEYS)
+        ),
+        quality_score_guard=QualityScoreGuardPolicy.model_validate(_slice(raw, _QS_GUARD_KEYS)),
+        budget_balance_drift=BudgetBalanceDriftPolicy.model_validate(
+            _slice(raw, _BALANCE_DRIFT_KEYS)
+        ),
+        conversion_integrity=ConversionIntegrityPolicy.model_validate(
+            _slice(raw, _CONVERSION_KEYS)
+        ),
+        query_drift=QueryDriftPolicy.model_validate(_slice(raw, _QUERY_DRIFT_KEYS)),
+        **top_level,
+    )
