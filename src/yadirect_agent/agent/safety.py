@@ -322,6 +322,21 @@ class KeywordSnapshot:
     (new keyword, Direct hasn't scored it yet). KS#4 treats unknown
     QS as "skip, don't block" — a missing signal is not evidence of
     a low QS.
+
+    Bid fields ``current_search_bid_rub`` / ``current_network_bid_rub``:
+    ``None`` denotes "unknown at snapshot time" rather than "not
+    applicable". KS#2 and KS#4 both defer (skip the check) when the
+    current value is None — they cannot prove an increase or a cap
+    violation without a base value. An agent presenting a partial
+    snapshot therefore routes around the guard; mitigations are
+    tracked in BACKLOG (M2.3 audit surfaces every deferred-None case
+    as a warn; the snapshot builder must read bids eagerly).
+
+    ``__post_init__`` enforces the QS type contract at construction —
+    frozen dataclass offers no runtime validation on its own, so a
+    caller could otherwise slip ``quality_score=4.5`` past us and
+    undermine the ``>= threshold`` comparison. See
+    tests/unit/agent/test_safety.py for the pinned edge cases.
     """
 
     keyword_id: int
@@ -329,6 +344,22 @@ class KeywordSnapshot:
     current_search_bid_rub: float | None = None
     current_network_bid_rub: float | None = None
     quality_score: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.quality_score is None:
+            return
+        # `bool` is a subclass of `int` in Python; reject it explicitly
+        # so a stray `True`/`False` from a JSON mapper doesn't become
+        # a `1` or `0` QS value that passes every threshold trivially.
+        if isinstance(self.quality_score, bool) or not isinstance(self.quality_score, int):
+            msg = (
+                "KeywordSnapshot.quality_score must be int or None, "
+                f"got {type(self.quality_score).__name__}"
+            )
+            raise TypeError(msg)
+        if not 0 <= self.quality_score <= 10:
+            msg = f"KeywordSnapshot.quality_score must be in range 0..10, got {self.quality_score}"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True)

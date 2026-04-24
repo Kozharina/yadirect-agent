@@ -1238,3 +1238,39 @@ class TestQualityScoreGuardCheckBlocks:
         )
 
         assert result.status == "ok"
+
+
+class TestKeywordSnapshotQualityScoreTypeContract:
+    """Security-auditor LOW finding on KS#4: `KeywordSnapshot` is a
+    plain frozen dataclass, so Python performs zero runtime validation
+    on field types. Without this, a caller could slip
+    `quality_score=4.5` past us and the `>= threshold` comparison
+    would silently mis-classify borderline keywords.
+
+    These tests pin the `__post_init__` type contract.
+    """
+
+    def test_rejects_float_quality_score(self) -> None:
+        with pytest.raises(TypeError, match="quality_score"):
+            KeywordSnapshot(keyword_id=1, campaign_id=100, quality_score=4.5)  # type: ignore[arg-type]
+
+    def test_rejects_string_quality_score(self) -> None:
+        with pytest.raises(TypeError, match="quality_score"):
+            KeywordSnapshot(keyword_id=1, campaign_id=100, quality_score="5")  # type: ignore[arg-type]
+
+    def test_rejects_bool_quality_score(self) -> None:
+        # bool is a subclass of int in Python; we reject it explicitly
+        # so True/False do not silently become QS 1/0.
+        with pytest.raises(TypeError, match="quality_score"):
+            KeywordSnapshot(keyword_id=1, campaign_id=100, quality_score=True)  # type: ignore[arg-type]
+
+    def test_rejects_out_of_range_quality_score(self) -> None:
+        with pytest.raises(ValueError, match=r"range 0\.\.10"):
+            KeywordSnapshot(keyword_id=1, campaign_id=100, quality_score=11)
+        with pytest.raises(ValueError, match=r"range 0\.\.10"):
+            KeywordSnapshot(keyword_id=1, campaign_id=100, quality_score=-1)
+
+    def test_accepts_boundary_values(self) -> None:
+        for qs in (0, 5, 10, None):
+            kw = KeywordSnapshot(keyword_id=1, campaign_id=100, quality_score=qs)
+            assert kw.quality_score == qs
