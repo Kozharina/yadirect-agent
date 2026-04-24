@@ -31,8 +31,6 @@ Each one is TDD, with `security-auditor` sub-agent review before merge.
 All seven reference
 [`docs/PRIOR_ART.md`](./PRIOR_ART.md) → "Agentic PPC Campaign Management".
 
-- [ ] **Kill-switch #5 — Budget-balance drift** (§M2.0 rule 5):
-      X% cap on cross-campaign share shift per day.
 - [ ] **Kill-switch #6 — Conversion integrity** (§M2.0 rule 6):
       daily Metrika goal-count sanity check; blocks writes on anomaly.
 - [ ] **Kill-switch #7 — Query drift detector** (§M2.0 rule 7):
@@ -91,6 +89,21 @@ the PR merges or is abandoned.
 ## Tech debt / follow-ups
 
 Accumulated work that isn't blocking but will sting later.
+
+- [ ] **Balance-drift follow-ups from security-auditor review**
+      (logged during M2 Kill-switch #5; architectural, not a
+      current bypass):
+  - MEDIUM: **Baseline-provenance contract** — `BudgetBalanceDriftCheck`
+    trusts the `baseline` argument as-is. M2.2 pipeline runner must
+    be the sole constructor of baseline, sourced from a read-only
+    store with a timestamp assertion, and the baseline's age must
+    flow into the M2.3 audit sink so stale baselines (e.g. a failed
+    cron leaving last week's data) surface loudly.
+  - DESIGN: **No upper-ceiling warning on `max_shift_pct_per_day`**
+    — `le=1` allows `0.99999` which functionally disables the
+    check. A policy-load-time warn when the value exceeds ~0.7
+    would catch accidental near-disablement. Deferred to M2.1's
+    full Policy schema.
 
 - [ ] **QS-guardrail follow-ups from security-auditor review**
       (logged during M2 Kill-switch #4; no single-call bypass, but
@@ -252,6 +265,21 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2 Kill-switch #5 — Budget-balance drift** —
+      `BudgetBalanceDriftCheck` refuses plans that shift any
+      campaign's share of active daily budget more than
+      `max_shift_pct_per_day` (default 0.3, `gt=0, le=1`) vs. a
+      baseline snapshot. First kill-switch with a temporal
+      dimension. Reuses `AccountBudgetSnapshot` + `BudgetChange`;
+      projects changes via shared `BudgetCapCheck._project`. IEEE
+      754 boundary handled with `math.isclose(abs_tol=1e-14)`.
+      Empty baseline → `warn` (not `ok`) to surface first-run /
+      missing-backfill cases in M2.3 audit. 22 new tests (120
+      safety, 244 across the suite). Reviewed by `security-auditor`
+      — three findings closed in-PR (tolerance tightened, empty
+      baseline warns, details payload carries baseline_total_rub);
+      one MEDIUM (baseline provenance) + one DESIGN (ceiling
+      warning) escalated to Tech debt.
 - [x] **M2 Kill-switch #4 — Quality Score guardrail** —
       `QualityScoreGuardCheck` blocks bid *increases* on keywords
       whose QS is below the configured threshold. Policy is a narrow

@@ -1487,10 +1487,13 @@ class TestBudgetBalanceDriftBlocks:
 
 
 class TestBudgetBalanceDriftEdgeCases:
-    def test_ok_when_baseline_is_empty(self) -> None:
-        # First ever agent run: no baseline. Policy can't reason about
-        # drift; be permissive. (The ops runbook should backfill the
-        # baseline before running autonomously.)
+    def test_warns_when_baseline_is_empty(self) -> None:
+        # First-ever agent run: no baseline. Silent ok would let a
+        # compromised bootstrap run one unchecked rebalance — the
+        # security-auditor LOW on KS#5 called this out. We emit
+        # `warn` so the M2.3 audit sink surfaces the skipped check,
+        # and the M2.2 pipeline layer can refuse autonomous
+        # operation until a real baseline exists.
         check = BudgetBalanceDriftCheck(_bbd_policy(0.3))
         baseline = AccountBudgetSnapshot(campaigns=[])
         snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 1000), _ab_campaign(2, 1000)])
@@ -1501,7 +1504,11 @@ class TestBudgetBalanceDriftEdgeCases:
             [BudgetChange(campaign_id=1, new_daily_budget_rub=5000)],
         )
 
-        assert result.status == "ok"
+        assert result.status == "warn"
+        assert "baseline" in (result.reason or "").lower()
+        # Pipeline orchestrator can read these to refuse autonomous
+        # execution on empty baselines.
+        assert result.details.get("baseline_total_rub") == 0
 
     def test_ok_when_projected_total_is_zero(self) -> None:
         # Every active campaign gets paused — nothing spending, drift
@@ -1520,9 +1527,9 @@ class TestBudgetBalanceDriftEdgeCases:
 
         assert result.status == "ok"
 
-    def test_ok_when_baseline_total_is_zero(self) -> None:
-        # Baseline was all paused. Any distribution today is "new" —
-        # compare against nothing, be permissive.
+    def test_warns_when_baseline_total_is_zero(self) -> None:
+        # Same-class case as empty baseline: nobody was active yesterday.
+        # Safer to warn than silently allow any rebalance.
         check = BudgetBalanceDriftCheck(_bbd_policy(0.3))
         baseline = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500, state="SUSPENDED")])
         snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500), _ab_campaign(2, 500)])
@@ -1532,7 +1539,7 @@ class TestBudgetBalanceDriftEdgeCases:
             [BudgetChange(campaign_id=1, new_state="ON")],
         )
 
-        assert result.status == "ok"
+        assert result.status == "warn"
 
     def test_blocks_duplicate_campaign_ids_in_changes(self) -> None:
         check = BudgetBalanceDriftCheck(_bbd_policy(0.3))

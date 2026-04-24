@@ -881,10 +881,25 @@ class BudgetBalanceDriftCheck:
         baseline_total = baseline.total_active_budget_rub()
         projected_total = projected.total_active_budget_rub()
 
-        # Defer when either reference point is missing. Any observed
-        # distribution is "new," not drift.
-        if baseline_total == 0 or projected_total == 0:
-            return CheckResult.ok_result()
+        # Empty baseline is a real risk window — first autonomous run
+        # or a baseline that wasn't backfilled would otherwise silently
+        # pass every rebalance. We emit `warn` (not `ok`) so the
+        # decision surfaces in the audit sink (M2.3) and the pipeline
+        # layer (M2.2) can refuse autonomous operation until a real
+        # baseline is present. See security-auditor LOW on KS#5.
+        if baseline_total == 0:
+            return CheckResult.warn_result(
+                "baseline has no active budget; drift check cannot apply",
+                baseline_total_rub=baseline_total,
+                projected_total_rub=projected_total,
+            )
+        if projected_total == 0:
+            # Everything paused — nothing is spending, drift is
+            # mathematically undefined. That's safe, not risky.
+            return CheckResult.ok_result(
+                baseline_total_rub=baseline_total,
+                projected_total_rub=projected_total,
+            )
 
         threshold = self._policy.max_shift_pct_per_day
 
@@ -907,8 +922,13 @@ class BudgetBalanceDriftCheck:
             # rounding (e.g. 0.8-0.5 ≈ 0.30000000000000004).
             # `math.isclose` gives us a tolerance so "exactly at
             # threshold" inputs stay ok instead of flickering blocked.
+            # Tolerance tightened from abs_tol=1e-12 to 1e-14 after
+            # security-auditor LOW finding: the wider window let
+            # `threshold + 1e-11` slip past math.isclose. Legitimate
+            # IEEE 754 rounding on real budget inputs (integer rubles
+            # divided by integer totals) stays inside 1e-14.
             if shift > threshold and not math.isclose(
-                shift, threshold, rel_tol=1e-9, abs_tol=1e-12
+                shift, threshold, rel_tol=1e-9, abs_tol=1e-14
             ):
                 return CheckResult.blocked_result(
                     (
@@ -923,4 +943,7 @@ class BudgetBalanceDriftCheck:
                     projected_share=after,
                 )
 
-        return CheckResult.ok_result(projected_total_rub=projected_total)
+        return CheckResult.ok_result(
+            baseline_total_rub=baseline_total,
+            projected_total_rub=projected_total,
+        )
