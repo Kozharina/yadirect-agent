@@ -46,9 +46,14 @@ class SemanticsService:
     @classmethod
     def _cluster_key(cls, phrase: str) -> str:
         """Naive clustering: sorted content words. Replace with embeddings later."""
-        tokens = [t for t in cls.normalize(phrase).split() if t not in _STOP_WORDS]
+        normalised = cls.normalize(phrase)
+        tokens = [t for t in normalised.split() if t not in _STOP_WORDS]
         tokens.sort()
-        return " ".join(tokens) if tokens else phrase
+        # Fallback must also be normalised — a direct caller of _cluster_key
+        # with an all-stop-words input should still get a lowercase, whitespace-
+        # collapsed key equal to what the happy path would produce for any
+        # case/spacing variant of the same phrase.
+        return " ".join(tokens) if tokens else normalised
 
     async def collect(self, seeds: list[str], geo: list[int] | None = None) -> list[KeywordCluster]:
         seeds = [self.normalize(s) for s in seeds if s.strip()]
