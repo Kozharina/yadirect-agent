@@ -86,6 +86,29 @@ the PR merges or is abandoned.
 
 Accumulated work that isn't blocking but will sting later.
 
+- [ ] **M2.2 pipeline must-haves** (from M2.1 auditor review; block
+      M2.2 merge, not just landing):
+  - **`rollout_stage` enforcement** — today the field is stored but
+    never consulted. M2.2 pipeline runner MUST read it and refuse
+    ops that exceed the stage's permissions (shadow: read-only;
+    assist: pause/negatives/bid-±10%; autonomy_light: bid-±25%,
+    budget-±15%; autonomy_full: everything). A silent stored-but-
+    unchecked field is worse than no field — operators expecting
+    `autonomy_full` get `shadow` behaviour with no error, or vice
+    versa.
+  - **`forbidden_operations` comparator normalisation** — the list
+    is now normalised to lowercase snake_case at policy load. M2.2
+    pipeline MUST normalise the operation name at the call site
+    before the `in forbidden_operations` check, or the guard fails
+    silently on a case-different call.
+  - **`auto_approve_negative_keywords` default decision** — auditor
+    flagged that the `True` default is wider than the comment
+    claims (a bad negative can suppress all relevant traffic, not
+    just the intended subset). Decide in M2.2 whether to: (a) flip
+    to False by default, (b) keep True but add a size-limit guard
+    (`len(new_negatives) > N requires_confirmation`), or (c)
+    explicitly document the trade-off.
+
 - [ ] **Query-drift follow-ups from KS#7 review**:
   - PRIVACY / M2.3: **Hash or truncate `new_queries_sample` in the
     audit sink path.** KS#7's `CheckResult.details` surfaces up to
@@ -302,6 +325,22 @@ Last 10 items (newest at top). Older items are available via
       bug that had been hitting KS PRs as `ruff format --check`
       CI failures on code that passed locally. Bumping ruff is
       now a 3-file operation documented in both config comments.
+- [x] **M2.1 — Unified Policy schema** — single frozen pydantic
+      `Policy` aggregates all 7 slice-policies plus §M2.1's four
+      groups (approval tiers, per-op thresholds, forbidden_ops,
+      rollout_stage). YAML stays flat; `load_policy(path)` routes
+      each key to its slice and rejects unknown keys loudly.
+      64 KiB file-size guard against billion-laughs YAML. Seven
+      individual `load_*_policy` helpers remain for backwards
+      compat. `forbidden_operations` has a `field_validator` that
+      rejects blank entries and normalises case/whitespace so the
+      M2.2 pipeline can do case-insensitive lookup. Sync-test
+      pins `_*_KEYS` frozensets == slice `model_fields` to catch
+      the "add field, forget key map" maintenance trap. 23 new
+      tests (199 safety / 322 total). Reviewed by
+      `security-auditor` — MEDIUM + 3 LOW + 1 DESIGN all closed
+      in-PR; `auto_approve_negative_keywords` default explicitly
+      flagged for M2.2 decision.
 - [x] **M2 Kill-switch #7 — Query drift detector** — second
       system-level gatekeeper. `QueryDriftCheck(baseline, current)`
       compares normalised query sets, blocks when

@@ -1420,6 +1420,26 @@ class Policy(BaseModel):
     # --- Staged rollout (§M2.5; enforcement ships with M2.5) ---------------
     rollout_stage: RolloutStage = "shadow"
 
+    @field_validator("forbidden_operations")
+    @classmethod
+    def _normalise_forbidden_operations(cls, values: list[str]) -> list[str]:
+        """Reject blank entries and normalise to lowercase snake_case.
+
+        Without this, a typo in ``agent_policy.yml`` silently replaces
+        the default three-entry block list with one useless entry, and
+        the other two operations become permitted. Normalisation here
+        means the M2.2 pipeline can do case-insensitive lookup without
+        having to lowercase on every comparison.
+        """
+        normalised: list[str] = []
+        for v in values:
+            stripped = v.strip()
+            if not stripped:
+                msg = "forbidden_operations must not contain empty or whitespace-only entries"
+                raise ValueError(msg)
+            normalised.append(stripped.lower())
+        return normalised
+
 
 # --------------------------------------------------------------------------
 # Flat-YAML → nested-Policy loader.
@@ -1464,6 +1484,9 @@ def _slice(raw: dict[str, Any], keys: frozenset[str]) -> dict[str, Any]:
     return {k: raw[k] for k in keys if k in raw}
 
 
+_POLICY_FILE_MAX_BYTES = 64 * 1024  # 64 KiB — policy files are tiny.
+
+
 def load_policy(path: Path) -> Policy:
     """Read ``agent_policy.yml`` and build the unified ``Policy``.
 
@@ -1474,7 +1497,18 @@ def load_policy(path: Path) -> Policy:
     Unknown keys raise ``ValidationError`` — a typo must not silently
     become a default. Every kill-switch's slice has its own
     ``extra="forbid"`` as a second line of defence.
+
+    File-size guard: ``yaml.safe_load`` blocks arbitrary code execution
+    but does not bound memory; a deeply-aliased "billion laughs" file
+    can expand before Pydantic ever sees it. Anything over 64 KiB is
+    almost certainly an attack or a misfile — real policies are a few
+    hundred bytes.
     """
+    size = path.stat().st_size
+    if size > _POLICY_FILE_MAX_BYTES:
+        msg = f"agent_policy.yml is {size} bytes, exceeds {_POLICY_FILE_MAX_BYTES}-byte safety cap"
+        raise ValueError(msg)
+
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
     # Collect any keys we don't recognise and raise before Pydantic does

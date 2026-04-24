@@ -2360,6 +2360,69 @@ auto_approve_resume: true
         assert policy.budget_cap.account_daily_budget_cap_rub > 0
 
 
+class TestPolicyAuditorFindings:
+    """Security-auditor findings on the M2.1 unified Policy."""
+
+    def test_rejects_empty_forbidden_operations_entry(self) -> None:
+        # MEDIUM: a blank "" silently replaces defaults without
+        # providing a real block — typo or whitespace-only entries
+        # must raise.
+        with pytest.raises(ValidationError, match="forbidden_operations"):
+            Policy(
+                budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=10_000),
+                forbidden_operations=[""],
+            )
+
+    def test_rejects_whitespace_only_forbidden_operations_entry(self) -> None:
+        with pytest.raises(ValidationError, match="forbidden_operations"):
+            Policy(
+                budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=10_000),
+                forbidden_operations=["   "],
+            )
+
+    def test_forbidden_operations_are_normalised(self) -> None:
+        # Case drift and surrounding whitespace collapse so the M2.2
+        # pipeline's comparator can do a case-insensitive lookup
+        # without each call re-lowercasing.
+        policy = Policy(
+            budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=10_000),
+            forbidden_operations=["Delete_Campaigns", "  archive_campaigns_bulk  "],
+        )
+        assert policy.forbidden_operations == [
+            "delete_campaigns",
+            "archive_campaigns_bulk",
+        ]
+
+    def test_rejects_oversize_policy_file(self, tmp_path: Path) -> None:
+        # LOW: yaml.safe_load prevents arbitrary code execution but
+        # not unbounded memory expansion. Pin the 64 KiB guard.
+        path = tmp_path / "agent_policy.yml"
+        # 100 KB file — valid YAML, just huge.
+        filler = " " * (100 * 1024)
+        path.write_text(
+            f"account_daily_budget_cap_rub: 10000\n# padding:{filler}\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="safety cap"):
+            load_policy(path)
+
+    def test_key_maps_stay_in_sync_with_slice_model_fields(self) -> None:
+        # Maintenance trap: adding a field to a slice-policy without
+        # also adding the key to _*_KEYS would make load_policy
+        # silently reject the valid YAML key as "unknown". Pin the
+        # invariant.
+        from yadirect_agent.agent import safety
+
+        assert set(BudgetCapPolicy.model_fields) == safety._BUDGET_CAP_KEYS
+        assert set(MaxCpcPolicy.model_fields) == safety._MAX_CPC_KEYS
+        assert set(NegativeKeywordFloorPolicy.model_fields) == safety._NK_FLOOR_KEYS
+        assert set(QualityScoreGuardPolicy.model_fields) == safety._QS_GUARD_KEYS
+        assert set(BudgetBalanceDriftPolicy.model_fields) == safety._BALANCE_DRIFT_KEYS
+        assert set(ConversionIntegrityPolicy.model_fields) == safety._CONVERSION_KEYS
+        assert set(QueryDriftPolicy.model_fields) == safety._QUERY_DRIFT_KEYS
+
+
 class TestLoadPolicyBackwardsCompat:
     """The individual load_*_policy helpers MUST keep working. Existing
     kill-switch tests rely on them, and field-level callers shouldn't
