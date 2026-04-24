@@ -19,7 +19,11 @@ repos:
         args: ["--fix=lf"]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.8.4
+    # Pinned exact to match the ruff pin in pyproject.toml dev extras.
+    # Bumping ruff is a 3-file operation: here, pyproject.toml dev deps,
+    # and (if the new ruff ships new default lints) the code that trips
+    # them. See docs/TESTING.md on the version-skew lesson.
+    rev: v0.15.11
     hooks:
       - id: ruff
         args: ["--fix", "--exit-non-zero-on-fix"]
