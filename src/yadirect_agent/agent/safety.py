@@ -385,9 +385,22 @@ def _find_duplicate_keyword_ids(updates: list[ProposedBidChange]) -> list[int]:
 
 
 class MaxCpcCheck:
-    """Block bid updates that would exceed the per-campaign CPC cap.
+    """Block bid updates that would put CPC above the per-campaign cap.
 
-    Skeleton — always blocks. Real logic lands in the next commit.
+    Pipeline:
+    1. Reject the whole batch if any keyword_id appears twice in
+       ``updates`` — matches BudgetCapCheck's same-style refusal.
+    2. For each update, look up the keyword's campaign in the snapshot.
+       Unknown keyword_ids are silently skipped (tech-debt: surface as
+       a warn detail when M2.3 audit lands).
+    3. Pull the campaign's cap from policy. A campaign with no entry is
+       unconstrained by this check — the account-level BudgetCapCheck
+       still applies.
+    4. Compare proposed search and network bids against the cap. Block
+       on the first strict ``> cap`` violation; equality is ok.
+
+    Bid validation (``>= 0``, unknown fields, frozen instances) already
+    happened at ``ProposedBidChange`` construction.
     """
 
     def __init__(self, policy: MaxCpcPolicy) -> None:
@@ -398,6 +411,45 @@ class MaxCpcCheck:
         snapshot: AccountBidSnapshot,
         updates: list[ProposedBidChange],
     ) -> CheckResult:
-        _ = snapshot
-        _ = updates
-        return CheckResult.blocked_result("not implemented")
+        duplicates = _find_duplicate_keyword_ids(updates)
+        if duplicates:
+            first = duplicates[0]
+            return CheckResult.blocked_result(
+                f"duplicate keyword_id in updates: {first}",
+                keyword_id=first,
+                duplicates=duplicates,
+            )
+
+        for u in updates:
+            kw = snapshot.find(u.keyword_id)
+            if kw is None:
+                # Keyword disappeared between snapshot read and check —
+                # pass for now; TODO (BACKLOG): warn-level detail via
+                # the audit sink once M2.3 exists.
+                continue
+            cap = self._policy.campaign_max_cpc_rub.get(kw.campaign_id)
+            if cap is None:
+                # Campaign has no configured cap — unconstrained by this
+                # check. BudgetCapCheck still enforces account-level.
+                continue
+
+            if u.new_search_bid_rub is not None and u.new_search_bid_rub > cap:
+                return CheckResult.blocked_result(
+                    f"search bid exceeds max CPC cap for campaign {kw.campaign_id}",
+                    keyword_id=u.keyword_id,
+                    campaign_id=kw.campaign_id,
+                    bid_type="search",
+                    proposed_rub=u.new_search_bid_rub,
+                    cap_rub=cap,
+                )
+            if u.new_network_bid_rub is not None and u.new_network_bid_rub > cap:
+                return CheckResult.blocked_result(
+                    f"network bid exceeds max CPC cap for campaign {kw.campaign_id}",
+                    keyword_id=u.keyword_id,
+                    campaign_id=kw.campaign_id,
+                    bid_type="network",
+                    proposed_rub=u.new_network_bid_rub,
+                    cap_rub=cap,
+                )
+
+        return CheckResult.ok_result()
