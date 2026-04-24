@@ -165,8 +165,18 @@ def load_budget_cap_policy(path: Path) -> BudgetCapPolicy:
 class BudgetCapCheck:
     """Block plans that would push daily spend over a configured cap.
 
-    Skeleton: always blocks. Real projection + comparison lands in the
-    next commit.
+    Pipeline:
+    1. Apply ``changes`` to a copy of ``snapshot`` (state + budget fields).
+    2. Compute the projected total active spend. Block if > account cap.
+    3. For every group that has a cap configured, compute its projected
+       total active spend. Block on the first violation.
+    4. Otherwise ok.
+
+    Suspended / OFF campaigns are *excluded* from the totals even if
+    their budget changes — the concern is today's spend, not potential
+    future spend. Flipping state (e.g. SUSPENDED → ON via
+    ``BudgetChange.new_state``) is first-class: it moves a campaign
+    into or out of the total.
     """
 
     def __init__(self, policy: BudgetCapPolicy) -> None:
@@ -177,8 +187,64 @@ class BudgetCapCheck:
         snapshot: AccountBudgetSnapshot,
         changes: list[BudgetChange],
     ) -> CheckResult:
-        # Stub — overriden by the GREEN commit that implements the real
-        # projection + cap comparison.
-        _ = snapshot
-        _ = changes
-        return CheckResult.blocked_result("not implemented")
+        projected = self._project(snapshot, changes)
+
+        account_total = projected.total_active_budget_rub()
+        account_cap = self._policy.account_daily_budget_cap_rub
+        if account_total > account_cap:
+            return CheckResult.blocked_result(
+                "account daily budget cap would be exceeded",
+                projected_rub=account_total,
+                cap_rub=account_cap,
+            )
+
+        for group, group_cap in self._policy.campaign_group_caps_rub.items():
+            group_total = projected.group_active_budget_rub(group)
+            if group_total > group_cap:
+                return CheckResult.blocked_result(
+                    f"campaign-group daily budget cap would be exceeded: {group!r}",
+                    group=group,
+                    projected_rub=group_total,
+                    cap_rub=group_cap,
+                )
+
+        return CheckResult.ok_result(
+            projected_total_rub=account_total,
+            account_cap_rub=account_cap,
+        )
+
+    @staticmethod
+    def _project(
+        snapshot: AccountBudgetSnapshot,
+        changes: list[BudgetChange],
+    ) -> AccountBudgetSnapshot:
+        """Return a new snapshot with every change applied.
+
+        Changes not matching any existing campaign are silently ignored
+        — the agent sometimes proposes an id that got archived between
+        the snapshot read and the policy check. We don't synthesise
+        phantom campaigns; the calling layer can re-read and re-plan.
+        """
+        by_id: dict[int, BudgetChange] = {c.campaign_id: c for c in changes}
+        next_campaigns: list[CampaignBudget] = []
+        for c in snapshot.campaigns:
+            change = by_id.get(c.id)
+            if change is None:
+                next_campaigns.append(c)
+                continue
+            new_budget = (
+                change.new_daily_budget_rub
+                if change.new_daily_budget_rub is not None
+                else c.daily_budget_rub
+            )
+            new_state = change.new_state if change.new_state is not None else c.state
+            next_campaigns.append(
+                CampaignBudget(
+                    id=c.id,
+                    name=c.name,
+                    daily_budget_rub=new_budget,
+                    state=new_state,
+                    group=c.group,
+                )
+            )
+        return AccountBudgetSnapshot(campaigns=next_campaigns)
