@@ -168,11 +168,16 @@ _BUDGET_SNAPSHOT_ACTIONS: frozenset[str] = frozenset(
         "set_campaign_budget",
         "add_negative_keywords",
         "archive_campaigns",
-        # NB: create_campaign is deliberately absent. A freshly-created
-        # campaign has no spend-to-date to cap-check against; the budget
-        # ceiling kicks in the moment the operator calls set_campaign_budget
-        # (which *is* in this set). Structural creation falls through to
-        # the gatekeepers + approval tier and defaults to confirm.
+        # NB: structural creation actions (``create_campaign``,
+        # ``create_ad_group``, ``create_ad``) are deliberately absent
+        # from both snapshot sets. None of them directly mutates a
+        # budget or a bid at the API level — a freshly-created
+        # campaign has no spend-to-date to cap-check against; an ad
+        # group / ad has no CPC until the operator calls
+        # ``set_keyword_bids`` or ``set_campaign_budget`` (both of
+        # which ARE in the relevant snapshot set). Structural creation
+        # falls through to the gatekeepers + approval tier and
+        # defaults to ``confirm``. Second-pass auditor INFO.
     }
 )
 _BID_SNAPSHOT_ACTIONS: frozenset[str] = frozenset(
@@ -201,21 +206,13 @@ def _required_snapshots(action: str) -> tuple[bool, bool]:
 # and more — all of which should default to "human-in-the-loop" until
 # an explicit policy knob says otherwise.
 #
-# Today the policy only exposes three auto-approve knobs (pause, resume,
-# negative_keywords). Every other mutating action defaults to ``confirm``
-# even when all kill-switches pass. When more fine-grained knobs land
-# (auto_approve_budget_change, auto_approve_structural_change, etc.),
-# this table grows.
+# The single source of truth for auto-approvability is the explicit
+# if-branch list in ``SafetyPipeline._requires_confirmation``; adding
+# a new tier means adding a new if-branch there together with a new
+# ``auto_approve_*`` knob on Policy. Keeping a parallel data structure
+# (a whitelist set) risks silent drift between the set and the
+# branches — second-pass auditor MEDIUM.
 # --------------------------------------------------------------------------
-
-
-_AUTO_APPROVABLE_ACTIONS: frozenset[str] = frozenset(
-    {
-        "pause_campaigns",
-        "resume_campaigns",
-        "add_negative_keywords",
-    }
-)
 
 
 # --------------------------------------------------------------------------
@@ -383,9 +380,16 @@ class SafetyPipeline:
                 ),
             )
 
-        # 2. Read-only actions: nothing else to check; allow immediately.
+        # 2. Read-only actions: nothing else to check. Honour the
+        #    ``auto_approve_readonly`` policy knob — operators who
+        #    disable it (e.g. for a compliance audit that logs every
+        #    read before execution) expect a confirm tier, not a
+        #    silent allow. Second-pass auditor LOW.
         if not _is_mutating_action(normalised_action):
-            return SafetyDecision(status="allow", reason="read-only")
+            status: Literal["allow", "confirm"] = (
+                "allow" if self._policy.auto_approve_readonly else "confirm"
+            )
+            return SafetyDecision(status=status, reason="read-only")
 
         # 2a. Mutating action requires the appropriate snapshot present.
         #     Without this guard an empty ReviewContext would route every
@@ -644,7 +648,10 @@ class SafetyPipeline:
 
         This closes auditor HIGH on this PR.
         """
-        # Whitelist paths: the three § M2.1 tiers that can auto-approve.
+        # Whitelist paths: the three §M2.1 tiers that can auto-approve.
+        # Add a branch here when a new ``auto_approve_*`` knob lands on
+        # Policy; do NOT re-introduce a parallel set — the if-branches
+        # are the single source of truth for auto-approvability.
         if action == "pause_campaigns":
             return not self._policy.auto_approve_pause
         if action == "resume_campaigns":
@@ -652,7 +659,6 @@ class SafetyPipeline:
         if action == "add_negative_keywords":
             return not self._policy.auto_approve_negative_keywords
 
-        # Whitelisted auto-approvable actions handled above. Every
-        # other mutating action requires confirm until a dedicated
-        # policy knob is added.
-        return action not in _AUTO_APPROVABLE_ACTIONS
+        # Every other mutating action requires confirm until a
+        # dedicated policy knob (and matching branch above) is added.
+        return True

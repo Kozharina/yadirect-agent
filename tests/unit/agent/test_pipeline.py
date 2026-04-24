@@ -53,6 +53,7 @@ def _policy(
     *,
     rollout_stage: RolloutStage = "autonomy_full",
     account_cap: int = 100_000,
+    auto_approve_readonly: bool = True,
     auto_approve_resume: bool = True,
     auto_approve_pause: bool = True,
     auto_approve_negative_keywords: bool = True,
@@ -71,6 +72,7 @@ def _policy(
             require_all_baseline_goals_present=True,
         ),
         rollout_stage=rollout_stage,
+        auto_approve_readonly=auto_approve_readonly,
         auto_approve_resume=auto_approve_resume,
         auto_approve_pause=auto_approve_pause,
         auto_approve_negative_keywords=auto_approve_negative_keywords,
@@ -239,6 +241,16 @@ class TestReadOnlyShortCircuit:
         assert result.status == "allow"
         assert result.warnings == []
         assert result.skipped_checks == []
+
+    def test_auto_approve_readonly_false_forces_confirm(self) -> None:
+        # Operators who disable auto_approve_readonly (e.g. for
+        # compliance audit) expect every read to route through a
+        # confirm tier rather than silently auto-allow. Second-pass
+        # auditor LOW: the knob was a no-op until this landed.
+        pipe = SafetyPipeline(_policy(auto_approve_readonly=False))
+        result = pipe.review(_plan("list_campaigns"), _ctx())
+        assert result.status == "confirm"
+        assert result.reason == "read-only"
 
 
 # --------------------------------------------------------------------------
