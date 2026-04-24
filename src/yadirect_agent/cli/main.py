@@ -37,6 +37,7 @@ from rich.table import Table
 
 from .. import __version__
 from ..agent.loop import Agent, AgentLoopError, AgentRun
+from ..agent.plans import OperationPlan, PendingPlansStore
 from ..agent.tools import build_default_registry
 from ..config import Settings, get_settings
 from ..logging import configure_logging
@@ -284,6 +285,98 @@ def _compact_json(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError):
         return repr(value)
+
+
+# --------------------------------------------------------------------------
+# `plans` — list / show pending operation plans (M2.2 data layer).
+# --------------------------------------------------------------------------
+
+
+plans_app = typer.Typer(
+    name="plans",
+    help="Inspect pending operation plans produced by the safety pipeline.",
+    no_args_is_help=True,
+)
+app.add_typer(plans_app, name="plans")
+
+
+def _plans_store(settings: Settings) -> PendingPlansStore:
+    """Standard location for the plans JSONL: next to the audit log."""
+    path = settings.audit_log_path.parent / "pending_plans.jsonl"
+    return PendingPlansStore(path)
+
+
+@plans_app.command("list")
+def plans_list_cmd(
+    show_all: Annotated[
+        bool,
+        typer.Option("--all", help="Include non-pending plans in the output."),
+    ] = False,
+) -> None:
+    """Print pending operation plans (or all plans with --all)."""
+    settings = _bootstrap_settings()
+    store = _plans_store(settings)
+    plans = store.all_plans() if show_all else store.list_pending()
+    _render_plans_table(plans)
+
+
+@plans_app.command("show")
+def plans_show_cmd(
+    plan_id: Annotated[str, typer.Argument(help="plan_id from `plans list`.")],
+) -> None:
+    """Print the full record for one plan."""
+    settings = _bootstrap_settings()
+    store = _plans_store(settings)
+    plan = store.get(plan_id)
+    if plan is None:
+        _err.print(f"[red]no plan with id {plan_id!r}[/red]")
+        raise typer.Exit(code=1)
+    _render_plan_detail(plan)
+
+
+def _render_plans_table(plans: list[OperationPlan]) -> None:
+    if not plans:
+        _out.print("[dim]no plans[/dim]")
+        return
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("plan_id")
+    table.add_column("created")
+    table.add_column("status")
+    table.add_column("action")
+    table.add_column("preview")
+    status_colour = {
+        "pending": "yellow",
+        "approved": "cyan",
+        "rejected": "red",
+        "applied": "green",
+    }
+    for p in plans:
+        colour = status_colour.get(p.status, "white")
+        table.add_row(
+            p.plan_id,
+            p.created_at.isoformat(timespec="seconds"),
+            f"[{colour}]{p.status}[/{colour}]",
+            p.action,
+            p.preview,
+        )
+    _out.print(table)
+
+
+def _render_plan_detail(plan: OperationPlan) -> None:
+    _out.print(f"[bold]plan_id[/bold]      {plan.plan_id}")
+    _out.print(f"[bold]created_at[/bold]   {plan.created_at.isoformat()}")
+    _out.print(f"[bold]action[/bold]       {plan.action}")
+    _out.print(f"[bold]resource[/bold]     {plan.resource_type} {plan.resource_ids}")
+    _out.print(f"[bold]status[/bold]       {plan.status}")
+    if plan.status_updated_at is not None:
+        _out.print(f"[bold]updated_at[/bold]   {plan.status_updated_at.isoformat()}")
+    if plan.trace_id is not None:
+        _out.print(f"[bold]trace_id[/bold]     {plan.trace_id}")
+    _out.print(f"[bold]reason[/bold]       {plan.reason}")
+    _out.print(f"[bold]preview[/bold]      {plan.preview}")
+    if plan.args:
+        _out.print("[bold]args:[/bold]")
+        _out.print(_compact_json(plan.args))
 
 
 if __name__ == "__main__":  # pragma: no cover

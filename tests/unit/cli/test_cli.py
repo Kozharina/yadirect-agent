@@ -129,3 +129,84 @@ def test_run_dispatches_into_agent_run(
     assert captured["task"] == "do the thing"
     assert "I did the thing." in result.output
     assert "trace_id=tr" in result.output
+
+
+# --------------------------------------------------------------------------
+# `plans` subcommand (M2.2 data layer).
+# --------------------------------------------------------------------------
+
+
+def _write_one_plan(store_path: Any) -> None:
+    """Seed pending_plans.jsonl with a single minimal plan."""
+    from datetime import UTC, datetime
+
+    from yadirect_agent.agent.plans import OperationPlan, PendingPlansStore
+
+    plan = OperationPlan(
+        plan_id="plan-a",
+        created_at=datetime(2026, 4, 24, 10, 0, tzinfo=UTC),
+        action="set_campaign_budget",
+        resource_type="campaign",
+        resource_ids=[42],
+        args={"campaign_id": 42, "new_budget_rub": 800},
+        preview="raise campaign 42 budget 500→800 RUB",
+        reason="change exceeds auto-approval ceiling of +20%",
+    )
+    PendingPlansStore(store_path).append(plan)
+
+
+def test_plans_list_shows_pending_plan(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+) -> None:
+    # Seed one plan next to the audit log (where the CLI looks by default).
+    plans_path = settings.audit_log_path.parent / "pending_plans.jsonl"
+    _write_one_plan(plans_path)
+
+    result = runner.invoke(app, ["plans", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "plan-a" in result.output
+    # Rich table truncates long strings with ellipsis in narrow
+    # terminals, so just check the fields we know won't wrap.
+    assert "pending" in result.output
+    assert "set_campaign" in result.output  # prefix is always visible
+
+
+def test_plans_list_says_no_plans_when_store_is_empty(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+) -> None:
+    result = runner.invoke(app, ["plans", "list"])
+
+    assert result.exit_code == 0
+    assert "no plans" in result.output.lower()
+
+
+def test_plans_show_prints_full_detail(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+) -> None:
+    plans_path = settings.audit_log_path.parent / "pending_plans.jsonl"
+    _write_one_plan(plans_path)
+
+    result = runner.invoke(app, ["plans", "show", "plan-a"])
+
+    assert result.exit_code == 0, result.output
+    assert "plan-a" in result.output
+    assert "reason" in result.output.lower()
+    assert "raise campaign 42" in result.output
+
+
+def test_plans_show_returns_nonzero_for_unknown_id(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+) -> None:
+    result = runner.invoke(app, ["plans", "show", "does-not-exist"])
+
+    assert result.exit_code == 1
+    assert "no plan" in result.output.lower()
