@@ -1047,7 +1047,17 @@ def load_conversion_integrity_policy(path: Path) -> ConversionIntegrityPolicy:
 class ConversionIntegrityCheck:
     """Block all writes when Metrika tracking looks broken.
 
-    Skeleton — always blocks. Real logic lands in the next commit.
+    Pipeline (fails fast on the first tripped rule):
+    0. Empty baseline or baseline total == 0 → warn. No reference
+       point for the ratio; don't silently pass.
+    1. Absolute floor: current total < min_conversions_total →
+       blocked. Detects "zero conversions for a window" outages.
+    2. Ratio: current / baseline < min_ratio_vs_baseline → blocked.
+       Detects collapses that the absolute floor alone misses.
+    3. Missing goals: baseline goal_ids not ⊆ current goal_ids →
+       blocked (unless require_all_baseline_goals_present is False).
+       Detects deleted / misconfigured goals. Additive changes
+       (new goals in current) are fine.
     """
 
     def __init__(self, policy: ConversionIntegrityPolicy) -> None:
@@ -1058,6 +1068,56 @@ class ConversionIntegrityCheck:
         baseline: ConversionsSnapshot,
         current: ConversionsSnapshot,
     ) -> CheckResult:
-        _ = baseline
-        _ = current
-        return CheckResult.blocked_result("not implemented")
+        baseline_total = baseline.total_conversions()
+        current_total = current.total_conversions()
+
+        # (0) Empty baseline → warn, regardless of current state.
+        if not baseline.goals or baseline_total == 0:
+            return CheckResult.warn_result(
+                "baseline has no conversions; integrity check cannot apply",
+                baseline_total=baseline_total,
+                current_total=current_total,
+            )
+
+        # (1) Absolute floor.
+        if self._policy.min_conversions_total > 0 and (
+            current_total < self._policy.min_conversions_total
+        ):
+            return CheckResult.blocked_result(
+                (
+                    f"current total conversions {current_total} is below "
+                    f"minimum {self._policy.min_conversions_total}"
+                ),
+                current_total=current_total,
+                baseline_total=baseline_total,
+                min_total=self._policy.min_conversions_total,
+            )
+
+        # (2) Ratio vs baseline. Guard against divide-by-zero via the
+        # empty-baseline branch above.
+        ratio = current_total / baseline_total
+        if self._policy.min_ratio_vs_baseline > 0 and (ratio < self._policy.min_ratio_vs_baseline):
+            return CheckResult.blocked_result(
+                (
+                    f"current/baseline ratio {ratio:.3f} is below "
+                    f"minimum {self._policy.min_ratio_vs_baseline}"
+                ),
+                current_total=current_total,
+                baseline_total=baseline_total,
+                ratio=ratio,
+                min_ratio=self._policy.min_ratio_vs_baseline,
+            )
+
+        # (3) Missing goals. Only checked when the operator wants it.
+        if self._policy.require_all_baseline_goals_present:
+            missing = sorted(baseline.goal_ids() - current.goal_ids())
+            if missing:
+                return CheckResult.blocked_result(
+                    (f"baseline goals missing in current snapshot: {missing}"),
+                    missing_goal_ids=missing,
+                )
+
+        return CheckResult.ok_result(
+            baseline_total=baseline_total,
+            current_total=current_total,
+        )
