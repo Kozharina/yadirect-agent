@@ -41,6 +41,13 @@ from ..agent.tools import build_default_registry
 from ..config import Settings, get_settings
 from ..logging import configure_logging
 from ..services.campaigns import CampaignService, CampaignSummary
+from .doctor import (
+    CheckResult,
+    check_anthropic,
+    check_direct_sandbox,
+    check_env,
+    check_policy_file,
+)
 
 app = typer.Typer(
     name="yadirect-agent",
@@ -157,6 +164,51 @@ def list_campaigns_cmd(
         typer.echo(json.dumps([asdict(s) for s in summaries], ensure_ascii=False))
         return
     _render_campaigns_table(summaries)
+
+
+# --------------------------------------------------------------------------
+# `doctor` — environment diagnostics.
+# --------------------------------------------------------------------------
+
+
+@app.command("doctor")
+def doctor_cmd() -> None:
+    """Probe env + Anthropic + Direct sandbox + policy file, report per-check status.
+
+    Exit code: 0 if all checks are ok/warn, 2 if any check fails.
+    Safe to run from cron as a liveness probe.
+    """
+    settings = _bootstrap_settings()
+    results = asyncio.run(_run_doctor_checks(settings))
+    _render_doctor_results(results)
+
+    any_failed = any(r.status == "fail" for r in results)
+    if any_failed:
+        raise typer.Exit(code=2)
+
+
+async def _run_doctor_checks(settings: Settings) -> list[CheckResult]:
+    """Orchestrator. Serial on purpose — each check's output shapes the
+    operator's next action, and a failed env check makes the rest
+    irrelevant anyway."""
+    return [
+        await check_env(settings),
+        check_policy_file(settings),
+        await check_anthropic(settings),
+        await check_direct_sandbox(settings),
+    ]
+
+
+def _render_doctor_results(results: list[CheckResult]) -> None:
+    status_colour = {"ok": "green", "warn": "yellow", "fail": "red"}
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("check")
+    table.add_column("status")
+    table.add_column("detail")
+    for r in results:
+        colour = status_colour.get(r.status, "white")
+        table.add_row(r.name, f"[{colour}]{r.status}[/{colour}]", r.detail)
+    _out.print(table)
 
 
 # --------------------------------------------------------------------------
