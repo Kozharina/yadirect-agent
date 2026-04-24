@@ -1,8 +1,8 @@
-"""Tests for the safety layer — M2 kill-switch #1 (budget caps).
+"""Tests for the safety layer.
 
-TDD-first: this file grows with every subsequent kill-switch
-(#2 max CPC, #3 negative-keyword floor, etc.). For this PR we only
-cover the budget-cap projection and comparison logic.
+TDD-first: this file grows with every kill-switch in the M2 roadmap.
+- KS#1 (budget caps): TestBudgetCapCheck* / TestSnapshotTotals / ...
+- KS#2 (max CPC):     TestMaxCpcCheck* / TestProposedBidChange* / ...
 """
 
 from __future__ import annotations
@@ -13,13 +13,19 @@ import pytest
 from pydantic import ValidationError
 
 from yadirect_agent.agent.safety import (
+    AccountBidSnapshot,
     AccountBudgetSnapshot,
     BudgetCapCheck,
     BudgetCapPolicy,
     BudgetChange,
     CampaignBudget,
     CheckResult,
+    KeywordSnapshot,
+    MaxCpcCheck,
+    MaxCpcPolicy,
+    ProposedBidChange,
     load_budget_cap_policy,
+    load_max_cpc_policy,
 )
 
 # --------------------------------------------------------------------------
@@ -374,6 +380,278 @@ class TestBudgetCapCheckSuspendedSemantics:
                 BudgetChange(campaign_id=2, new_state="SUSPENDED"),
                 BudgetChange(campaign_id=1, new_daily_budget_rub=9_500),
             ],
+        )
+
+        assert result.status == "ok"
+
+
+# ==========================================================================
+# Kill-switch #2 — Max CPC per campaign.
+# ==========================================================================
+
+
+def _keyword(
+    kid: int,
+    campaign_id: int,
+    *,
+    search: float | None = None,
+    network: float | None = None,
+) -> KeywordSnapshot:
+    return KeywordSnapshot(
+        keyword_id=kid,
+        campaign_id=campaign_id,
+        current_search_bid_rub=search,
+        current_network_bid_rub=network,
+    )
+
+
+def _cpc_policy(caps: dict[int, float] | None = None) -> MaxCpcPolicy:
+    return MaxCpcPolicy(campaign_max_cpc_rub=caps or {})
+
+
+class TestProposedBidChangeValidation:
+    """KS#1's security-auditor lessons pre-applied: negatives rejected,
+    extra fields rejected, frozen instances.
+    """
+
+    def test_rejects_negative_search_bid(self) -> None:
+        with pytest.raises(ValidationError):
+            ProposedBidChange(keyword_id=1, new_search_bid_rub=-1.0)
+
+    def test_rejects_negative_network_bid(self) -> None:
+        with pytest.raises(ValidationError):
+            ProposedBidChange(keyword_id=1, new_network_bid_rub=-0.5)
+
+    def test_accepts_zero(self) -> None:
+        change = ProposedBidChange(keyword_id=1, new_search_bid_rub=0.0)
+        assert change.new_search_bid_rub == 0.0
+
+    def test_rejects_extra_fields(self) -> None:
+        with pytest.raises(ValidationError):
+            ProposedBidChange.model_validate({"keyword_id": 1, "evil_flag": True})
+
+
+class TestAccountBidSnapshot:
+    def test_find_returns_matching_keyword(self) -> None:
+        s = AccountBidSnapshot(keywords=[_keyword(1, 100), _keyword(2, 100)])
+        kw = s.find(2)
+        assert kw is not None
+        assert kw.keyword_id == 2
+
+    def test_find_returns_none_for_missing_keyword(self) -> None:
+        s = AccountBidSnapshot(keywords=[_keyword(1, 100)])
+        assert s.find(999) is None
+
+
+class TestMaxCpcPolicyValidation:
+    def test_empty_policy_is_valid(self) -> None:
+        p = MaxCpcPolicy()
+        assert p.campaign_max_cpc_rub == {}
+
+    def test_rejects_extra_fields(self) -> None:
+        with pytest.raises(ValidationError):
+            MaxCpcPolicy.model_validate({"unknown": 1})
+
+    def test_policy_is_immutable(self) -> None:
+        p = _cpc_policy({100: 10.0})
+        with pytest.raises(ValidationError):
+            p.campaign_max_cpc_rub = {}  # type: ignore[misc]
+
+
+class TestLoadMaxCpcPolicy:
+    def test_loads_policy_from_yaml(self, tmp_path: Path) -> None:
+        path = tmp_path / "agent_policy.yml"
+        path.write_text(
+            """
+campaign_max_cpc_rub:
+  100: 25.0
+  200: 40.0
+""",
+            encoding="utf-8",
+        )
+
+        p = load_max_cpc_policy(path)
+        assert p.campaign_max_cpc_rub == {100: 25.0, 200: 40.0}
+
+    def test_tolerates_unknown_keys(self, tmp_path: Path) -> None:
+        # Same YAML file carries keys for other kill-switches.
+        path = tmp_path / "agent_policy.yml"
+        path.write_text(
+            """
+account_daily_budget_cap_rub: 10000
+campaign_max_cpc_rub:
+  100: 25.0
+""",
+            encoding="utf-8",
+        )
+        p = load_max_cpc_policy(path)
+        assert p.campaign_max_cpc_rub == {100: 25.0}
+
+
+class TestMaxCpcCheckHappyPath:
+    def test_ok_with_no_updates(self) -> None:
+        check = MaxCpcCheck(_cpc_policy({100: 20.0}))
+        snapshot = AccountBidSnapshot(keywords=[_keyword(1, 100)])
+
+        result = check.check(snapshot, [])
+
+        assert result.status == "ok"
+
+    def test_ok_when_bid_is_below_cap(self) -> None:
+        check = MaxCpcCheck(_cpc_policy({100: 20.0}))
+        snapshot = AccountBidSnapshot(keywords=[_keyword(1, 100)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_search_bid_rub=15.0)],
+        )
+
+        assert result.status == "ok"
+
+    def test_ok_when_bid_exactly_at_cap(self) -> None:
+        # Equality is not "exceeding"; strict > only.
+        check = MaxCpcCheck(_cpc_policy({100: 20.0}))
+        snapshot = AccountBidSnapshot(keywords=[_keyword(1, 100)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_search_bid_rub=20.0)],
+        )
+
+        assert result.status == "ok"
+
+    def test_ok_when_campaign_has_no_cap_configured(self) -> None:
+        # Policy is empty — any bid passes this check.
+        check = MaxCpcCheck(_cpc_policy())
+        snapshot = AccountBidSnapshot(keywords=[_keyword(1, 999)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_search_bid_rub=9999.0)],
+        )
+
+        assert result.status == "ok"
+
+
+class TestMaxCpcCheckBlocksBids:
+    def test_blocked_when_search_bid_exceeds_cap(self) -> None:
+        check = MaxCpcCheck(_cpc_policy({100: 20.0}))
+        snapshot = AccountBidSnapshot(keywords=[_keyword(1, 100)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_search_bid_rub=25.0)],
+        )
+
+        assert result.status == "blocked"
+        assert "search" in (result.reason or "").lower()
+        assert "100" in (result.reason or "")
+        assert result.details.get("keyword_id") == 1
+        assert result.details.get("campaign_id") == 100
+        assert result.details.get("bid_type") == "search"
+        assert result.details.get("proposed_rub") == 25.0
+        assert result.details.get("cap_rub") == 20.0
+
+    def test_blocked_when_network_bid_exceeds_cap(self) -> None:
+        check = MaxCpcCheck(_cpc_policy({100: 20.0}))
+        snapshot = AccountBidSnapshot(keywords=[_keyword(1, 100)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_network_bid_rub=30.0)],
+        )
+
+        assert result.status == "blocked"
+        assert result.details.get("bid_type") == "network"
+        assert result.details.get("proposed_rub") == 30.0
+
+    def test_blocks_on_search_when_both_bids_exceed_cap(self) -> None:
+        # Security-auditor MEDIUM/LOW finding on KS#2: evaluation order
+        # between search and network is an implicit contract. A refactor
+        # that swaps the order would silently change which bid_type the
+        # operator sees first. Pin the order: search checked before
+        # network.
+        check = MaxCpcCheck(_cpc_policy({100: 20.0}))
+        snapshot = AccountBidSnapshot(keywords=[_keyword(1, 100)])
+
+        result = check.check(
+            snapshot,
+            [
+                ProposedBidChange(
+                    keyword_id=1,
+                    new_search_bid_rub=25.0,
+                    new_network_bid_rub=30.0,
+                )
+            ],
+        )
+
+        assert result.status == "blocked"
+        assert result.details.get("bid_type") == "search"
+        assert result.details.get("proposed_rub") == 25.0
+
+
+class TestMaxCpcPolicyKeyCoercion:
+    """Security-auditor MEDIUM finding: the int-keyed-dict contract is
+    assumed but never asserted. Pinning here so a future merged-policy
+    loader (M2.1) that goes through model_validate stays safe, and
+    anyone using model_construct gets caught on the first dict lookup.
+    """
+
+    def test_model_validate_coerces_string_keys_to_int(self) -> None:
+        # YAML / JSON always present dict keys as strings; pydantic v2
+        # coerces them to int under model_validate. This guarantees the
+        # lookup at MaxCpcCheck.check (`campaign_max_cpc_rub.get(int)`)
+        # finds the entry regardless of load path.
+        policy = MaxCpcPolicy.model_validate({"campaign_max_cpc_rub": {"100": 20.0, "200": 40.0}})
+
+        assert policy.campaign_max_cpc_rub == {100: 20.0, 200: 40.0}
+        # And the check actually uses the coerced int key:
+        assert policy.campaign_max_cpc_rub.get(100) == 20.0
+        assert policy.campaign_max_cpc_rub.get("100") is None  # type: ignore[arg-type]
+
+    def test_stops_at_first_violation(self) -> None:
+        # Multiple violations — report the first; details point to it.
+        check = MaxCpcCheck(_cpc_policy({100: 20.0, 200: 5.0}))
+        snapshot = AccountBidSnapshot(keywords=[_keyword(1, 100), _keyword(2, 200)])
+
+        result = check.check(
+            snapshot,
+            [
+                ProposedBidChange(keyword_id=1, new_search_bid_rub=25.0),
+                ProposedBidChange(keyword_id=2, new_search_bid_rub=100.0),
+            ],
+        )
+
+        assert result.status == "blocked"
+        assert result.details.get("keyword_id") == 1
+
+    def test_blocks_duplicate_keyword_ids_in_updates(self) -> None:
+        # Lesson pre-applied from KS#1 auditor review.
+        check = MaxCpcCheck(_cpc_policy({100: 20.0}))
+        snapshot = AccountBidSnapshot(keywords=[_keyword(1, 100)])
+
+        result = check.check(
+            snapshot,
+            [
+                ProposedBidChange(keyword_id=1, new_search_bid_rub=5.0),
+                ProposedBidChange(keyword_id=1, new_search_bid_rub=15.0),
+            ],
+        )
+
+        assert result.status == "blocked"
+        assert "duplicate" in (result.reason or "").lower()
+        assert result.details.get("keyword_id") == 1
+
+    def test_silently_skips_unknown_keyword_id(self) -> None:
+        # Matches KS#1 behaviour — agent sometimes proposes an id that
+        # disappeared between snapshot read and check. Logged in BACKLOG
+        # as tech debt (surface as warn detail when M2.3 audit lands).
+        check = MaxCpcCheck(_cpc_policy({100: 20.0}))
+        snapshot = AccountBidSnapshot(keywords=[_keyword(1, 100)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=999, new_search_bid_rub=999_999.0)],
         )
 
         assert result.status == "ok"
