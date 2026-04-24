@@ -31,10 +31,16 @@ Each one is TDD, with `security-auditor` sub-agent review before merge.
 All seven reference
 [`docs/PRIOR_ART.md`](./PRIOR_ART.md) → "Agentic PPC Campaign Management".
 
-- [ ] **M2.1 + M2.2: Policy schema & `plan → confirm → execute`** —
-      `agent/safety.py::Policy` (pydantic), `agent_policy.yml` loader,
-      `@requires_plan` decorator, `pending_plans.jsonl`,
-      `yadirect-agent apply-plan <id>` command.
+- [ ] **M2.2 part 3 — `@requires_plan` decorator + `apply-plan`
+      executor** — last slice of §M2.2. Decorator wraps mutating
+      service methods (`set_daily_budget` first), intercepts call,
+      builds an `OperationPlan`, persists via `PendingPlansStore`,
+      and raises `PlanRequired` carrying the plan_id. CLI
+      `yadirect-agent apply-plan <id>` loads the plan, routes it
+      back to the same service method with a `force=True` escape
+      hatch, marks the plan `applied`, and calls
+      `SafetyPipeline.on_applied(context)` to record session
+      TOCTOU state. First wiring target: `CampaignService.set_daily_budget`.
 - [ ] **M2.3: Audit sink** — `audit.py::AuditEvent`, JSONL async writer,
       `*.requested` / `*.ok` / `*.failed` emissions in every mutating
       service method.
@@ -85,6 +91,23 @@ the PR merges or is abandoned.
 ## Tech debt / follow-ups
 
 Accumulated work that isn't blocking but will sting later.
+
+- [ ] **M2.2 part 3 executor must-haves** (from SafetyPipeline
+      second-pass auditor review; block apply-plan merge):
+  - **Executor must call `SafetyPipeline.on_applied(context)`
+    exactly once after a successful API write**, and must NOT call
+    it on failure or timeout. The session TOCTOU register (max
+    approved bid per keyword) degrades silently to the per-snapshot
+    ceiling alone if this contract breaks. Acceptance test: write a
+    regression that exercises the failure path — plan allowed,
+    executor raises, next review of the same keyword at a higher
+    bid must NOT slip past the session cap.
+  - **Plan must carry the exact `ReviewContext` that produced the
+    decision** (not a rebuilt one at execute time), so
+    `on_applied` records bids against the same snapshot the
+    decision was made on. Alternatively, persist the minimal
+    identity (keyword_id → approved ceiling) inside
+    `OperationPlan.args` and reconstruct at apply time.
 
 - [ ] **M2.2 pipeline must-haves** (from M2.1 auditor review; block
       M2.2 merge, not just landing):
@@ -316,6 +339,28 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2.2 pipeline — SafetyPipeline orchestrator** — second
+      slice of §M2.2. `SafetyPipeline.review(plan, context)`
+      aggregates all 7 kill-switches + §M2.1 gatekeepers into a
+      single `allow | confirm | reject` decision with a skipped-check
+      ledger. Stages: forbidden_operations → rollout_stage allow-list →
+      read-only shortcut → required-snapshot guard → system
+      gatekeepers (KS#6/7) → per-op checks (KS#1/2/3/4/5) → session
+      TOCTOU → approval tier. Required-snapshot guard explicitly
+      rejects mutating actions when the caller did not supply the
+      data the relevant kill-switch needs (prevents the auditor's
+      CRITICAL empty-context bypass). `on_applied(context)` is a
+      separate post-execution callback that records the session
+      TOCTOU state (`max_approved_bid`) so a failed executor does
+      not poison the session cap. Default-confirm posture: the
+      `_AUTO_APPROVABLE_ACTIONS` whitelist (pause/resume/
+      add_negative_keywords) is the ONLY set that auto-allows;
+      every other mutating action returns `confirm` until an
+      explicit auto-approve knob lands. 36 new pipeline tests
+      (forbidden / rollout / read-only / required-snapshot /
+      gatekeepers / per-op / tiers / session / skipped; 386 total).
+      `security-auditor` pre-merge review: CRITICAL + 2 HIGH + 2
+      MEDIUM + 1 LOW all addressed before green tree.
 - [x] **chore(deps): pin ruff version across pyproject + pre-commit** —
       replaced `"ruff>=0.6"` with `"ruff==0.15.11"` in dev extras
       and bumped `.pre-commit-config.yaml` `ruff-pre-commit` rev
@@ -426,55 +471,3 @@ Last 10 items (newest at top). Older items are available via
       both, duplicate ids), silent-skip unknown ids. Reviewed by
       `security-auditor` before merge — MEDIUM/LOW tests added
       (both-bids-exceed evaluation order, policy key coercion).
-- [x] **M2 Kill-switch #1 — Budget caps** — `agent/safety.py` with
-      `BudgetCapPolicy`, `AccountBudgetSnapshot`, `BudgetChange`
-      (frozen pydantic BaseModel with Field(ge=0) on budget and
-      Literal on state), `BudgetCapCheck`, `CheckResult`. YAML loader
-      tolerates M2.1+ keys. `agent_policy.example.yml` shipped.
-      26 tests across happy/account/group/suspended semantics +
-      auditor-driven HIGH/MEDIUM fixes (negative budget, unknown
-      state string, duplicate ids in changes list). Reviewed by
-      `security-auditor` sub-agent before merge.
-- [x] **PR-C: yadirect-agent doctor command** — four checks
-      (env / policy file / Anthropic ping / Direct sandbox ping),
-      coloured table output, exit 2 on any failure. Delivered as
-      a clean RED → GREEN pair: failing tests + skeleton first,
-      real implementations + typer wiring second. Coverage 85.7%
-      → 87.0%.
-- [x] **M7.1 dotyazhka** — `test_semantics.py` (20 tests covering
-      normalize / _cluster_key / collect / validate_with_direct) +
-      `test_bidding.py` (6 tests pinning rubles→micro conversion,
-      empty-list no-op, batching). First real TDD PR: a visible
-      `test:` → `fix:` pair drove a real bug fix in
-      `_cluster_key`'s all-stop-words fallback (was returning the
-      raw phrase; now returns a normalised key). Coverage 78.9% →
-      85.7%; gate raised 78 → 80.
-- [x] **CodeQL first-scan cleanup** — 2 real `Note` alerts fixed in
-      code (`test_campaigns.py` dotted-path monkeypatch; unused `limit`
-      params prefixed with `_`). 3 Protocol-stub false positives
-      dismissed in the Security tab with reason "false positive —
-      `...` is the idiomatic `typing.Protocol` method body".
-- [x] **PR-B: security baseline** — `SECURITY.md` (GH private advisory
-      workflow), `.github/dependabot.yml` (weekly, grouped, labeled
-      `dependencies`/`python` and `github-actions`),
-      `.github/workflows/codeql.yml` (push + PR + weekly cron, pack
-      `security-and-quality`, Python only).
-- [x] **docs(backlog): introduce BACKLOG.md + rules** — merged as #5.
-- [x] **PR-A: coverage gate** — `pytest-cov` (`--cov-fail-under=78`),
-      `pytest-randomly`, `pytest-timeout=10` with two retry tests
-      explicitly marked `timeout=60`. Merged as #4.
-- [x] **docs/enforce-tdd** — `TDD as default` in `CLAUDE.md`,
-      `<tdd_workflow>` section in `TESTING.md`, reviewer checklist
-      item in `REVIEW.md`, PR-template checkbox. Merged as #3.
-- [x] **M1 agent skeleton** — `agent/` (tools, loop, prompts, CLI),
-      47 new tests, argument-aware repetition detector, parallel
-      reads / serial writes. Merged as #2.
-- [x] **Pre-commit setup** — hooks installed, missing runtime deps
-      (`httpx`, `structlog`, `tenacity`, `anthropic`, `typer`) added
-      to the mypy mirror's `additional_dependencies`. Merged as #1.
-- [x] **Initial scaffold + M0** — `pyproject.toml`, layered `src/`
-      tree (clients / services / models), `README.md`, `LICENSE`
-      (MIT), `Makefile`, `.pre-commit-config.yaml`, CI workflow on
-      py3.11 + py3.12, issue/PR templates, branch ruleset,
-      navigation docs (`CLAUDE.md`, `ARCHITECTURE.md`,
-      `CODING_RULES.md`, `TESTING.md`, `REVIEW.md`).
