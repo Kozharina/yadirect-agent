@@ -24,6 +24,8 @@ from yadirect_agent.agent.pipeline import (
     SafetyDecision,
     SafetyPipeline,
     SessionState,
+    deserialize_review_context,
+    serialize_review_context,
 )
 from yadirect_agent.agent.plans import OperationPlan
 from yadirect_agent.agent.safety import (
@@ -593,6 +595,57 @@ class TestSessionState:
 
     def test_approved_bid_ceiling_none_when_unknown(self) -> None:
         assert SessionState().approved_bid_ceiling(1) is None
+
+
+# --------------------------------------------------------------------------
+# ReviewContext serialisation (consumed by OperationPlan.review_context).
+# --------------------------------------------------------------------------
+
+
+class TestReviewContextSerialisation:
+    def test_empty_context_roundtrips(self) -> None:
+        # The minimal case — no snapshots present. Useful for read-only
+        # plans that don't carry any pipeline data.
+        ctx = ReviewContext()
+        revived = deserialize_review_context(serialize_review_context(ctx))
+        assert revived == ctx
+
+    def test_full_context_roundtrips(self) -> None:
+        ctx = ReviewContext(
+            budget_snapshot=AccountBudgetSnapshot(
+                campaigns=[CampaignBudget(id=1, name="c", daily_budget_rub=100, state="ON")]
+            ),
+            budget_changes=[BudgetChange(campaign_id=1, new_daily_budget_rub=150)],
+            baseline_timestamp=datetime(2026, 4, 24, 10, 0, tzinfo=UTC),
+        )
+        data = serialize_review_context(ctx)
+        # Sanity — serialisation produces JSON-compatible primitives.
+        import json
+
+        json.dumps(data)
+        revived = deserialize_review_context(data)
+        assert revived == ctx
+
+    def test_bid_change_list_roundtrips(self) -> None:
+        ctx = ReviewContext(
+            bid_changes=[
+                ProposedBidChange(
+                    keyword_id=42,
+                    new_search_bid_rub=15.0,
+                )
+            ],
+        )
+        revived = deserialize_review_context(serialize_review_context(ctx))
+        assert revived == ctx
+
+    def test_deserialize_rejects_unknown_keys(self) -> None:
+        # Silent-drop on extra keys is dangerous: a field added to
+        # ReviewContext later but forgotten in the serialiser would
+        # round-trip with that field lost. Loud failure is safer.
+        import pytest
+
+        with pytest.raises(ValueError, match="unknown keys"):
+            deserialize_review_context({"mystery_field": 1})
 
 
 # Silence "unused import" mypy check on cast / ValidationError — we

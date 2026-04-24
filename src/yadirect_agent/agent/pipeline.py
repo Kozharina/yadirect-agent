@@ -56,7 +56,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
+
+from pydantic import TypeAdapter
 
 from .plans import OperationPlan
 from .safety import (
@@ -254,6 +256,105 @@ class ReviewContext:
 
     # Provenance: when were the baselines read?
     baseline_timestamp: datetime | None = None
+
+
+# --------------------------------------------------------------------------
+# ReviewContext serialisation — consumed by ``OperationPlan.review_context``
+# so the apply-plan executor can re-review and record ``on_applied`` against
+# the original snapshot. ``ReviewContext`` and most snapshot classes are
+# frozen dataclasses (not pydantic models), so we use ``TypeAdapter`` to
+# get JSON round-tripping without migrating the existing shapes. Keeping
+# the adaptors alongside ``ReviewContext`` means the two stay in lockstep
+# — if a new snapshot field lands on ``ReviewContext``, the missing branch
+# below surfaces at the first serialisation test.
+# --------------------------------------------------------------------------
+
+
+# Pydantic TypeAdapters — compiled once per process. Each adaptor handles
+# a ``type | None`` variant so we can pass ``None`` for absent snapshots
+# through the same ``dump_python`` / ``validate_python`` path.
+_BUDGET_SNAPSHOT_TA: TypeAdapter[AccountBudgetSnapshot | None] = TypeAdapter(
+    AccountBudgetSnapshot | None
+)
+_BID_SNAPSHOT_TA: TypeAdapter[AccountBidSnapshot | None] = TypeAdapter(AccountBidSnapshot | None)
+_CONVERSIONS_TA: TypeAdapter[ConversionsSnapshot | None] = TypeAdapter(ConversionsSnapshot | None)
+_QUERIES_TA: TypeAdapter[SearchQueriesSnapshot | None] = TypeAdapter(SearchQueriesSnapshot | None)
+_BUDGET_CHANGES_TA: TypeAdapter[list[BudgetChange]] = TypeAdapter(list[BudgetChange])
+_BID_CHANGES_TA: TypeAdapter[list[ProposedBidChange]] = TypeAdapter(list[ProposedBidChange])
+
+_ALLOWED_CONTEXT_KEYS: frozenset[str] = frozenset(
+    {
+        "budget_snapshot",
+        "bid_snapshot",
+        "budget_baseline",
+        "conversions_baseline",
+        "conversions_current",
+        "queries_baseline",
+        "queries_current",
+        "budget_changes",
+        "bid_changes",
+        "baseline_timestamp",
+    }
+)
+
+
+def serialize_review_context(context: ReviewContext) -> dict[str, Any]:
+    """Return a JSON-serialisable dict for ``context``.
+
+    Round-trippable via :func:`deserialize_review_context`.
+    ``mode="json"`` ensures datetimes come back as ISO-8601 strings
+    and ``frozenset`` comes out as a list (which the target model
+    coerces back on reload).
+    """
+    return {
+        "budget_snapshot": _BUDGET_SNAPSHOT_TA.dump_python(context.budget_snapshot, mode="json"),
+        "bid_snapshot": _BID_SNAPSHOT_TA.dump_python(context.bid_snapshot, mode="json"),
+        "budget_baseline": _BUDGET_SNAPSHOT_TA.dump_python(context.budget_baseline, mode="json"),
+        "conversions_baseline": _CONVERSIONS_TA.dump_python(
+            context.conversions_baseline, mode="json"
+        ),
+        "conversions_current": _CONVERSIONS_TA.dump_python(
+            context.conversions_current, mode="json"
+        ),
+        "queries_baseline": _QUERIES_TA.dump_python(context.queries_baseline, mode="json"),
+        "queries_current": _QUERIES_TA.dump_python(context.queries_current, mode="json"),
+        "budget_changes": _BUDGET_CHANGES_TA.dump_python(context.budget_changes, mode="json"),
+        "bid_changes": _BID_CHANGES_TA.dump_python(context.bid_changes, mode="json"),
+        "baseline_timestamp": (
+            None if context.baseline_timestamp is None else context.baseline_timestamp.isoformat()
+        ),
+    }
+
+
+def deserialize_review_context(data: dict[str, Any]) -> ReviewContext:
+    """Inverse of :func:`serialize_review_context`.
+
+    Extra keys on ``data`` raise — mismatched schema must fail loudly
+    rather than silently drop data an operator might have expected to
+    round-trip (e.g. bid-side snapshots added later).
+    """
+    extra = set(data.keys()) - _ALLOWED_CONTEXT_KEYS
+    if extra:
+        msg = f"unknown keys in serialised ReviewContext: {sorted(extra)}"
+        raise ValueError(msg)
+
+    ts_raw = data.get("baseline_timestamp")
+    baseline_ts: datetime | None = None
+    if ts_raw is not None:
+        baseline_ts = datetime.fromisoformat(ts_raw)
+
+    return ReviewContext(
+        budget_snapshot=_BUDGET_SNAPSHOT_TA.validate_python(data.get("budget_snapshot")),
+        bid_snapshot=_BID_SNAPSHOT_TA.validate_python(data.get("bid_snapshot")),
+        budget_baseline=_BUDGET_SNAPSHOT_TA.validate_python(data.get("budget_baseline")),
+        conversions_baseline=_CONVERSIONS_TA.validate_python(data.get("conversions_baseline")),
+        conversions_current=_CONVERSIONS_TA.validate_python(data.get("conversions_current")),
+        queries_baseline=_QUERIES_TA.validate_python(data.get("queries_baseline")),
+        queries_current=_QUERIES_TA.validate_python(data.get("queries_current")),
+        budget_changes=_BUDGET_CHANGES_TA.validate_python(data.get("budget_changes", [])),
+        bid_changes=_BID_CHANGES_TA.validate_python(data.get("bid_changes", [])),
+        baseline_timestamp=baseline_ts,
+    )
 
 
 @dataclass(frozen=True)

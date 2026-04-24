@@ -36,21 +36,36 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-PlanStatus = Literal["pending", "approved", "rejected", "applied"]
+PlanStatus = Literal["pending", "approved", "rejected", "applied", "failed"]
+#: ``failed`` marks a plan whose apply-plan executor raised during the
+#: underlying API call. The plan cannot be retried through the normal
+#: ``apply-plan`` path — operators must triage the failure reason and
+#: decide whether to re-propose from scratch. Keeping it as a terminal
+#: status (alongside ``rejected`` and ``applied``) preserves the
+#: append-only audit trail and ensures a failed plan never silently
+#: re-runs on a later snapshot where the decision might differ.
 
 
 class OperationPlan(BaseModel):
     """A proposed mutating operation waiting for a decision.
 
     Every field is required except ``args`` / ``resource_ids`` /
-    ``trace_id``. Frozen: the content of a plan never changes —
-    state transitions produce *new* plan entries (with the same
-    ``plan_id`` and a new ``status`` + ``status_updated_at``) that
-    the store appends.
+    ``trace_id`` / ``review_context``. Frozen: the content of a plan
+    never changes — state transitions produce *new* plan entries
+    (with the same ``plan_id`` and a new ``status`` +
+    ``status_updated_at``) that the store appends.
 
     ``preview`` is the one-line human-readable summary the CLI
     surfaces; ``reason`` is why the pipeline decided this plan
     required confirmation (e.g. "bid increase > 50% on 12 keywords").
+
+    ``review_context`` carries a serialised snapshot of the
+    ``ReviewContext`` that produced the pipeline's decision at plan
+    creation time. It's consumed by the apply-plan executor to
+    (a) re-review the plan against the same snapshot that made the
+    confirm decision and (b) call ``SafetyPipeline.on_applied`` with
+    the original context so the session TOCTOU register records the
+    approval at the originally-evaluated ceiling.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -66,6 +81,7 @@ class OperationPlan(BaseModel):
     status: PlanStatus = "pending"
     status_updated_at: datetime | None = None
     trace_id: str | None = None
+    review_context: dict[str, Any] | None = None
 
     @field_validator("plan_id")
     @classmethod

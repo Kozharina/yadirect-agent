@@ -117,6 +117,27 @@ class TestOperationPlanModel:
         with pytest.raises(ValidationError):
             p.status = "approved"  # type: ignore[misc]
 
+    def test_review_context_defaults_to_none(self) -> None:
+        # Existing call-sites don't know about review_context; adding the
+        # field must not retroactively make every plan require it.
+        assert _plan().review_context is None
+
+    def test_review_context_accepts_dict(self) -> None:
+        # The executor serialises ReviewContext into this field. Pydantic
+        # just sees a dict — the shape is validated by the pipeline's
+        # deserializer, not here.
+        p = _plan().model_copy(update={"review_context": {"budget_snapshot": None}})
+        # Frozen model_copy must preserve the value through roundtrip.
+        revived = OperationPlan.model_validate_json(p.model_dump_json())
+        assert revived.review_context == {"budget_snapshot": None}
+
+    def test_failed_status_is_accepted(self) -> None:
+        # "failed" is the terminal state the executor writes when the
+        # underlying API call raises. It must be a valid PlanStatus so
+        # update_status can append it to the jsonl.
+        p = _plan(status="failed")
+        assert p.status == "failed"
+
 
 class TestGeneratePlanId:
     def test_returns_url_safe_hex(self) -> None:
