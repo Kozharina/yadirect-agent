@@ -129,6 +129,19 @@ Accumulated work that isn't blocking but will sting later.
       to keep the gate enforced locally, not only in CI.
 - [ ] **Raise coverage gate 78 → 80** once M7.1 dotyazhka lands. Gate
       value lives in two places (CI yaml and Makefile) — raise both.
+- [ ] **Pre-branch ritual in CLAUDE.md** — bug hit once: creating a
+      new branch without first `git switch main && git pull --ff-only`
+      led to stale base and a merge conflict. Add an explicit
+      checklist to `<workflow_per_task>`: sync main → delete merged
+      local branches → `git fetch --prune` → only then `git switch -c`.
+- [ ] **Copilot Autofix review policy** — `github-advanced-security`
+      can push "potential fix" commits straight to the PR branch when
+      the "Apply as commit" button is clicked. The fix can be
+      syntactically incomplete (e.g. remove dead function, leave the
+      imports). Rule to add to `docs/REVIEW.md` tier 1: every
+      autofix commit must be followed by a manual `make check` before
+      re-requesting review. Caught after PR for
+      `chore/codeql-first-scan-cleanup`.
 
 ## Ideas (no commitment)
 
