@@ -31,7 +31,6 @@ Each one is TDD, with `security-auditor` sub-agent review before merge.
 All seven reference
 [`docs/PRIOR_ART.md`](./PRIOR_ART.md) → "Agentic PPC Campaign Management".
 
-- [ ] **Kill-switch #2 — Max CPC per campaign** (§M2.0 rule 2).
 - [ ] **Kill-switch #3 — Negative-keyword floor** (§M2.0 rule 3):
       required minimum list (e.g. free/скачать/отзывы/вакансии).
 - [ ] **Kill-switch #4 — Quality Score guardrail + protected metric**
@@ -97,6 +96,27 @@ the PR merges or is abandoned.
 ## Tech debt / follow-ups
 
 Accumulated work that isn't blocking but will sting later.
+
+- [ ] **Max-CPC follow-ups from security-auditor review** (logged
+      during M2 Kill-switch #2; deferred as lower severity / out of
+      scope for current PR):
+  - DESIGN: **Auto-bidding strategy bypass** — MaxCpcCheck only
+    validates explicit `new_search_bid_rub` / `new_network_bid_rub`
+    in ProposedBidChange. Yandex Direct's portfolio strategies can
+    override keyword-level CPCs at serving time. If M2.2 adds an
+    OperationPlan carrying strategy-change ops, those need their
+    own kill-switch or this one must be extended.
+  - DESIGN: **Unconstrained-campaign misconfig trap** — a campaign
+    absent from `campaign_max_cpc_rub` is fully unconstrained. When
+    the M2.3 audit sink lands, emit a warn on first-use of such a
+    campaign so configuration drift is visible.
+  - DESIGN: **`load_max_cpc_policy` empty-policy silence** — a
+    typo'd YAML key silently disables the entire kill-switch.
+    Consider hard-failing or emitting a warn when the loaded policy
+    is empty while the kill-switch is registered.
+  - PERF/LOW: **O(n·m) snapshot.find()** — linear scan per update.
+    Acceptable at current Direct scale but becomes relevant when
+    M2.2 chains multiple checks per plan.
 
 - [ ] **Budget-cap follow-ups from security-auditor review** (logged
       during M2 Kill-switch #1; deferred as lower severity):
@@ -184,6 +204,16 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2 Kill-switch #2 — Max CPC per campaign** — `MaxCpcCheck`
+      enforces per-campaign CPC caps on bid updates. Adds
+      `KeywordSnapshot`, `AccountBidSnapshot`, `ProposedBidChange`
+      (pydantic BaseModel, Field(ge=0), extra=forbid, auditor-hardened
+      from day one), `MaxCpcPolicy`, `load_max_cpc_policy`. 22 new
+      tests: shapes, validation, YAML loader, key-coercion contract,
+      happy paths (below / at cap / no cap), blocks (search, network,
+      both, duplicate ids), silent-skip unknown ids. Reviewed by
+      `security-auditor` before merge — MEDIUM/LOW tests added
+      (both-bids-exceed evaluation order, policy key coercion).
 - [x] **M2 Kill-switch #1 — Budget caps** — `agent/safety.py` with
       `BudgetCapPolicy`, `AccountBudgetSnapshot`, `BudgetChange`
       (frozen pydantic BaseModel with Field(ge=0) on budget and

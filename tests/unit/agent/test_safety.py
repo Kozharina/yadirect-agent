@@ -565,6 +565,50 @@ class TestMaxCpcCheckBlocksBids:
         assert result.details.get("bid_type") == "network"
         assert result.details.get("proposed_rub") == 30.0
 
+    def test_blocks_on_search_when_both_bids_exceed_cap(self) -> None:
+        # Security-auditor MEDIUM/LOW finding on KS#2: evaluation order
+        # between search and network is an implicit contract. A refactor
+        # that swaps the order would silently change which bid_type the
+        # operator sees first. Pin the order: search checked before
+        # network.
+        check = MaxCpcCheck(_cpc_policy({100: 20.0}))
+        snapshot = AccountBidSnapshot(keywords=[_keyword(1, 100)])
+
+        result = check.check(
+            snapshot,
+            [
+                ProposedBidChange(
+                    keyword_id=1,
+                    new_search_bid_rub=25.0,
+                    new_network_bid_rub=30.0,
+                )
+            ],
+        )
+
+        assert result.status == "blocked"
+        assert result.details.get("bid_type") == "search"
+        assert result.details.get("proposed_rub") == 25.0
+
+
+class TestMaxCpcPolicyKeyCoercion:
+    """Security-auditor MEDIUM finding: the int-keyed-dict contract is
+    assumed but never asserted. Pinning here so a future merged-policy
+    loader (M2.1) that goes through model_validate stays safe, and
+    anyone using model_construct gets caught on the first dict lookup.
+    """
+
+    def test_model_validate_coerces_string_keys_to_int(self) -> None:
+        # YAML / JSON always present dict keys as strings; pydantic v2
+        # coerces them to int under model_validate. This guarantees the
+        # lookup at MaxCpcCheck.check (`campaign_max_cpc_rub.get(int)`)
+        # finds the entry regardless of load path.
+        policy = MaxCpcPolicy.model_validate({"campaign_max_cpc_rub": {"100": 20.0, "200": 40.0}})
+
+        assert policy.campaign_max_cpc_rub == {100: 20.0, 200: 40.0}
+        # And the check actually uses the coerced int key:
+        assert policy.campaign_max_cpc_rub.get(100) == 20.0
+        assert policy.campaign_max_cpc_rub.get("100") is None  # type: ignore[arg-type]
+
     def test_stops_at_first_violation(self) -> None:
         # Multiple violations — report the first; details point to it.
         check = MaxCpcCheck(_cpc_policy({100: 20.0, 200: 5.0}))
