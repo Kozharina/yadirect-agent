@@ -31,8 +31,6 @@ Each one is TDD, with `security-auditor` sub-agent review before merge.
 All seven reference
 [`docs/PRIOR_ART.md`](./PRIOR_ART.md) → "Agentic PPC Campaign Management".
 
-- [ ] **Kill-switch #6 — Conversion integrity** (§M2.0 rule 6):
-      daily Metrika goal-count sanity check; blocks writes on anomaly.
 - [ ] **Kill-switch #7 — Query drift detector** (§M2.0 rule 7):
       weekly new-query-share alert.
 - [ ] **M2.1 + M2.2: Policy schema & `plan → confirm → execute`** —
@@ -89,6 +87,20 @@ the PR merges or is abandoned.
 ## Tech debt / follow-ups
 
 Accumulated work that isn't blocking but will sting later.
+
+- [ ] **Conversion-integrity follow-ups from KS#6 review**
+      (architectural items, for M2.2 pipeline wiring):
+  - DESIGN: **Global-gatekeeper marker** — KS#6 is the first check
+    where a `blocked` result must abort *every* write in the plan
+    (no per-campaign scope). M2.2 pipeline must enforce this
+    invariant rather than demoting it to a per-op skip. Consider
+    typing the check as a distinct role (e.g. `SystemCheck` vs
+    `OperationCheck`) so the dispatcher can't confuse them.
+  - DESIGN: **`warn` on empty baseline in autonomous mode** — the
+    docstring says M2.2 "can" refuse autonomous writes on warn.
+    That's too weak: in fully-autonomous runs, `warn` from KS#6
+    should be a hard block; only a human-supervised mode may
+    override. Pin this when writing the pipeline runner.
 
 - [ ] **Balance-drift follow-ups from security-auditor review**
       (logged during M2 Kill-switch #5; architectural, not a
@@ -265,6 +277,17 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2 Kill-switch #6 — Conversion integrity** —
+      `ConversionIntegrityCheck` is a system-level gatekeeper
+      (no `changes` arg). Signature: `check(baseline, current)`.
+      Three independently-tunable rules: absolute floor, ratio vs
+      baseline, baseline-goals presence. Counter-id mismatch
+      rejected upfront. `GoalConversions.__post_init__` guards
+      negative / bool / non-int counts. 30 new tests (150 safety,
+      273 total). Reviewed by `security-auditor` — 2 code findings
+      (negative-count bypass + counter_id mismatch) closed in-PR;
+      2 design items moved to Tech debt (global-gatekeeper marker
+      for M2.2, warn-in-autonomous-mode policy for M2.2).
 - [x] **M2 Kill-switch #5 — Budget-balance drift** —
       `BudgetBalanceDriftCheck` refuses plans that shift any
       campaign's share of active daily budget more than

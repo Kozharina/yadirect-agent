@@ -978,11 +978,32 @@ class BudgetBalanceDriftCheck:
 
 @dataclass(frozen=True)
 class GoalConversions:
-    """Conversions for one Metrika goal over the snapshot window."""
+    """Conversions for one Metrika goal over the snapshot window.
+
+    ``__post_init__`` enforces the count contract at construction.
+    Without it, a plain frozen dataclass would accept negative ints
+    and booleans — a caller stitching a snapshot from a malicious
+    or corrupt Metrika response could submit `conversions=-500`,
+    inflating the ratio-vs-baseline metric in their favour and
+    bypassing KS#6. Same pattern as KeywordSnapshot.__post_init__
+    for quality_score (security-auditor LOW on KS#6).
+    """
 
     goal_id: int
     goal_name: str
     conversions: int
+
+    def __post_init__(self) -> None:
+        # bool is a subclass of int — reject explicitly so True/False
+        # don't slip in as 1/0.
+        if isinstance(self.conversions, bool) or not isinstance(self.conversions, int):
+            msg = (
+                "GoalConversions.conversions must be int, got " f"{type(self.conversions).__name__}"
+            )
+            raise TypeError(msg)
+        if self.conversions < 0:
+            msg = "GoalConversions.conversions must be non-negative, got " f"{self.conversions}"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True)
@@ -1068,6 +1089,20 @@ class ConversionIntegrityCheck:
         baseline: ConversionsSnapshot,
         current: ConversionsSnapshot,
     ) -> CheckResult:
+        # Sanity gate: the two snapshots must describe the same
+        # Metrika counter. Comparing tracking from counter A against
+        # counter B is meaningless and a realistic pipeline-wiring
+        # mistake in M2.2 (security-auditor LOW on KS#6).
+        if baseline.counter_id != current.counter_id:
+            return CheckResult.blocked_result(
+                (
+                    f"snapshot counter_id mismatch: baseline="
+                    f"{baseline.counter_id}, current={current.counter_id}"
+                ),
+                baseline_counter_id=baseline.counter_id,
+                current_counter_id=current.counter_id,
+            )
+
         baseline_total = baseline.total_conversions()
         current_total = current.total_conversions()
 

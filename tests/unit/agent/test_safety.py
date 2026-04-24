@@ -1845,3 +1845,59 @@ class TestConversionIntegrityEdgeCases:
         # baseline empty → warn by the empty-baseline branch, not
         # blocked by the absolute floor.
         assert result.status == "warn"
+
+
+class TestConversionIntegrityAuditorFindings:
+    """Security-auditor findings on KS#6: runtime validation gap on
+    GoalConversions, counter_id mismatch silent-pass, and an
+    untested all-disabled-policy state.
+    """
+
+    def test_goal_conversions_rejects_negative_count(self) -> None:
+        # MEDIUM. A negative count inflates total_conversions via
+        # integer arithmetic and slips past the ratio check.
+        with pytest.raises(ValueError, match="non-negative"):
+            GoalConversions(goal_id=1, goal_name="g", conversions=-1)
+
+    def test_goal_conversions_rejects_bool_count(self) -> None:
+        # bool is int's subclass; reject explicitly so True/False
+        # don't become 1/0.
+        with pytest.raises(TypeError, match="conversions"):
+            GoalConversions(goal_id=1, goal_name="g", conversions=True)  # type: ignore[arg-type]
+
+    def test_goal_conversions_rejects_non_int_count(self) -> None:
+        with pytest.raises(TypeError, match="conversions"):
+            GoalConversions(goal_id=1, goal_name="g", conversions="10")  # type: ignore[arg-type]
+
+    def test_goal_conversions_accepts_zero(self) -> None:
+        g = GoalConversions(goal_id=1, goal_name="g", conversions=0)
+        assert g.conversions == 0
+
+    def test_blocks_on_counter_id_mismatch(self) -> None:
+        # LOW. A pipeline bug (or deliberate poisoning) that pairs a
+        # baseline from counter A with a current from counter B must
+        # be caught — the ratio math would otherwise be nonsense.
+        check = ConversionIntegrityCheck(_ci_policy())
+        baseline = ConversionsSnapshot(counter_id=1, goals=_goals((1, 100)))
+        current = ConversionsSnapshot(counter_id=2, goals=_goals((1, 100)))
+
+        result = check.check(baseline, current)
+
+        assert result.status == "blocked"
+        assert "counter_id" in (result.reason or "").lower()
+        assert result.details.get("baseline_counter_id") == 1
+        assert result.details.get("current_counter_id") == 2
+
+    def test_all_disabled_policy_passes_non_empty_baseline(self) -> None:
+        # Test-coverage debt flagged by auditor: the code path where
+        # every knob is off and baseline is non-empty was not pinned.
+        # Today: falls through all three rules → ok.
+        check = ConversionIntegrityCheck(
+            _ci_policy(min_total=0, min_ratio=0.0, require_goals=False)
+        )
+        baseline = _snap(_goals((1, 100)))
+        current = _snap([])
+
+        result = check.check(baseline, current)
+
+        assert result.status == "ok"
