@@ -312,12 +312,54 @@ class BudgetCapCheck:
 
 @dataclass(frozen=True)
 class KeywordSnapshot:
-    """Snapshot of one keyword's current bid-relevant state."""
+    """Snapshot of one keyword's safety-relevant state.
+
+    - KS#2 (max CPC) reads ``campaign_id`` + current bids.
+    - KS#4 (QS guardrail) reads ``quality_score`` + current bids (to
+      detect increases).
+
+    ``quality_score`` is a Direct 0-10 score; ``None`` means unknown
+    (new keyword, Direct hasn't scored it yet). KS#4 treats unknown
+    QS as "skip, don't block" — a missing signal is not evidence of
+    a low QS.
+
+    Bid fields ``current_search_bid_rub`` / ``current_network_bid_rub``:
+    ``None`` denotes "unknown at snapshot time" rather than "not
+    applicable". KS#2 and KS#4 both defer (skip the check) when the
+    current value is None — they cannot prove an increase or a cap
+    violation without a base value. An agent presenting a partial
+    snapshot therefore routes around the guard; mitigations are
+    tracked in BACKLOG (M2.3 audit surfaces every deferred-None case
+    as a warn; the snapshot builder must read bids eagerly).
+
+    ``__post_init__`` enforces the QS type contract at construction —
+    frozen dataclass offers no runtime validation on its own, so a
+    caller could otherwise slip ``quality_score=4.5`` past us and
+    undermine the ``>= threshold`` comparison. See
+    tests/unit/agent/test_safety.py for the pinned edge cases.
+    """
 
     keyword_id: int
     campaign_id: int
     current_search_bid_rub: float | None = None
     current_network_bid_rub: float | None = None
+    quality_score: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.quality_score is None:
+            return
+        # `bool` is a subclass of `int` in Python; reject it explicitly
+        # so a stray `True`/`False` from a JSON mapper doesn't become
+        # a `1` or `0` QS value that passes every threshold trivially.
+        if isinstance(self.quality_score, bool) or not isinstance(self.quality_score, int):
+            msg = (
+                "KeywordSnapshot.quality_score must be int or None, "
+                f"got {type(self.quality_score).__name__}"
+            )
+            raise TypeError(msg)
+        if not 0 <= self.quality_score <= 10:
+            msg = f"KeywordSnapshot.quality_score must be in range 0..10, got {self.quality_score}"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True)
@@ -595,3 +637,144 @@ class NegativeKeywordFloorCheck:
                 )
 
         return CheckResult.ok_result()
+
+
+# --------------------------------------------------------------------------
+# Kill-switch #4 — Quality Score guardrail.
+#
+# QS is a *constraint*, not an objective. Refuse to raise a bid on a
+# keyword whose current QS is below policy, because raising CPC on a
+# low-QS keyword both wastes money (low QS → high actual CPC per click)
+# and risks further QS degradation at serving time. Source:
+# docs/TECHNICAL_SPEC.md §M2.0 rule 4 and §M2.6.
+#
+# Explicitly *not* in this PR (see BACKLOG):
+# - §M2.6 campaign-median QS tracking over 7 days.
+# - Alert emission when medial QS drops >1 point.
+# Those need historical snapshots; KS#4 here is the single-point
+# gate that fires at plan-check time.
+# --------------------------------------------------------------------------
+
+
+class QualityScoreGuardPolicy(BaseModel):
+    """Kill-switch #4 policy slice.
+
+    ``min_quality_score_for_bid_increase`` is the Direct QS floor below
+    which an explicit bid increase is refused. Direct QS is a 0-10
+    integer; policy defaults to 5 per §M2.1.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    min_quality_score_for_bid_increase: int = Field(
+        default=5,
+        ge=0,
+        le=10,
+        description="Keywords with QS below this value may not be bid up.",
+    )
+
+
+def load_quality_score_guard_policy(path: Path) -> QualityScoreGuardPolicy:
+    """Read ``agent_policy.yml`` and extract the QS-guardrail slice."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    fields = {k: raw[k] for k in ("min_quality_score_for_bid_increase",) if k in raw}
+    return QualityScoreGuardPolicy.model_validate(fields)
+
+
+class QualityScoreGuardCheck:
+    """Block bid *increases* on keywords whose QS is below policy.
+
+    Pipeline:
+    1. Duplicate keyword_id in ``updates`` → reject the whole batch
+       (shared guard with KS#1/#2/#3).
+    2. For each update, look up the keyword. Unknown ids skip
+       (consistent BACKLOG follow-up for M2.3 audit).
+    3. If QS is unknown (None) — defer. Missing signal ≠ bad signal;
+       operator should backfill QS before retrying.
+    4. If QS ≥ threshold — nothing to say.
+    5. QS < threshold: check each bid field against its current value
+       in the snapshot. A strict increase is blocked; equality and
+       decrease pass. If the current value is unknown, we can't tell
+       if it's an increase, so we defer.
+    6. Search field is checked before network — the order is part of
+       the documented contract (pinned in tests).
+
+    What never blocks:
+    - Lowering or holding a bid (the operator is doing the right
+      thing on a low-QS keyword).
+    - Bid on a keyword the snapshot doesn't include (silent skip).
+    - Bid when either current or new value is None on that field.
+    """
+
+    def __init__(self, policy: QualityScoreGuardPolicy) -> None:
+        self._policy = policy
+
+    def check(
+        self,
+        snapshot: AccountBidSnapshot,
+        updates: list[ProposedBidChange],
+    ) -> CheckResult:
+        duplicates = _find_duplicate_keyword_ids(updates)
+        if duplicates:
+            first = duplicates[0]
+            return CheckResult.blocked_result(
+                f"duplicate keyword_id in updates: {first}",
+                keyword_id=first,
+                duplicates=duplicates,
+            )
+
+        threshold = self._policy.min_quality_score_for_bid_increase
+
+        for u in updates:
+            kw = snapshot.find(u.keyword_id)
+            if kw is None:
+                continue
+            if kw.quality_score is None:
+                continue
+            if kw.quality_score >= threshold:
+                continue
+
+            # QS strictly below threshold — inspect each bid field for
+            # an increase.
+            if self._is_increase(u.new_search_bid_rub, kw.current_search_bid_rub):
+                return CheckResult.blocked_result(
+                    (
+                        f"search bid increase on keyword {u.keyword_id} refused: "
+                        f"QS {kw.quality_score} is below threshold {threshold}"
+                    ),
+                    keyword_id=u.keyword_id,
+                    campaign_id=kw.campaign_id,
+                    quality_score=kw.quality_score,
+                    threshold=threshold,
+                    bid_type="search",
+                    current_rub=kw.current_search_bid_rub,
+                    proposed_rub=u.new_search_bid_rub,
+                )
+            if self._is_increase(u.new_network_bid_rub, kw.current_network_bid_rub):
+                return CheckResult.blocked_result(
+                    (
+                        f"network bid increase on keyword {u.keyword_id} refused: "
+                        f"QS {kw.quality_score} is below threshold {threshold}"
+                    ),
+                    keyword_id=u.keyword_id,
+                    campaign_id=kw.campaign_id,
+                    quality_score=kw.quality_score,
+                    threshold=threshold,
+                    bid_type="network",
+                    current_rub=kw.current_network_bid_rub,
+                    proposed_rub=u.new_network_bid_rub,
+                )
+
+        return CheckResult.ok_result()
+
+    @staticmethod
+    def _is_increase(new: float | None, current: float | None) -> bool:
+        """Return True if ``new`` strictly exceeds ``current``.
+
+        If either side is None the answer is False — a missing value
+        means we cannot prove an increase, so we defer rather than
+        block.
+        """
+        if new is None or current is None:
+            return False
+        return new > current

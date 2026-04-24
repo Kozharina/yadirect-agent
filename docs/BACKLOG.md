@@ -31,9 +31,6 @@ Each one is TDD, with `security-auditor` sub-agent review before merge.
 All seven reference
 [`docs/PRIOR_ART.md`](./PRIOR_ART.md) → "Agentic PPC Campaign Management".
 
-- [ ] **Kill-switch #4 — Quality Score guardrail + protected metric**
-      (§M2.0 rule 4, §M2.6). QS as constraint, never objective;
-      monitor-only, alert on > 1-point drop over 7 days.
 - [ ] **Kill-switch #5 — Budget-balance drift** (§M2.0 rule 5):
       X% cap on cross-campaign share shift per day.
 - [ ] **Kill-switch #6 — Conversion integrity** (§M2.0 rule 6):
@@ -94,6 +91,33 @@ the PR merges or is abandoned.
 ## Tech debt / follow-ups
 
 Accumulated work that isn't blocking but will sting later.
+
+- [ ] **QS-guardrail follow-ups from security-auditor review**
+      (logged during M2 Kill-switch #4; no single-call bypass, but
+      load-bearing before the pipeline ships):
+  - MEDIUM: **Cross-call bid-ratcheting TOCTOU** — KS#4 is stateless
+    per `check()` call. An agent can split an increase across N
+    calls (each small-delta against the fresh snapshot) and walk a
+    low-QS bid upward while every individual call passes. Must land
+    before M2.2 pipeline runner: a session-scoped
+    `max_approved_bid_per_keyword` register consulted and updated
+    inside the pipeline's per-turn execution.
+  - LOW: **None-current-bid defers to allow** — if either the
+    current or the new bid on a given field is None, KS#4 and KS#2
+    skip (cannot prove an increase / cap violation). An adversarial
+    snapshot builder that leaves bids as None slips guards. The
+    M2.3 audit sink should emit a `warn` for every deferred-None
+    case, and M2.2 snapshot builder must read bids eagerly.
+  - §M2.6 **QS trending** — median campaign QS drop > 1 point
+    over 7 days triggers alert + halt. Needs historical snapshots
+    (time-series sink) + background job. Out of scope for single-
+    point KS#4; scheduled for after the audit sink (M2.3) provides
+    a place to read daily QS writes from.
+  - DESIGN: **`KeywordSnapshot` post-init is now enforcing QS
+    integrity** — same pattern could migrate to a pydantic model
+    for consistency with every policy class in this module. Not
+    urgent: the dataclass+__post_init__ is functionally equivalent
+    and keeps the import surface narrow.
 
 - [ ] **Negative-keyword-floor follow-ups from security-auditor
       review** (logged during M2 Kill-switch #3; lower severity /
@@ -228,6 +252,17 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2 Kill-switch #4 — Quality Score guardrail** —
+      `QualityScoreGuardCheck` blocks bid *increases* on keywords
+      whose QS is below the configured threshold. Policy is a narrow
+      slice: `min_quality_score_for_bid_increase: int` with
+      `Field(ge=0, le=10)` defaulting to 5. `KeywordSnapshot` grows
+      `quality_score: int | None` and a `__post_init__` guard that
+      rejects float / bool / out-of-range values. Search-before-
+      network evaluation order pinned. 28 new tests (99 safety, 222
+      across the suite). Reviewed by `security-auditor` — no single-
+      call bypass found; 3 follow-ups (cross-call ratchet, None-
+      current defer, §M2.6 trending) moved to Tech debt.
 - [x] **M2 Kill-switch #3 — Negative-keyword floor** —
       `NegativeKeywordFloorCheck` refuses to resume a campaign that
       does not carry every required negative keyword. Reuses KS#1
