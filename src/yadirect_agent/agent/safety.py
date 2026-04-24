@@ -27,6 +27,7 @@ rather than ``ImportError`` (wrong reason).
 
 from __future__ import annotations
 
+import math
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -778,3 +779,171 @@ class QualityScoreGuardCheck:
         if new is None or current is None:
             return False
         return new > current
+
+
+# --------------------------------------------------------------------------
+# Kill-switch #5 — Budget-balance drift.
+#
+# Refuses plans that would shift a single campaign's share of the daily
+# account budget by more than a configured number of percentage points
+# vs. a baseline (yesterday's) distribution. Protects against the
+# "agent poured everything into one campaign overnight" failure mode.
+# Source: docs/TECHNICAL_SPEC.md §M2.0 rule 5.
+#
+# First kill-switch with a temporal dimension: the check takes two
+# snapshots (baseline + current) and projects changes onto the current
+# to produce a "projected" distribution, then compares per-campaign
+# shares. Distances are in absolute percentage points.
+#
+# Out of scope for this PR (BACKLOG): historical snapshot store with
+# rolling windows, cross-day baseline rotation, alerts on sustained
+# drift. Here the check is a single-call function that treats the
+# `baseline` argument as ground truth.
+# --------------------------------------------------------------------------
+
+
+class BudgetBalanceDriftPolicy(BaseModel):
+    """Kill-switch #5 policy slice.
+
+    ``max_shift_pct_per_day`` is the hard ceiling on how much any
+    single campaign's share of the active daily budget may move in
+    absolute percentage points between yesterday's baseline and the
+    projected state after changes apply. A default of ``0.3`` matches
+    §M2.1 (a 30-percentage-point shift is already enough to materially
+    restructure an account's delivery profile).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    max_shift_pct_per_day: float = Field(
+        default=0.3,
+        gt=0,
+        le=1,
+        description=(
+            "Max absolute change in a campaign's share of account-level "
+            "active budget, expressed as a [0, 1] fraction of total."
+        ),
+    )
+
+
+def load_budget_balance_drift_policy(path: Path) -> BudgetBalanceDriftPolicy:
+    """Read ``agent_policy.yml`` and extract the balance-drift slice."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    fields = {k: raw[k] for k in ("max_shift_pct_per_day",) if k in raw}
+    return BudgetBalanceDriftPolicy.model_validate(fields)
+
+
+class BudgetBalanceDriftCheck:
+    """Block plans that redistribute account budget too aggressively.
+
+    Pipeline:
+    1. Duplicate campaign_id in ``changes`` → reject whole batch.
+    2. Project ``changes`` onto ``snapshot`` (reuse BudgetCapCheck's
+       projection semantics: state flips first-class, unknown ids
+       silently dropped).
+    3. Compute baseline active total and projected active total.
+       If either is zero, defer — no reference distribution, any
+       allocation today is "new" and shouldn't be called drift.
+    4. For every campaign that appears in baseline or projected,
+       compute its share in each, and take the absolute difference.
+       Campaigns missing from one side contribute share = 0 on that
+       side.
+    5. Strictly greater than ``max_shift_pct_per_day`` → block on
+       that first campaign; equality is ok.
+
+    Only ``state == "ON"`` campaigns contribute to the totals —
+    suspended or ended campaigns don't spend, so their budget numbers
+    are noise for drift. Pausing a previously-active campaign moves
+    its share from its prior value to 0 (which IS a drift the operator
+    may want to block on).
+    """
+
+    def __init__(self, policy: BudgetBalanceDriftPolicy) -> None:
+        self._policy = policy
+
+    def check(
+        self,
+        baseline: AccountBudgetSnapshot,
+        snapshot: AccountBudgetSnapshot,
+        changes: list[BudgetChange],
+    ) -> CheckResult:
+        duplicates = _find_duplicate_ids(changes)
+        if duplicates:
+            first = duplicates[0]
+            return CheckResult.blocked_result(
+                f"duplicate campaign_id in changes: {first}",
+                campaign_id=first,
+                duplicates=duplicates,
+            )
+
+        projected = BudgetCapCheck._project(snapshot, changes)
+
+        baseline_total = baseline.total_active_budget_rub()
+        projected_total = projected.total_active_budget_rub()
+
+        # Empty baseline is a real risk window — first autonomous run
+        # or a baseline that wasn't backfilled would otherwise silently
+        # pass every rebalance. We emit `warn` (not `ok`) so the
+        # decision surfaces in the audit sink (M2.3) and the pipeline
+        # layer (M2.2) can refuse autonomous operation until a real
+        # baseline is present. See security-auditor LOW on KS#5.
+        if baseline_total == 0:
+            return CheckResult.warn_result(
+                "baseline has no active budget; drift check cannot apply",
+                baseline_total_rub=baseline_total,
+                projected_total_rub=projected_total,
+            )
+        if projected_total == 0:
+            # Everything paused — nothing is spending, drift is
+            # mathematically undefined. That's safe, not risky.
+            return CheckResult.ok_result(
+                baseline_total_rub=baseline_total,
+                projected_total_rub=projected_total,
+            )
+
+        threshold = self._policy.max_shift_pct_per_day
+
+        baseline_active = {
+            c.id: c.daily_budget_rub / baseline_total for c in baseline.campaigns if c.state == "ON"
+        }
+        projected_active = {
+            c.id: c.daily_budget_rub / projected_total
+            for c in projected.campaigns
+            if c.state == "ON"
+        }
+
+        all_ids = sorted(baseline_active.keys() | projected_active.keys())
+        for cid in all_ids:
+            before = baseline_active.get(cid, 0.0)
+            after = projected_active.get(cid, 0.0)
+            shift = abs(after - before)
+            # IEEE 754: values that should mathematically equal
+            # threshold often come out slightly above due to
+            # rounding (e.g. 0.8-0.5 ≈ 0.30000000000000004).
+            # `math.isclose` gives us a tolerance so "exactly at
+            # threshold" inputs stay ok instead of flickering blocked.
+            # Tolerance tightened from abs_tol=1e-12 to 1e-14 after
+            # security-auditor LOW finding: the wider window let
+            # `threshold + 1e-11` slip past math.isclose. Legitimate
+            # IEEE 754 rounding on real budget inputs (integer rubles
+            # divided by integer totals) stays inside 1e-14.
+            if shift > threshold and not math.isclose(
+                shift, threshold, rel_tol=1e-9, abs_tol=1e-14
+            ):
+                return CheckResult.blocked_result(
+                    (
+                        f"campaign {cid} share would shift "
+                        f"{shift * 100:.1f}pp (threshold "
+                        f"{threshold * 100:.0f}pp)"
+                    ),
+                    campaign_id=cid,
+                    shift_pct=shift,
+                    threshold=threshold,
+                    baseline_share=before,
+                    projected_share=after,
+                )
+
+        return CheckResult.ok_result(
+            baseline_total_rub=baseline_total,
+            projected_total_rub=projected_total,
+        )

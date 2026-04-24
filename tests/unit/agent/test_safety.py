@@ -15,6 +15,8 @@ from pydantic import ValidationError
 from yadirect_agent.agent.safety import (
     AccountBidSnapshot,
     AccountBudgetSnapshot,
+    BudgetBalanceDriftCheck,
+    BudgetBalanceDriftPolicy,
     BudgetCapCheck,
     BudgetCapPolicy,
     BudgetChange,
@@ -28,6 +30,7 @@ from yadirect_agent.agent.safety import (
     ProposedBidChange,
     QualityScoreGuardCheck,
     QualityScoreGuardPolicy,
+    load_budget_balance_drift_policy,
     load_budget_cap_policy,
     load_max_cpc_policy,
     load_negative_keyword_floor_policy,
@@ -1274,3 +1277,308 @@ class TestKeywordSnapshotQualityScoreTypeContract:
         for qs in (0, 5, 10, None):
             kw = KeywordSnapshot(keyword_id=1, campaign_id=100, quality_score=qs)
             assert kw.quality_score == qs
+
+
+# ==========================================================================
+# Kill-switch #5 — Budget-balance drift.
+# ==========================================================================
+
+
+def _ab_campaign(
+    cid: int,
+    budget_rub: float,
+    *,
+    state: str = "ON",
+) -> CampaignBudget:
+    """Test helper: a campaign with just the fields KS#5 reads."""
+    return CampaignBudget(
+        id=cid,
+        name=f"c-{cid}",
+        daily_budget_rub=budget_rub,
+        state=state,
+    )
+
+
+def _bbd_policy(max_shift: float = 0.3) -> BudgetBalanceDriftPolicy:
+    return BudgetBalanceDriftPolicy(max_shift_pct_per_day=max_shift)
+
+
+class TestBudgetBalanceDriftPolicyValidation:
+    def test_default_is_30_percent(self) -> None:
+        p = BudgetBalanceDriftPolicy()
+        assert p.max_shift_pct_per_day == 0.3
+
+    def test_accepts_fraction_in_range(self) -> None:
+        for v in (0.01, 0.5, 1.0):
+            assert _bbd_policy(v).max_shift_pct_per_day == v
+
+    def test_rejects_zero_or_below(self) -> None:
+        # Zero means "no shift allowed ever" — arguably valid but almost
+        # certainly a typo; we require gt=0 so the operator is forced to
+        # be explicit (disable the kill-switch at the pipeline level
+        # instead of setting a degenerate policy).
+        with pytest.raises(ValidationError):
+            _bbd_policy(0.0)
+        with pytest.raises(ValidationError):
+            _bbd_policy(-0.1)
+
+    def test_rejects_above_one(self) -> None:
+        with pytest.raises(ValidationError):
+            _bbd_policy(1.5)
+
+    def test_rejects_extra_fields(self) -> None:
+        with pytest.raises(ValidationError):
+            BudgetBalanceDriftPolicy.model_validate({"unknown": 1})
+
+    def test_policy_is_immutable(self) -> None:
+        p = _bbd_policy()
+        with pytest.raises(ValidationError):
+            p.max_shift_pct_per_day = 0.5  # type: ignore[misc]
+
+
+class TestLoadBudgetBalanceDriftPolicy:
+    def test_loads_from_yaml(self, tmp_path: Path) -> None:
+        path = tmp_path / "agent_policy.yml"
+        path.write_text("max_shift_pct_per_day: 0.2\n", encoding="utf-8")
+        p = load_budget_balance_drift_policy(path)
+        assert p.max_shift_pct_per_day == 0.2
+
+    def test_default_when_key_missing(self, tmp_path: Path) -> None:
+        path = tmp_path / "agent_policy.yml"
+        path.write_text("account_daily_budget_cap_rub: 10000\n", encoding="utf-8")
+        p = load_budget_balance_drift_policy(path)
+        assert p.max_shift_pct_per_day == 0.3
+
+
+class TestBudgetBalanceDriftHappyPath:
+    def test_ok_with_no_changes(self) -> None:
+        # Empty changes — nothing moves; projected == snapshot.
+        check = BudgetBalanceDriftCheck(_bbd_policy(0.3))
+        baseline = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500), _ab_campaign(2, 500)])
+        snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500), _ab_campaign(2, 500)])
+
+        result = check.check(baseline, snapshot, [])
+
+        assert result.status == "ok"
+
+    def test_ok_when_shift_under_threshold(self) -> None:
+        # Baseline: 50/50. Propose 70/30 — each campaign's share shifts
+        # by 20pp, which is strictly below the 30% threshold.
+        check = BudgetBalanceDriftCheck(_bbd_policy(0.3))
+        baseline = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500), _ab_campaign(2, 500)])
+        snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500), _ab_campaign(2, 500)])
+        # Post-change: campaign 1 → 700, campaign 2 stays 300 (via budget
+        # change on campaign 2).
+        result = check.check(
+            baseline,
+            snapshot,
+            [
+                BudgetChange(campaign_id=1, new_daily_budget_rub=700),
+                BudgetChange(campaign_id=2, new_daily_budget_rub=300),
+            ],
+        )
+
+        assert result.status == "ok"
+
+    def test_ok_when_shift_exactly_at_threshold(self) -> None:
+        # Strict `>` blocks; equality is ok.
+        check = BudgetBalanceDriftCheck(_bbd_policy(0.3))
+        baseline = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500), _ab_campaign(2, 500)])
+        snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500), _ab_campaign(2, 500)])
+        # Shift 1 → 800 (80%), 2 → 200 (20%). Each shifts exactly 30pp.
+        result = check.check(
+            baseline,
+            snapshot,
+            [
+                BudgetChange(campaign_id=1, new_daily_budget_rub=800),
+                BudgetChange(campaign_id=2, new_daily_budget_rub=200),
+            ],
+        )
+
+        assert result.status == "ok"
+
+
+class TestBudgetBalanceDriftBlocks:
+    def test_blocked_when_one_campaign_absorbs_everything(self) -> None:
+        # The core "agent drained everything into one campaign" case.
+        # Baseline 50/50 → projected 95/5.
+        check = BudgetBalanceDriftCheck(_bbd_policy(0.3))
+        baseline = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500), _ab_campaign(2, 500)])
+        snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500), _ab_campaign(2, 500)])
+        result = check.check(
+            baseline,
+            snapshot,
+            [
+                BudgetChange(campaign_id=1, new_daily_budget_rub=950),
+                BudgetChange(campaign_id=2, new_daily_budget_rub=50),
+            ],
+        )
+
+        assert result.status == "blocked"
+        # One campaign shifted; details name it and its drift.
+        assert result.details.get("campaign_id") in {1, 2}
+        assert result.details.get("threshold") == 0.3
+        # drift should be ~0.45 (|0.95 - 0.5|)
+        drift = result.details.get("shift_pct", 0.0)
+        assert drift > 0.3
+
+    def test_blocked_when_resuming_a_large_paused_campaign(self) -> None:
+        # Baseline: only campaign 1 active at 100% share.
+        # Current: campaign 2 also exists but SUSPENDED. Propose to resume
+        # campaign 2 with equal budget — campaign 1's share drops from
+        # 100% to 50% (50pp drift), which busts 30%.
+        check = BudgetBalanceDriftCheck(_bbd_policy(0.3))
+        baseline = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500)])
+        snapshot = AccountBudgetSnapshot(
+            campaigns=[_ab_campaign(1, 500), _ab_campaign(2, 500, state="SUSPENDED")]
+        )
+        result = check.check(
+            baseline,
+            snapshot,
+            [BudgetChange(campaign_id=2, new_state="ON")],
+        )
+
+        assert result.status == "blocked"
+
+    def test_blocked_when_pausing_a_large_campaign(self) -> None:
+        # Baseline: 1 has 50% share. Pause → 1's share becomes 0%.
+        # |0 - 0.5| = 0.5 drift > threshold 0.3.
+        check = BudgetBalanceDriftCheck(_bbd_policy(0.3))
+        baseline = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500), _ab_campaign(2, 500)])
+        snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500), _ab_campaign(2, 500)])
+        result = check.check(
+            baseline,
+            snapshot,
+            [BudgetChange(campaign_id=1, new_state="SUSPENDED")],
+        )
+
+        assert result.status == "blocked"
+
+    def test_first_drifting_campaign_wins(self) -> None:
+        # Two campaigns both drift; first one returned in details.
+        check = BudgetBalanceDriftCheck(_bbd_policy(0.3))
+        baseline = AccountBudgetSnapshot(
+            campaigns=[
+                _ab_campaign(1, 100),
+                _ab_campaign(2, 100),
+                _ab_campaign(3, 100),
+            ]
+        )
+        snapshot = AccountBudgetSnapshot(
+            campaigns=[
+                _ab_campaign(1, 100),
+                _ab_campaign(2, 100),
+                _ab_campaign(3, 100),
+            ]
+        )
+        # Bring campaign 1 up to 800 (share .8), campaign 2 down to 10
+        # (share .01), campaign 3 stays. Both campaigns 1 and 2 drift
+        # over 30pp — only one is reported.
+        result = check.check(
+            baseline,
+            snapshot,
+            [
+                BudgetChange(campaign_id=1, new_daily_budget_rub=800),
+                BudgetChange(campaign_id=2, new_daily_budget_rub=10),
+            ],
+        )
+
+        assert result.status == "blocked"
+
+
+class TestBudgetBalanceDriftEdgeCases:
+    def test_warns_when_baseline_is_empty(self) -> None:
+        # First-ever agent run: no baseline. Silent ok would let a
+        # compromised bootstrap run one unchecked rebalance — the
+        # security-auditor LOW on KS#5 called this out. We emit
+        # `warn` so the M2.3 audit sink surfaces the skipped check,
+        # and the M2.2 pipeline layer can refuse autonomous
+        # operation until a real baseline exists.
+        check = BudgetBalanceDriftCheck(_bbd_policy(0.3))
+        baseline = AccountBudgetSnapshot(campaigns=[])
+        snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 1000), _ab_campaign(2, 1000)])
+
+        result = check.check(
+            baseline,
+            snapshot,
+            [BudgetChange(campaign_id=1, new_daily_budget_rub=5000)],
+        )
+
+        assert result.status == "warn"
+        assert "baseline" in (result.reason or "").lower()
+        # Pipeline orchestrator can read these to refuse autonomous
+        # execution on empty baselines.
+        assert result.details.get("baseline_total_rub") == 0
+
+    def test_ok_when_projected_total_is_zero(self) -> None:
+        # Every active campaign gets paused — nothing spending, drift
+        # metric is undefined and irrelevant. Not our problem.
+        check = BudgetBalanceDriftCheck(_bbd_policy(0.3))
+        baseline = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500), _ab_campaign(2, 500)])
+        snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500), _ab_campaign(2, 500)])
+        result = check.check(
+            baseline,
+            snapshot,
+            [
+                BudgetChange(campaign_id=1, new_state="SUSPENDED"),
+                BudgetChange(campaign_id=2, new_state="SUSPENDED"),
+            ],
+        )
+
+        assert result.status == "ok"
+
+    def test_warns_when_baseline_total_is_zero(self) -> None:
+        # Same-class case as empty baseline: nobody was active yesterday.
+        # Safer to warn than silently allow any rebalance.
+        check = BudgetBalanceDriftCheck(_bbd_policy(0.3))
+        baseline = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500, state="SUSPENDED")])
+        snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500), _ab_campaign(2, 500)])
+        result = check.check(
+            baseline,
+            snapshot,
+            [BudgetChange(campaign_id=1, new_state="ON")],
+        )
+
+        assert result.status == "warn"
+
+    def test_blocks_duplicate_campaign_ids_in_changes(self) -> None:
+        check = BudgetBalanceDriftCheck(_bbd_policy(0.3))
+        baseline = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500)])
+        snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500)])
+
+        result = check.check(
+            baseline,
+            snapshot,
+            [
+                BudgetChange(campaign_id=1, new_daily_budget_rub=500),
+                BudgetChange(campaign_id=1, new_state="SUSPENDED"),
+            ],
+        )
+
+        assert result.status == "blocked"
+        assert "duplicate" in (result.reason or "").lower()
+
+    def test_campaign_only_in_snapshot_counts_as_zero_baseline_share(self) -> None:
+        # A campaign that appeared today (not in yesterday's baseline)
+        # starts at 0% baseline share. If it takes a significant share
+        # of the projected distribution, that's > threshold drift and
+        # must be blocked.
+        check = BudgetBalanceDriftCheck(_bbd_policy(0.3))
+        baseline = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500)])
+        snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500), _ab_campaign(2, 500)])
+        # Campaign 2 has 0% baseline, ~50% projected → 50pp drift.
+        result = check.check(baseline, snapshot, [])
+
+        assert result.status == "blocked"
+
+    def test_campaign_only_in_baseline_counts_as_zero_projected_share(self) -> None:
+        # A campaign archived between days: baseline share N%, projected
+        # share 0%. Treat drift as that N%, block if over threshold.
+        check = BudgetBalanceDriftCheck(_bbd_policy(0.3))
+        baseline = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500), _ab_campaign(2, 500)])
+        snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 500)])
+
+        result = check.check(baseline, snapshot, [])
+
+        # Campaign 2 went from 50% → 0% (50pp drop).
+        assert result.status == "blocked"
