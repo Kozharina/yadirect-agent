@@ -293,6 +293,15 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **chore(deps): pin ruff version across pyproject + pre-commit** —
+      replaced `"ruff>=0.6"` with `"ruff==0.15.11"` in dev extras
+      and bumped `.pre-commit-config.yaml` `ruff-pre-commit` rev
+      from the stale `v0.8.4` to `v0.15.11`. Three sources of
+      truth (local venv / CI `pip install` / pre-commit hook)
+      now resolve to the same build, closing the version-skew
+      bug that had been hitting KS PRs as `ruff format --check`
+      CI failures on code that passed locally. Bumping ruff is
+      now a 3-file operation documented in both config comments.
 - [x] **M2 Kill-switch #7 — Query drift detector** — second
       system-level gatekeeper. `QueryDriftCheck(baseline, current)`
       compares normalised query sets, blocks when
