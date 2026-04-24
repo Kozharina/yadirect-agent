@@ -287,6 +287,56 @@ class TestBudgetCapCheckGroupLevel:
         assert result.status == "ok"
 
 
+class TestBudgetChangeValidation:
+    """Findings from security-auditor review of the initial green commit:
+    HIGH severity bypasses through malformed BudgetChange inputs. Each
+    test here drives one constraint on the type.
+    """
+
+    def test_rejects_negative_daily_budget(self) -> None:
+        # HIGH. Without this, an agent could submit a negative budget to
+        # shrink the projected total and slip a real change under the cap.
+        with pytest.raises(ValidationError):
+            BudgetChange(campaign_id=1, new_daily_budget_rub=-1.0)
+
+    def test_accepts_zero_daily_budget(self) -> None:
+        # Zero is a legitimate value (pause-ish), just not negative.
+        change = BudgetChange(campaign_id=1, new_daily_budget_rub=0.0)
+        assert change.new_daily_budget_rub == 0.0
+
+    def test_rejects_unknown_state_string(self) -> None:
+        # MEDIUM. Must not allow "on" / "enabled" / typos that sneak past
+        # the strict-equality filter in the snapshot totals.
+        with pytest.raises(ValidationError):
+            BudgetChange(campaign_id=1, new_state="on")
+
+    def test_accepts_known_state_values(self) -> None:
+        for state in ("ON", "OFF", "SUSPENDED", "ENDED", "CONVERTED", "ARCHIVED"):
+            change = BudgetChange(campaign_id=1, new_state=state)
+            assert change.new_state == state
+
+
+class TestBudgetCapCheckRejectsDuplicateChanges:
+    def test_blocks_duplicate_campaign_ids_in_changes_list(self) -> None:
+        # HIGH. Without this, `_project` would silently keep only the last
+        # BudgetChange for a given id and run the cap check against a
+        # projection that mismatches what the executor will actually do.
+        check = BudgetCapCheck(_policy(account_cap=10_000))
+        snapshot = AccountBudgetSnapshot(campaigns=[_campaign(1, 5_000)])
+
+        result = check.check(
+            snapshot,
+            [
+                BudgetChange(campaign_id=1, new_daily_budget_rub=99_000),
+                BudgetChange(campaign_id=1, new_state="SUSPENDED"),
+            ],
+        )
+
+        assert result.status == "blocked"
+        assert "duplicate" in (result.reason or "").lower()
+        assert result.details.get("campaign_id") == 1
+
+
 class TestBudgetCapCheckSuspendedSemantics:
     def test_ok_when_suspended_campaign_raises_its_budget_no_cap_impact(self) -> None:
         # A SUSPENDED campaign doesn't spend today, so its budget doesn't
