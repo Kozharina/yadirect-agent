@@ -23,12 +23,6 @@ from yadirect_agent.agent.tools import (
     build_default_registry,
 )
 from yadirect_agent.config import Settings
-from yadirect_agent.models.campaigns import (
-    Campaign,
-    CampaignState,
-    CampaignStatus,
-    DailyBudget,
-)
 from yadirect_agent.models.keywords import Keyword
 
 # --------------------------------------------------------------------------
@@ -138,7 +132,7 @@ async def test_list_campaigns_default_returns_all(
 ) -> None:
     from yadirect_agent.services.campaigns import CampaignService
 
-    async def fake_list_all(self: CampaignService, limit: int = 500) -> list:
+    async def fake_list_all(self: CampaignService, _limit: int = 500) -> list:
         return []
 
     async def fake_list_active(self: CampaignService, limit: int = 200) -> list:
@@ -352,27 +346,12 @@ async def test_list_campaigns_summary_shape(
     tool_context: ToolContext,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from yadirect_agent.services.campaigns import CampaignService
-
-    async def fake_list_all(self: CampaignService, limit: int = 500) -> list:
-        return [
-            # Use the pydantic Campaign model via the service's internal conversion.
-            Campaign(
-                Id=1,
-                Name="alpha",
-                State=CampaignState.ON,
-                Status=CampaignStatus.ACCEPTED,
-                Type="TEXT_CAMPAIGN",
-                DailyBudget=DailyBudget(amount=500_000_000, mode="STANDARD"),
-            )
-        ]
-
     # The service wraps `Campaign` in `CampaignSummary`. The tool converts
     # that summary to a dict. We bypass `DirectService` by patching the
     # service method to produce summaries directly.
-    from yadirect_agent.services.campaigns import CampaignSummary
+    from yadirect_agent.services.campaigns import CampaignService, CampaignSummary
 
-    async def fake_summaries(self: CampaignService, limit: int = 500) -> list[CampaignSummary]:
+    async def fake_summaries(self: CampaignService, _limit: int = 500) -> list[CampaignSummary]:
         return [
             CampaignSummary(
                 id=1,
