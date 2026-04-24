@@ -1,0 +1,56 @@
+# yadirect-agent policy — example.
+#
+# Copy this file to `agent_policy.yml` at the repo root and tune the
+# numbers to your account before running the agent. The agent refuses
+# to start without an account-level cap configured.
+#
+# Fields marked EXTENDED are land-later (M2.1+); this PR only reads
+# the budget-cap slice. Including the extra keys here keeps the file
+# format stable across milestones.
+#
+# `agent_policy.yml` is gitignored. `agent_policy.example.yml` is not.
+# Never commit production caps; keep them in a local `.yml` only.
+
+# --- Hard ceilings (kill-switch #1, this PR) -------------------------------
+
+# Account-wide hard cap on summed active daily budgets, in RUB. Any plan
+# that would push the sum over this value is refused by the agent before
+# it reaches the Direct API.
+account_daily_budget_cap_rub: 10000
+
+# Optional per-group caps. Keys are free-form group labels stored on each
+# campaign (`CampaignBudget.group`). Groups not listed here are bounded
+# only by the account cap.
+campaign_group_caps_rub:
+  brand: 3000
+  non-brand: 5000
+  retargeting: 2000
+
+# --- EXTENDED: lands in M2.1 (full Policy schema) --------------------------
+# These keys are tolerated by today's YAML loader but not yet enforced.
+# See docs/TECHNICAL_SPEC.md §M2.1 for the full model.
+
+# rollout_stage: shadow | assist | autonomy_light | autonomy_full
+rollout_stage: shadow
+
+# Approval tiers (M2.2 plan→confirm→execute pipeline).
+# auto_approve_readonly: true
+# auto_approve_pause: true
+# auto_approve_resume: false
+
+# Thresholds per single operation.
+# max_daily_budget_change_pct: 0.2
+# max_bid_increase_pct: 0.5
+
+# Kill-switch #2-#7 (subsequent PRs in this milestone).
+# campaign_max_cpc_rub: {}
+# required_negative_keywords: ["бесплатно", "скачать", "своими руками"]
+# min_quality_score_for_bid_increase: 5
+# max_budget_balance_shift_pct_per_day: 0.3
+# max_new_query_share: 0.4
+
+# Always-forbidden operations.
+# forbidden_operations:
+#   - delete_campaigns
+#   - delete_ads
+#   - archive_campaigns_bulk
