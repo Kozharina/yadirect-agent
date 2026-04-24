@@ -22,6 +22,8 @@ dependencies = [
     "rich>=13.7",                   # pretty output
     # MCP
     "mcp>=1.0",                     # official MCP SDK
+    # Config files
+    "pyyaml>=6.0",                  # agent_policy.yml parsing (M2 safety layer)
     # Utilities
     "tldextract>=5.1",              # domain extraction for seeds
     "python-slugify>=8.0",
@@ -40,6 +42,7 @@ dev = [
     "mypy>=1.11",
     "pre-commit>=4.0",              # git hooks for ruff/mypy/hygiene
     "types-python-slugify",
+    "types-pyyaml",
 ]
 
 [project.scripts]
