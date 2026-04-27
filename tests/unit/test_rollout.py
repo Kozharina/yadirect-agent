@@ -165,3 +165,98 @@ class TestRolloutStateStore:
         path.write_text("not valid json {{{")
         store = RolloutStateStore(path)
         assert store.load() is None
+
+    def test_load_unreadable_file_returns_none(self, tmp_path: Path) -> None:
+        """Auditor M2.5 MEDIUM: an OSError (chmod 000, symlink loop)
+        must NOT crash the agent at boot. None falls back to YAML.
+        """
+        import os
+        import sys
+
+        if sys.platform == "win32":
+            pytest.skip("chmod-based unreadability test is POSIX-only")
+
+        path = tmp_path / "rollout_state.json"
+        path.write_text(
+            '{"stage":"shadow","promoted_at":"2026-04-27T12:00:00Z",'
+            '"promoted_by":"x","previous_stage":"shadow"}'
+        )
+        os.chmod(path, 0)
+        try:
+            assert RolloutStateStore(path).load() is None
+        finally:
+            os.chmod(path, 0o600)
+
+    def test_save_is_atomic_no_partial_file_on_crash(self, tmp_path: Path) -> None:
+        """Auditor M2.5 MEDIUM: save uses tempfile + os.replace so a
+        crash mid-rename leaves the destination unchanged.
+        """
+        from unittest.mock import patch
+
+        path = tmp_path / "rollout_state.json"
+        store = RolloutStateStore(path)
+        original = RolloutState(
+            stage="shadow",
+            promoted_at=datetime(2026, 4, 1, tzinfo=UTC),
+            promoted_by="seed",
+            previous_stage="shadow",
+        )
+        store.save(original)
+        original_content = path.read_text()
+
+        new_state = RolloutState(
+            stage="assist",
+            promoted_at=datetime(2026, 4, 27, tzinfo=UTC),
+            promoted_by="ops",
+            previous_stage="shadow",
+        )
+
+        with patch("yadirect_agent.rollout.os.replace") as mock_replace:
+            mock_replace.side_effect = OSError("simulated rename failure")
+            with pytest.raises(OSError, match="simulated rename failure"):
+                store.save(new_state)
+
+        assert path.read_text() == original_content
+        revived = store.load()
+        assert revived is not None
+        assert revived.stage == "shadow"
+
+
+class TestPromotedByValidation:
+    """Auditor M2.5 LOW-2: promoted_by bounded length + character set."""
+
+    def test_rejects_too_long(self) -> None:
+        with pytest.raises(ValidationError):
+            RolloutState(
+                stage="shadow",
+                promoted_at=datetime.now(UTC),
+                promoted_by="x" * 200,
+                previous_stage="shadow",
+            )
+
+    def test_rejects_control_chars(self) -> None:
+        with pytest.raises(ValidationError):
+            RolloutState(
+                stage="shadow",
+                promoted_at=datetime.now(UTC),
+                promoted_by="ops\x00\x01",
+                previous_stage="shadow",
+            )
+
+    def test_rejects_shell_metacharacters(self) -> None:
+        with pytest.raises(ValidationError):
+            RolloutState(
+                stage="shadow",
+                promoted_at=datetime.now(UTC),
+                promoted_by="ops; rm -rf /",
+                previous_stage="shadow",
+            )
+
+    def test_accepts_email_style_identifier(self) -> None:
+        s = RolloutState(
+            stage="shadow",
+            promoted_at=datetime.now(UTC),
+            promoted_by="jane.smith@example.com",
+            previous_stage="shadow",
+        )
+        assert s.promoted_by == "jane.smith@example.com"

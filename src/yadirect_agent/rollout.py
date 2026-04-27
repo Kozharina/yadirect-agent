@@ -36,19 +36,27 @@ Design notes:
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 import structlog
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
-# Mirror the canonical RolloutStage Literal from safety.py to keep
-# the type contract single-sourced — importing the safety symbol
-# directly would form a service → safety dependency we don't need
-# here. A drift between the two would surface in the safety test
-# suite (Pydantic Literal mismatch).
+from .agent.safety import RolloutStage as _SafetyRolloutStage
+
+# Mirror the canonical RolloutStage Literal from safety.py and
+# assert at module import that the two stay in sync. A future
+# addition to one but not the other will fail loudly at boot rather
+# than silently at the first ``model_copy`` that hits the missing
+# value. Auditor M2.5 LOW-1.
 RolloutStageLiteral = Literal["shadow", "assist", "autonomy_light", "autonomy_full"]
+assert set(get_args(RolloutStageLiteral)) == set(get_args(_SafetyRolloutStage)), (
+    "RolloutStageLiteral and safety.RolloutStage drifted: "
+    f"{set(get_args(RolloutStageLiteral)) ^ set(get_args(_SafetyRolloutStage))}"
+)
 
 __all__ = [
     "RolloutStageLiteral",
@@ -77,7 +85,17 @@ class RolloutState(BaseModel):
 
     stage: RolloutStageLiteral
     promoted_at: AwareDatetime
-    promoted_by: str = Field(..., min_length=1)
+    # Constrained to alphanum + the punctuation operators commonly use
+    # in identifiers (email-style ``.@-_``) and bounded length so a
+    # malformed CLI ``--actor`` cannot embed control codes / shell
+    # metacharacters / huge strings into the audit JSONL or state-file.
+    # Auditor M2.5 LOW-2.
+    promoted_by: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_.@\-]+$",
+    )
     previous_stage: RolloutStageLiteral
 
 
@@ -100,35 +118,67 @@ class RolloutStateStore:
 
     def load(self) -> RolloutState | None:
         """Return the persisted state, or ``None`` on missing /
-        corrupt file.
+        corrupt / unreadable file.
 
-        Boot-safe: a corrupt file returns None (with a structlog
-        WARNING) rather than crashing. The agent falls back to the
-        YAML's ``rollout_stage`` — safer than refusing to start.
+        Boot-safe: any failure to read or parse the file returns
+        ``None`` (with a structlog WARNING) rather than crashing.
+        The agent falls back to the YAML's ``rollout_stage`` —
+        safer than refusing to start. ``OSError`` is caught
+        explicitly (auditor M2.5 MEDIUM): a ``chmod 000`` on the
+        state-file or a symlink loop should not block boot.
         """
         if not self._path.exists():
             return None
         try:
             return RolloutState.model_validate_json(self._path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, OSError) as exc:
             structlog.get_logger(__name__).warning(
-                "rollout_state_file_corrupt",
+                "rollout_state_file_unreadable",
                 path=str(self._path),
+                error_type=type(exc).__name__,
+                error=str(exc),
                 note=(
-                    "rollout_state.json failed to parse; falling back to "
-                    "Policy.rollout_stage from YAML. Investigate and "
-                    "re-promote if needed."
+                    "rollout_state.json failed to read/parse; falling "
+                    "back to Policy.rollout_stage from YAML. Investigate "
+                    "and re-promote if needed."
                 ),
             )
             return None
 
     def save(self, state: RolloutState) -> None:
-        """Persist ``state`` (overwrite). Creates parent dirs on demand."""
+        """Persist ``state`` atomically (overwrite). Creates parent
+        dirs on demand.
+
+        Atomic-write contract (auditor M2.5 MEDIUM): the file is
+        written to a sibling tempfile and renamed via ``os.replace``,
+        which is atomic on POSIX and atomic-on-same-volume on
+        Windows. A SIGKILL between ``open`` and ``close`` therefore
+        leaves either the OLD file intact OR the NEW file fully
+        written — never a truncated half. Without this, ``load``'s
+        corrupt-file branch could silently fire after a crash mid-
+        write and the operator's ``promote`` confirmation would be
+        misleading.
+        """
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        # Use ``mode="json"`` so the AwareDatetime serialises to ISO-8601
-        # rather than a Python-only repr.
-        payload = state.model_dump_json(indent=2)
-        self._path.write_text(payload + "\n", encoding="utf-8")
+        # ``model_dump_json(indent=2)`` serialises AwareDatetime to
+        # ISO-8601 with offset preserved.
+        payload = state.model_dump_json(indent=2) + "\n"
+
+        # Sibling tempfile in the same dir → ``os.replace`` is atomic
+        # because source and destination share a filesystem.
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=self._path.parent,
+            prefix=f".{self._path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp.write(payload)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, self._path)
 
 
 # Silence "unused import" check on datetime — kept as a re-export hint

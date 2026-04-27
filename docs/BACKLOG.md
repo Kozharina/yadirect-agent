@@ -143,6 +143,24 @@ Accumulated work that isn't blocking but will sting later.
       ``_resolve_safety``-style raises if production marker is set
       without a sink.
 
+- [ ] **rollout_status_cmd: stale-but-aligned state-file display**
+      (from PR M2.5 auditor LOW-3): when YAML and state-file agree
+      on the same stage, ``_apply_rollout_state_override`` no-ops
+      and emits no info log, but ``rollout status`` still shows the
+      state-file block. Either suppress the state-file block when
+      no-op, or always emit ``rollout_state_resolved`` at boot.
+
+- [ ] **rollout promote autonomy_full: type-the-stage confirmation**
+      (from PR M2.5 auditor INFO): the most dangerous transition
+      currently uses y/N. For prod, require typing the literal
+      ``autonomy_full`` to confirm — eliminates fat-finger.
+
+- [ ] **rollout: docs/ROLLOUT.md operator runbook** (from PR M2.5
+      auditor INFO): the ``rollout`` subapp isn't in any operator-
+      facing doc. Add a short docs/ROLLOUT.md covering stage
+      semantics, success-gate metrics, and ``status`` / ``promote``
+      workflow with examples.
+
 - [ ] **Audit JSONL durability — fsync on emit** (from PR M2.3a
       auditor M-3): ``JsonlSink._append`` calls ``open().close()``
       which flushes Python's buffer to the OS but does not call
