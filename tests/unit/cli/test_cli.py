@@ -428,3 +428,178 @@ def test_apply_plan_unknown_action_exits_3(
     final = PendingPlansStore(plans_path).get("plan-mystery")
     assert final is not None
     assert final.status == "failed"
+
+
+# --------------------------------------------------------------------------
+# `rollout` subcommand (M2.5).
+# --------------------------------------------------------------------------
+
+
+def test_rollout_status_reports_yaml_default_when_no_state_file(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+) -> None:
+    """Fresh deployment (no rollout_state.json) → YAML default surfaces;
+    output mentions absence of the state-file."""
+    # Write a YAML so build_safety_pair has something to load.
+    settings.agent_policy_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.agent_policy_path.write_text(
+        "account_daily_budget_cap_rub: 50000\nrollout_stage: shadow\n"
+    )
+
+    result = runner.invoke(app, ["rollout", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "shadow" in result.output
+    assert "no rollout_state.json" in result.output.lower()
+
+
+def test_rollout_status_reports_state_file_override(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+) -> None:
+    """When a state-file is present, ``status`` reports the override
+    path (previous → current with timestamp + actor)."""
+    from datetime import UTC, datetime
+
+    from yadirect_agent.rollout import RolloutState, RolloutStateStore
+
+    settings.agent_policy_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.agent_policy_path.write_text(
+        "account_daily_budget_cap_rub: 50000\nrollout_stage: shadow\n"
+    )
+    state_path = settings.audit_log_path.parent / "rollout_state.json"
+    RolloutStateStore(state_path).save(
+        RolloutState(
+            stage="assist",
+            promoted_at=datetime(2026, 4, 27, 12, 0, tzinfo=UTC),
+            promoted_by="ops@example.com",
+            previous_stage="shadow",
+        )
+    )
+
+    result = runner.invoke(app, ["rollout", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "assist" in result.output
+    assert "ops@example.com" in result.output
+    # Both stages mentioned (previous → current).
+    assert "shadow" in result.output
+
+
+def test_rollout_promote_invalid_stage_exits_1(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+) -> None:
+    settings.agent_policy_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.agent_policy_path.write_text(
+        "account_daily_budget_cap_rub: 50000\nrollout_stage: shadow\n"
+    )
+
+    result = runner.invoke(app, ["rollout", "promote", "--to", "halfway"])
+
+    assert result.exit_code == 1, result.output
+    assert "invalid stage" in result.output.lower()
+
+
+def test_rollout_promote_writes_state_file_and_emits_audit(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+) -> None:
+    """Happy path: --yes skips confirmation; state-file written; audit
+    JSONL contains rollout_promote.requested + rollout_promote.ok."""
+    import json
+
+    from yadirect_agent.rollout import RolloutStateStore
+
+    settings.agent_policy_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.agent_policy_path.write_text(
+        "account_daily_budget_cap_rub: 50000\nrollout_stage: shadow\n"
+    )
+
+    result = runner.invoke(
+        app,
+        ["rollout", "promote", "--to", "assist", "--yes", "--actor", "ops"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "promoted" in result.output.lower()
+
+    # State-file written with the new stage.
+    state_path = settings.audit_log_path.parent / "rollout_state.json"
+    state = RolloutStateStore(state_path).load()
+    assert state is not None
+    assert state.stage == "assist"
+    assert state.previous_stage == "shadow"
+    assert state.promoted_by == "ops"
+
+    # Audit JSONL contains the promote envelope.
+    audit_lines = [
+        json.loads(line)
+        for line in settings.audit_log_path.read_text().splitlines()
+        if line.strip()
+    ]
+    actions = [e["action"] for e in audit_lines]
+    assert "rollout_promote.requested" in actions
+    assert "rollout_promote.ok" in actions
+    ok = next(e for e in audit_lines if e["action"] == "rollout_promote.ok")
+    assert ok["actor"] == "human"
+    assert ok["resource"] == "rollout"
+    assert ok["result"]["from_stage"] == "shadow"
+    assert ok["result"]["to_stage"] == "assist"
+
+
+def test_rollout_promote_declined_exits_2(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+) -> None:
+    """Without --yes, a "no" answer to the prompt aborts with exit 2."""
+    settings.agent_policy_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.agent_policy_path.write_text(
+        "account_daily_budget_cap_rub: 50000\nrollout_stage: shadow\n"
+    )
+
+    # CliRunner.invoke supports ``input=`` for the typer.confirm prompt.
+    result = runner.invoke(app, ["rollout", "promote", "--to", "assist"], input="n\n")
+
+    assert result.exit_code == 2, result.output
+    assert "abort" in result.output.lower()
+
+
+def test_rollout_promote_downgrade_allowed(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+) -> None:
+    """Operators must be able to roll BACK to a tighter stage —
+    downgrade is the safety win after an incident."""
+    from datetime import UTC, datetime
+
+    from yadirect_agent.rollout import RolloutState, RolloutStateStore
+
+    settings.agent_policy_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.agent_policy_path.write_text(
+        "account_daily_budget_cap_rub: 50000\nrollout_stage: shadow\n"
+    )
+    state_path = settings.audit_log_path.parent / "rollout_state.json"
+    RolloutStateStore(state_path).save(
+        RolloutState(
+            stage="autonomy_full",
+            promoted_at=datetime(2026, 4, 27, 12, 0, tzinfo=UTC),
+            promoted_by="ops",
+            previous_stage="autonomy_light",
+        )
+    )
+
+    result = runner.invoke(app, ["rollout", "promote", "--to", "shadow", "--yes", "--actor", "ops"])
+
+    assert result.exit_code == 0, result.output
+    state = RolloutStateStore(state_path).load()
+    assert state is not None
+    assert state.stage == "shadow"
+    assert state.previous_stage == "autonomy_full"

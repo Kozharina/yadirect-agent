@@ -31,6 +31,7 @@ from ..audit import AuditSink, JsonlSink
 from ..clients.direct import DirectService
 from ..clients.wordstat import DirectKeywordsResearch
 from ..config import Settings
+from ..rollout import RolloutStateStore
 from ..services.bidding import BiddingService, BidUpdate
 from ..services.campaigns import CampaignService
 from .executor import PlanRejected, PlanRequired
@@ -499,6 +500,39 @@ def _make_validate_phrases_tool(settings: Settings) -> Tool:
 # --------------------------------------------------------------------------
 
 
+def _apply_rollout_state_override(policy: Policy, settings: Settings) -> Policy:
+    """Override ``Policy.rollout_stage`` from the on-disk
+    rollout-state file when present (M2.5).
+
+    Layering:
+    - YAML (``Policy.rollout_stage``) is the default.
+    - ``rollout_state.json`` next to the audit log (written by the
+      ``yadirect-agent rollout promote`` CLI command) takes
+      precedence.
+
+    Returns the original ``policy`` unchanged when:
+    - the state-file is missing (fresh deployment), or
+    - the persisted stage matches the YAML stage (no-op).
+
+    Otherwise returns a deep-copied Policy with the new stage.
+    """
+    state_path = settings.audit_log_path.parent / "rollout_state.json"
+    state = RolloutStateStore(state_path).load()
+    if state is None:
+        return policy
+    if state.stage == policy.rollout_stage:
+        return policy
+
+    structlog.get_logger(__name__).info(
+        "rollout_state_override",
+        yaml_stage=policy.rollout_stage,
+        state_file_stage=state.stage,
+        promoted_at=state.promoted_at.isoformat(),
+        promoted_by=state.promoted_by,
+    )
+    return policy.model_copy(update={"rollout_stage": state.stage})
+
+
 def _apply_env_backstop(policy: Policy, settings: Settings) -> Policy:
     """Tighten the Policy's account budget cap with the env-level
     backstop ``settings.agent_max_daily_budget_rub`` (M2.4).
@@ -627,6 +661,12 @@ def build_safety_pair(
     # more input into the cap. ``min`` always picks the safer
     # number; if the YAML is already tighter, this is a no-op.
     policy = _apply_env_backstop(policy, settings)
+    # M2.5 staged rollout: if an operator has run
+    # ``yadirect-agent rollout promote --to <stage>``, the persisted
+    # state-file overrides the YAML's ``rollout_stage``. Apply AFTER
+    # env-backstop so the budget-cap and rollout-stage decisions are
+    # both finalised before the SafetyPipeline is constructed.
+    policy = _apply_rollout_state_override(policy, settings)
 
     pipeline = SafetyPipeline(policy)
     store = PendingPlansStore(settings.audit_log_path.parent / "pending_plans.jsonl")
