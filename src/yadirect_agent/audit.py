@@ -367,16 +367,32 @@ async def audit_action(
         )
         try:
             await sink.emit(failed)
-        except Exception:
-            # Audit-write failure on the failure path — log as warning
-            # but do NOT propagate; the original exception is the one
-            # the operator must see. The .failed record is lost, but
-            # the .requested record is on disk so the gap is visible
-            # ("requested with no terminal event").
+        except OSError:
+            # I/O failure on the failure path (disk full, broken
+            # pipe, permission denied). Log as warning but do NOT
+            # propagate — the original wrapped-operation exception
+            # is what the operator must see. The .failed record is
+            # lost; the .requested record is on disk so the gap is
+            # visible ("requested with no terminal event").
             structlog.get_logger(__name__).warning(
                 "audit_emit_failed_in_failure_path",
                 action=f"{action}.failed",
                 error_type=type(exc).__name__,
+            )
+        except Exception as sink_exc:
+            # Programmer bug in a sink subclass (ValidationError on
+            # a malformed AuditEvent, TypeError, AttributeError).
+            # We MUST NOT replace the wrapped-operation's exception
+            # with a sink bug — the operator's debugging path is
+            # the original API failure. Log loudly so the broken
+            # sink surfaces in operator-visible logs, then fall
+            # through to the bare ``raise`` below which re-raises
+            # the original ``exc``. Auditor M2.3a ADVISORY-1.
+            structlog.get_logger(__name__).exception(
+                "audit_emit_programmer_error_in_failure_path",
+                action=f"{action}.failed",
+                wrapped_error_type=type(exc).__name__,
+                sink_error_type=type(sink_exc).__name__,
             )
         raise
 
@@ -392,13 +408,22 @@ async def audit_action(
     )
     try:
         await sink.emit(ok)
-    except Exception:
-        # Audit-write failure on the success path — the wrapped
-        # operation already succeeded, so we MUST NOT raise an
-        # exception here that makes the caller think the API call
-        # failed. Same auditor C-1 reasoning: emit failures lose
-        # evidence but never mask outcome. Loss is visible from
-        # the JSONL gap (requested with no terminal event).
+    except OSError:
+        # I/O failure on the success path. The wrapped operation
+        # already succeeded, so we MUST NOT raise here — the caller
+        # would otherwise think the API call failed. Same auditor
+        # C-1 reasoning: emit failures lose evidence but never mask
+        # outcome. Loss is visible from the JSONL gap ("requested
+        # with no .ok / .failed terminal").
+        #
+        # Narrowed to ``OSError`` only (auditor M2.3a ADVISORY-1):
+        # programmer bugs in a sink subclass (ValidationError on a
+        # malformed AuditEvent, TypeError, AttributeError) MUST
+        # propagate so the broken sink surfaces immediately. The
+        # API call's outcome is fine; what's broken is the audit
+        # record itself, and the operator must see that — silent
+        # warning + reconciliation failure weeks later is a worse
+        # failure mode than a loud raise here.
         structlog.get_logger(__name__).warning(
             "audit_emit_failed_in_success_path",
             action=f"{action}.ok",
