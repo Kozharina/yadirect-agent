@@ -210,3 +210,145 @@ def test_plans_show_returns_nonzero_for_unknown_id(
 
     assert result.exit_code == 1
     assert "no plan" in result.output.lower()
+
+
+# --------------------------------------------------------------------------
+# `apply-plan` command (M2.2 part 3b2).
+# --------------------------------------------------------------------------
+
+
+def _write_full_plan_with_review_context(store_path: Any, plan_id: str = "plan-x") -> None:
+    """Seed a realistic pending plan with a serialised ReviewContext.
+
+    The CLI's apply-plan path requires review_context to be non-null
+    so it can re-review against the original snapshot — a plan written
+    by hand with the basic ``OperationPlan(...)`` constructor only
+    (which has review_context=None) would hit InvalidPlanStateError.
+    """
+    from datetime import UTC, datetime
+
+    from yadirect_agent.agent.pipeline import ReviewContext, serialize_review_context
+    from yadirect_agent.agent.plans import OperationPlan, PendingPlansStore
+    from yadirect_agent.agent.safety import (
+        AccountBudgetSnapshot,
+        BudgetChange,
+        CampaignBudget,
+    )
+
+    ctx = ReviewContext(
+        budget_snapshot=AccountBudgetSnapshot(
+            campaigns=[
+                CampaignBudget(id=42, name="alpha", daily_budget_rub=500.0, state="ON"),
+            ]
+        ),
+        budget_changes=[BudgetChange(campaign_id=42, new_daily_budget_rub=800)],
+    )
+    plan = OperationPlan(
+        plan_id=plan_id,
+        created_at=datetime(2026, 4, 24, 10, 0, tzinfo=UTC),
+        action="set_campaign_budget",
+        resource_type="campaign",
+        resource_ids=[42],
+        args={"campaign_id": 42, "budget_rub": 800},
+        preview="raise campaign 42 budget 500→800 RUB",
+        reason="change exceeds auto-approval ceiling of +20%",
+        review_context=serialize_review_context(ctx),
+    )
+    PendingPlansStore(store_path).append(plan)
+
+
+def test_apply_plan_unknown_id_exits_nonzero(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+) -> None:
+    result = runner.invoke(app, ["apply-plan", "does-not-exist"])
+    assert result.exit_code == 1
+    assert "not found" in result.output.lower()
+
+
+def test_apply_plan_already_applied_exits_nonzero(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+) -> None:
+    from yadirect_agent.agent.plans import PendingPlansStore
+
+    plans_path = settings.audit_log_path.parent / "pending_plans.jsonl"
+    _write_full_plan_with_review_context(plans_path, plan_id="plan-applied")
+    PendingPlansStore(plans_path).update_status("plan-applied", "applied")
+
+    result = runner.invoke(app, ["apply-plan", "plan-applied"])
+    assert result.exit_code == 1
+    assert "applied" in result.output.lower() or "not pending" in result.output.lower()
+
+
+def test_apply_plan_re_review_reject_exits_with_code_2(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-review at apply-plan time may return reject (snapshot drift,
+    rollout-stage tightened, etc.). Status moves to ``rejected`` and
+    the CLI exits with code 2 so cron / scripts can branch on it.
+    """
+    from yadirect_agent.agent.pipeline import SafetyDecision, SafetyPipeline
+    from yadirect_agent.agent.safety import CheckResult
+
+    plans_path = settings.audit_log_path.parent / "pending_plans.jsonl"
+    _write_full_plan_with_review_context(plans_path, plan_id="plan-reject")
+
+    def stub_review(self: SafetyPipeline, plan: Any, ctx: Any) -> SafetyDecision:
+        return SafetyDecision(
+            status="reject",
+            reason="account cap lowered since plan creation",
+            blocking_checks=[CheckResult(status="blocked", reason="budget_cap: x")],
+        )
+
+    monkeypatch.setattr(SafetyPipeline, "review", stub_review)
+
+    result = runner.invoke(app, ["apply-plan", "plan-reject"])
+    assert result.exit_code == 2, result.output
+    assert "reject" in result.output.lower()
+
+
+def test_apply_plan_happy_path_marks_applied(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Happy path: re-review allows, executor runs, plan moves to applied."""
+    from yadirect_agent.agent.pipeline import SafetyDecision, SafetyPipeline
+    from yadirect_agent.agent.plans import PendingPlansStore
+    from yadirect_agent.services.campaigns import CampaignService
+
+    plans_path = settings.audit_log_path.parent / "pending_plans.jsonl"
+    _write_full_plan_with_review_context(plans_path, plan_id="plan-go")
+
+    def stub_review(self: SafetyPipeline, plan: Any, ctx: Any) -> SafetyDecision:
+        return SafetyDecision(status="allow", reason="ok")
+
+    captured: list[tuple[int, int]] = []
+
+    async def fake_set_budget(
+        self: CampaignService,
+        campaign_id: int,
+        budget_rub: int,
+        *,
+        _applying_plan_id: str | None = None,
+    ) -> None:
+        captured.append((campaign_id, budget_rub))
+
+    monkeypatch.setattr(SafetyPipeline, "review", stub_review)
+    monkeypatch.setattr(CampaignService, "set_daily_budget", fake_set_budget)
+
+    result = runner.invoke(app, ["apply-plan", "plan-go"])
+
+    assert result.exit_code == 0, result.output
+    assert "applied" in result.output.lower()
+    assert captured == [(42, 800)]
+    final = PendingPlansStore(plans_path).get("plan-go")
+    assert final is not None
+    assert final.status == "applied"
