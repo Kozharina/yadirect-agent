@@ -8,8 +8,9 @@ snake_case via `alias` where needed.
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class CampaignState(StrEnum):
@@ -49,3 +50,27 @@ class Campaign(BaseModel):
     end_date: str | None = Field(None, alias="EndDate")
     daily_budget: DailyBudget | None = Field(None, alias="DailyBudget")
     client_info: str | None = Field(None, alias="ClientInfo")
+    # Direct returns campaign-level negatives as
+    # ``"NegativeKeywords": {"Items": [...]}``. Flatten at the model
+    # boundary so the safety layer (which works in plain phrases via
+    # ``CampaignBudget.negative_keywords``) never sees the envelope.
+    # Both an absent / null field and ``Items: []`` collapse to ``[]``
+    # — KS#3 treats "no negatives" uniformly regardless of how Direct
+    # rendered the empty case.
+    negative_keywords: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_negative_keywords(cls, data: Any) -> Any:
+        """Pull ``NegativeKeywords.Items`` up to the top-level
+        ``negative_keywords`` field. Runs before field validation so
+        the rest of the model sees a clean flat list."""
+        if not isinstance(data, dict):
+            return data
+        envelope = data.get("NegativeKeywords")
+        if envelope is None:
+            data["negative_keywords"] = []
+        elif isinstance(envelope, dict):
+            items = envelope.get("Items") or []
+            data["negative_keywords"] = list(items)
+        return data
