@@ -23,8 +23,7 @@ import respx
 
 from yadirect_agent.clients.metrika import MetrikaService
 from yadirect_agent.config import Settings
-from yadirect_agent.exceptions import ApiTransientError, AuthError
-
+from yadirect_agent.exceptions import ApiTransientError, AuthError, ValidationError
 
 _GOALS_URL = "https://api-metrika.yandex.net/management/v1/counter/12345/goals"
 
@@ -134,8 +133,6 @@ class TestGetGoals:
 
     @respx.mock
     async def test_400_raises_validation_error(self, settings: Settings) -> None:
-        from yadirect_agent.exceptions import ValidationError
-
         respx.get(_GOALS_URL).mock(
             return_value=httpx.Response(
                 400,
