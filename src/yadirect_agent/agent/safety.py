@@ -646,10 +646,19 @@ class NegativeKeywordFloorCheck:
             existing = {_normalize_keyword(kw) for kw in campaign.negative_keywords}
             missing = sorted(required - existing)
             if missing:
+                # Privacy: ``reason`` is a free-form string that flows
+                # into AuditEvent.result and AgentLoop tool responses;
+                # the per-key blocklist in audit.py cannot redact it.
+                # Operator-supplied negative keyword phrases may carry
+                # brand / competitor / sensitive terms — surface only
+                # the count here. ``details["missing"]`` still carries
+                # the full list for in-process inspection but the audit
+                # sink strips it via ``_PRIVATE_KEYS``. M2.3a auditor
+                # M-2 follow-up.
                 return CheckResult.blocked_result(
                     (
-                        f"campaign {campaign.id} is missing required negative "
-                        f"keywords: {', '.join(missing)}"
+                        f"campaign {campaign.id} is missing "
+                        f"{len(missing)} required negative keyword(s)"
                     ),
                     campaign_id=campaign.id,
                     missing=missing,
