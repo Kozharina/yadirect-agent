@@ -91,22 +91,6 @@ Accumulated work that isn't blocking but will sting later.
       the timestamp, this is a single-PR change with no cross-cutting
       prerequisites.
 
-- [ ] **`DailyBudget` model lacks API field aliases** (latent bug
-      surfaced while writing the KS#3 reader tests): ``DailyBudget``
-      defines ``amount: int`` and ``mode: str`` without ``alias="Amount"``
-      / ``alias="Mode"``, so ``Campaign.model_validate({"DailyBudget":
-      {"Amount": 500_000_000, "Mode": "STANDARD"}})`` fails with
-      ``Field required: amount``. Production code currently routes
-      around it because no test exercises the wire-JSON path through
-      ``DirectService.get_campaigns`` against a real ``DailyBudget``
-      payload; the unit tests construct ``DailyBudget(amount=...)``
-      directly. Real Direct responses will fail to populate
-      ``Campaign.daily_budget`` on the first integration run. Fix:
-      add ``populate_by_name=True`` (already present) plus
-      ``alias="Amount"`` / ``alias="Mode"`` on the two fields. Block
-      this BEFORE the first sandbox round-trip against a campaign
-      that actually has a daily budget.
-
 - [ ] **`AccountBidSnapshot.find` O(n²) at large bulk sizes** (auditor
       M2-bid-snapshot second-pass NEW LOW): now that the bid snapshot
       is populated from a real API call, a single ``apply`` with N
@@ -588,6 +572,17 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **`DailyBudget` API alias fix** — added ``alias="Amount"`` /
+      ``alias="Mode"`` to ``DailyBudget`` so ``Campaign.model_validate``
+      against the real wire JSON shape populates ``daily_budget``
+      end-to-end. Pre-fix the inner field validation raised on
+      every real ``DirectService.get_campaigns`` response —
+      hidden across 566 tests because every fixture constructed
+      ``DailyBudget(amount=...)`` directly via the snake_case
+      constructor. Caught before the first sandbox integration
+      run courtesy of the KS#3 reader's end-to-end PascalCase
+      tests trying to reach the same shape. 3 new tests; 566
+      total green.
 - [x] **M2 follow-up — Per-campaign negative keywords reader for
       KS#3** — closes the footgun that would have blocked every
       resume the moment an operator configured
