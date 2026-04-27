@@ -677,6 +677,62 @@ async def test_set_campaign_budget_redacts_private_keys_from_blocking(
 
 
 @pytest.mark.asyncio
+async def test_resume_campaigns_redacts_ks3_missing_phrases_from_blocking(
+    settings: Settings,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Auditor M2-ks3-negatives HIGH-1: KS#3
+    (negative-keyword floor) blocks with ``details["missing"]``
+    carrying the operator-supplied required phrases the campaign
+    lacks. Those phrases are commercial intent — competitor names,
+    brand misspells, regulated-product filters — and have no business
+    reaching the LLM agent's tool response or any API-provider
+    retention. The audit sink already strips ``missing`` via
+    ``_PRIVATE_KEYS``; the tool-layer ``_redact_details`` must do
+    the same so the agent-facing channel matches the audit-facing
+    channel.
+
+    Pre-PR this leak was theoretical because
+    ``CampaignBudget.negative_keywords`` was always empty so KS#3
+    always returned an empty ``missing`` list. This PR populates
+    real negatives, which means real phrases can land in the
+    rejected-response details.
+    """
+    from yadirect_agent.agent.executor import PlanRejected
+    from yadirect_agent.agent.safety import CheckResult
+    from yadirect_agent.services.campaigns import CampaignService
+
+    async def fake_resume(self: CampaignService, campaign_ids: list[int]) -> None:
+        raise PlanRejected(
+            reason="negative_keyword_floor failed",
+            blocking=[
+                CheckResult(
+                    status="blocked",
+                    reason="campaign 42 is missing 2 required negative keyword(s)",
+                    details={
+                        "campaign_id": 42,
+                        "missing": ["competitor_brand", "regulated_phrase"],
+                    },
+                )
+            ],
+        )
+
+    monkeypatch.setattr(CampaignService, "resume", fake_resume)
+
+    tool = build_default_registry(settings).get("resume_campaigns")
+    inp = tool.input_model.model_validate({"campaign_ids": [42]})
+    result = await tool.handler(inp, tool_context)
+
+    blocking_details = result["blocking"][0]["details"]
+    # Non-PII details must remain — the agent needs to know which
+    # campaign tripped the check.
+    assert blocking_details["campaign_id"] == 42
+    # Operator-supplied phrases MUST be gone.
+    assert "missing" not in blocking_details
+
+
+@pytest.mark.asyncio
 async def test_get_keywords_returns_model_dumps(
     settings: Settings,
     tool_context: ToolContext,

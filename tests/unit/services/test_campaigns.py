@@ -909,6 +909,103 @@ def _build_safety_with_required_negatives(
 
 
 @pytest.mark.asyncio
+async def test_resume_context_records_baseline_timestamp(
+    settings: Settings, fake_direct: _FakeDirectService, tmp_path: Any
+) -> None:
+    """Auditor M2-ks3-negatives HIGH-2: ``ReviewContext.baseline_timestamp``
+    must be stamped at snapshot-read time so the audit sink and any
+    future apply-plan staleness check have a reference point.
+    Without this, an apply-plan re-review minutes / hours after the
+    plan was created has no signal that the underlying snapshot is
+    stale — same gap closed for the bid context in the previous PR.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from yadirect_agent.services.campaigns import _build_resume_context
+
+    fake_direct._campaigns = [
+        Campaign(
+            Id=1,
+            Name="alpha",
+            State=CampaignState.SUSPENDED,
+            Status=CampaignStatus.ACCEPTED,
+            DailyBudget=DailyBudget(amount=500_000_000, mode="STANDARD"),
+        )
+    ]
+    pipeline, store, sink = _build_safety_for_test(tmp_path)
+    svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
+
+    before = datetime.now(UTC)
+    ctx = await _build_resume_context(svc, [1])
+    after = datetime.now(UTC)
+
+    assert ctx.baseline_timestamp is not None
+    assert ctx.baseline_timestamp.tzinfo is not None  # tz-aware, not naive
+    assert before - timedelta(seconds=1) <= ctx.baseline_timestamp <= after + timedelta(seconds=1)
+
+
+@pytest.mark.asyncio
+async def test_pause_context_records_baseline_timestamp(
+    settings: Settings, fake_direct: _FakeDirectService, tmp_path: Any
+) -> None:
+    """Same freshness signal must apply to pause / set_daily_budget —
+    KS#1 (budget cap) on those paths reads the snapshot's daily
+    budget totals, and a stale snapshot would let a parallel-operator
+    bump slip through the cap arithmetic."""
+    from datetime import UTC, datetime, timedelta
+
+    from yadirect_agent.services.campaigns import _build_pause_context
+
+    fake_direct._campaigns = [
+        Campaign(
+            Id=1,
+            Name="alpha",
+            State=CampaignState.ON,
+            Status=CampaignStatus.ACCEPTED,
+            DailyBudget=DailyBudget(amount=500_000_000, mode="STANDARD"),
+        )
+    ]
+    pipeline, store, sink = _build_safety_for_test(tmp_path)
+    svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
+
+    before = datetime.now(UTC)
+    ctx = await _build_pause_context(svc, [1])
+    after = datetime.now(UTC)
+
+    assert ctx.baseline_timestamp is not None
+    assert before - timedelta(seconds=1) <= ctx.baseline_timestamp <= after + timedelta(seconds=1)
+
+
+@pytest.mark.asyncio
+async def test_set_budget_context_records_baseline_timestamp(
+    settings: Settings, fake_direct: _FakeDirectService, tmp_path: Any
+) -> None:
+    """Same freshness signal must apply to set_daily_budget."""
+    from datetime import UTC, datetime, timedelta
+
+    from yadirect_agent.services.campaigns import _build_set_budget_context
+
+    fake_direct._campaigns = [
+        Campaign(
+            Id=1,
+            Name="alpha",
+            State=CampaignState.ON,
+            Status=CampaignStatus.ACCEPTED,
+            DailyBudget=DailyBudget(amount=500_000_000, mode="STANDARD"),
+        )
+    ]
+    pipeline, store, sink = _build_safety_for_test(tmp_path)
+    svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
+
+    before = datetime.now(UTC)
+    ctx = await _build_set_budget_context(svc, 1, 800)
+    after = datetime.now(UTC)
+
+    assert ctx.baseline_timestamp is not None
+    assert before - timedelta(seconds=1) <= ctx.baseline_timestamp <= after + timedelta(seconds=1)
+
+
+@pytest.mark.asyncio
 async def test_resume_blocks_when_campaign_missing_required_negatives(
     settings: Settings, fake_direct: _FakeDirectService, tmp_path: Any
 ) -> None:
