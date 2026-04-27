@@ -2196,6 +2196,33 @@ class TestPolicyConstruction:
         assert p.max_bid_change_per_day_pct == 0.25
         assert p.max_bulk_size == 50
 
+    def test_default_max_snapshot_age_seconds_is_300(self) -> None:
+        """Five minutes — short enough that operator-driven apply-plan
+        still works in normal workflow (read plans, type a command,
+        apply), but tight enough that hours-old plans get rejected
+        and re-issued against fresh data. Pinned so a future change
+        surfaces as red rather than silently extending the
+        TOCTOU window."""
+        p = Policy(budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=10_000))
+        assert p.max_snapshot_age_seconds == 300
+
+    def test_rejects_zero_max_snapshot_age_seconds(self) -> None:
+        """A zero ceiling would fail every apply-plan immediately
+        (every snapshot is at least a few microseconds old by the
+        time the executor reads it). Reject as a likely typo."""
+        with pytest.raises(ValidationError):
+            Policy(
+                budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=10_000),
+                max_snapshot_age_seconds=0,
+            )
+
+    def test_rejects_negative_max_snapshot_age_seconds(self) -> None:
+        with pytest.raises(ValidationError):
+            Policy(
+                budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=10_000),
+                max_snapshot_age_seconds=-1,
+            )
+
     def test_default_forbidden_operations_match_spec(self) -> None:
         p = Policy(budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=10_000))
         assert set(p.forbidden_operations) == {
