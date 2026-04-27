@@ -571,6 +571,18 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **CLI: `--state` filter on `list-campaigns` actually applies**
+      — surfaced by a project-wide audit. The flag was silently
+      ignored: when ``state is not None`` the CLI branched to
+      ``service.list_active()`` which hardcodes ``[ON, SUSPENDED]``
+      regardless of the requested value. ``yadirect-agent
+      list-campaigns --state OFF`` returned ON+SUSPENDED rows with
+      no indication anything was wrong. Fix: always fetch via
+      ``list_all()`` and filter client-side, validate against
+      ``CampaignState`` enum at the CLI boundary so typos error
+      loudly. Case normalisation (``--state off`` ≡ ``--state OFF``).
+      3 new tests pin the filter / case / invalid-value contracts;
+      579 total green.
 - [x] **M7.2 — agent evals framework (first PR)** — eval runner
       skeleton + ``EvalResult`` metrics shape + 3 starter evals
       covering happy path (pause low-CTR campaigns), reject path
