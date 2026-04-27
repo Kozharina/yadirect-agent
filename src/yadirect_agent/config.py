@@ -29,6 +29,15 @@ class Settings(BaseSettings):
     yandex_client_login: str | None = None
     yandex_use_sandbox: bool = True
 
+    # M6 (Metrika reading) — counter ID is required for any read against
+    # the user's analytics data. We keep it None by default so the agent
+    # boots even if Metrika integration is not configured (read-only paths
+    # like list_campaigns still work). Services that need it raise a
+    # clear ConfigError when it's missing rather than crashing on the
+    # first HTTP call. Single counter only — multi-counter is M14
+    # (agency mode) territory.
+    yandex_metrika_counter_id: int | None = Field(default=None, ge=1)
+
     # --- Anthropic ---
     anthropic_api_key: SecretStr = Field(default=SecretStr(""))
     anthropic_model: str = "claude-opus-4-7"

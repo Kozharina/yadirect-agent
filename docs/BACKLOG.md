@@ -135,7 +135,16 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **M6 (basic) — Metrika reading** (§M6, branch
+      `feat/m6-metrika-basic`). Three Metrika endpoints
+      (`get_goals`, `get_report`, `get_conversion_by_source`) +
+      `services/reporting.py` with `campaign_performance` (joins
+      Direct cost/clicks ↔ Metrika conversions) and
+      `account_overview` (batch view for the M15.5 rule-based
+      health check). New `Settings.yandex_metrika_counter_id`
+      knob with a clear `ConfigError` when missing. Out-of-scope
+      for this PR: alerts (M6 full), LLM insights (M12), result
+      caching (deferred until measurement justifies it).
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
