@@ -573,3 +573,134 @@ class TestBoundArgsDict:
             pass
 
         assert self._make((), {"a": 1, "_applying_plan_id": "xyz"}, f) == {"a": 1}
+
+
+# --------------------------------------------------------------------------
+# Audit emission inside apply_plan (M2.3b).
+# --------------------------------------------------------------------------
+
+
+class _CapturingSink:
+    """In-memory AuditSink stub."""
+
+    def __init__(self) -> None:
+        from yadirect_agent.audit import AuditEvent  # noqa: F401
+
+        self.events: list[Any] = []
+
+    async def emit(self, event: Any) -> None:
+        self.events.append(event)
+
+
+class TestApplyPlanAuditEmission:
+    async def test_happy_path_emits_apply_plan_requested_and_ok(
+        self, store: PendingPlansStore
+    ) -> None:
+        """apply_plan emits its own ``apply_plan.requested`` /
+        ``apply_plan.ok`` envelope around the service-router call.
+        Actor is "human" — the operator drove the apply.
+        """
+        pipe = _StubPipeline()
+        plan_id = await _seed_pending_plan(store, pipe)
+        svc = _FakeService(pipe, store)
+        pipe.next_decision = SafetyDecision(status="allow", reason="ok")
+        sink = _CapturingSink()
+
+        result = await apply_plan(
+            plan_id,
+            store=store,
+            pipeline=pipe,
+            service_router=lambda action, args, _applying_plan_id: _route_set_budget(
+                svc, action, args, _applying_plan_id=_applying_plan_id
+            ),
+            audit_sink=sink,
+        )
+
+        assert result == "ok"
+        actions = [e.action for e in sink.events]
+        assert "apply_plan.requested" in actions
+        assert "apply_plan.ok" in actions
+        # Resource shape: ``plan:<plan_id>`` so audit can join with
+        # plan store entries.
+        requested = next(e for e in sink.events if e.action == "apply_plan.requested")
+        assert requested.actor == "human"
+        assert requested.resource == f"plan:{plan_id}"
+        assert requested.args["plan_id"] == plan_id
+
+    async def test_executor_failure_emits_failed(self, store: PendingPlansStore) -> None:
+        pipe = _StubPipeline()
+        plan_id = await _seed_pending_plan(store, pipe)
+        pipe.next_decision = SafetyDecision(status="allow", reason="ok")
+        sink = _CapturingSink()
+
+        async def boom(action: str, args: dict[str, Any], *, _applying_plan_id: str) -> Any:
+            raise RuntimeError("API 500")
+
+        with pytest.raises(RuntimeError):
+            await apply_plan(
+                plan_id,
+                store=store,
+                pipeline=pipe,
+                service_router=boom,
+                audit_sink=sink,
+            )
+
+        actions = [e.action for e in sink.events]
+        assert "apply_plan.requested" in actions
+        assert "apply_plan.failed" in actions
+        # The .failed event carries the underlying error metadata.
+        failed = next(e for e in sink.events if e.action == "apply_plan.failed")
+        assert failed.result is not None
+        assert failed.result["error_type"] == "RuntimeError"
+        assert failed.result["error_message"] == "API 500"
+
+    async def test_re_review_reject_emits_failed_with_rejection_reason(
+        self, store: PendingPlansStore
+    ) -> None:
+        pipe = _StubPipeline()
+        plan_id = await _seed_pending_plan(store, pipe)
+        sink = _CapturingSink()
+
+        # Re-review now rejects — apply_plan must surface this in the
+        # audit log so the operator sees both the attempt AND the
+        # reason it was blocked.
+        pipe.next_decision = SafetyDecision(
+            status="reject",
+            reason="account cap lowered",
+            blocking_checks=[CheckResult(status="blocked", reason="budget_cap: x")],
+        )
+
+        with pytest.raises(PlanRejected):
+            await apply_plan(
+                plan_id,
+                store=store,
+                pipeline=pipe,
+                service_router=lambda *a, **kw: None,  # type: ignore[arg-type]
+                audit_sink=sink,
+            )
+
+        actions = [e.action for e in sink.events]
+        assert "apply_plan.requested" in actions
+        assert "apply_plan.failed" in actions
+        failed = next(e for e in sink.events if e.action == "apply_plan.failed")
+        assert failed.result is not None
+        assert failed.result["error_type"] == "PlanRejected"
+
+    async def test_no_audit_sink_runs_unchanged(self, store: PendingPlansStore) -> None:
+        # apply_plan with audit_sink=None (default) keeps working —
+        # backwards compatibility for any caller that doesn't yet
+        # thread a sink through.
+        pipe = _StubPipeline()
+        plan_id = await _seed_pending_plan(store, pipe)
+        svc = _FakeService(pipe, store)
+        pipe.next_decision = SafetyDecision(status="allow", reason="ok")
+
+        result = await apply_plan(
+            plan_id,
+            store=store,
+            pipeline=pipe,
+            service_router=lambda action, args, _applying_plan_id: _route_set_budget(
+                svc, action, args, _applying_plan_id=_applying_plan_id
+            ),
+        )
+        assert result == "ok"

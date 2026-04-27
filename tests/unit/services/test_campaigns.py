@@ -347,3 +347,99 @@ async def test_set_daily_budget_with_safety_persists_plan_on_confirm(
 
     # The DirectService client was NOT called.
     assert fake_direct.budget_calls == []
+
+
+# --------------------------------------------------------------------------
+# Audit emission on the service path (M2.3b).
+#
+# CampaignService.set_daily_budget emits ``set_campaign_budget.requested``
+# and ``set_campaign_budget.ok`` (or .failed) via the audit_sink the
+# constructor receives. Actor is determined by call shape:
+#   - apply-plan re-entry (``_applying_plan_id`` present) → "human"
+#   - direct call from the agent's allow-path → "agent"
+# --------------------------------------------------------------------------
+
+
+class _CapturingSink:
+    """In-memory AuditSink stub for tests."""
+
+    def __init__(self) -> None:
+        from yadirect_agent.audit import AuditEvent
+
+        self.events: list[AuditEvent] = []
+
+    async def emit(self, event: Any) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_set_daily_budget_emits_requested_and_ok_on_apply_plan_path(
+    settings: Settings, fake_direct: _FakeDirectService
+) -> None:
+    """When the operator runs apply-plan (bypass kwarg present), the
+    service-level audit MUST fire as ``actor="human"`` so the JSONL
+    line ties back to the operator action, not a phantom agent call.
+    """
+    sink = _CapturingSink()
+    svc = CampaignService(settings, audit_sink=sink)
+
+    await svc.set_daily_budget(
+        campaign_id=42,
+        budget_rub=500,
+        _applying_plan_id="plan-xyz",
+    )
+
+    assert len(sink.events) == 2
+    requested, ok = sink.events
+    assert requested.action == "set_campaign_budget.requested"
+    assert requested.actor == "human"
+    assert requested.resource == "campaign:42"
+    assert requested.args == {"campaign_id": 42, "budget_rub": 500}
+    assert requested.result is None
+
+    assert ok.action == "set_campaign_budget.ok"
+    assert ok.actor == "human"
+    assert ok.result is not None
+    assert ok.result["status"] == "applied"
+    assert ok.result["campaign_id"] == 42
+
+
+@pytest.mark.asyncio
+async def test_set_daily_budget_emits_failed_when_api_raises(
+    settings: Settings, fake_direct: _FakeDirectService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sink = _CapturingSink()
+    svc = CampaignService(settings, audit_sink=sink)
+
+    # Make DirectService raise when the budget update is sent.
+    async def boom(self: _FakeDirectService, campaign_id: int, budget_rub: int) -> None:
+        raise RuntimeError("API 500")
+
+    monkeypatch.setattr(_FakeDirectService, "update_campaign_budget", boom)
+
+    with pytest.raises(RuntimeError, match="API 500"):
+        await svc.set_daily_budget(campaign_id=42, budget_rub=500, _applying_plan_id="plan-xyz")
+
+    assert len(sink.events) == 2
+    requested, failed = sink.events
+    assert requested.action == "set_campaign_budget.requested"
+    assert failed.action == "set_campaign_budget.failed"
+    assert failed.result is not None
+    assert failed.result["error_type"] == "RuntimeError"
+    assert failed.result["error_message"] == "API 500"
+
+
+@pytest.mark.asyncio
+async def test_set_daily_budget_without_audit_sink_runs_unchanged(
+    settings: Settings, fake_direct: _FakeDirectService
+) -> None:
+    """Backwards-compat: callers that don't pass an audit_sink (test
+    fixtures, future read-only code paths) keep working — the audit
+    layer is opt-in by sink presence so existing tests are not
+    forced to thread one through.
+    """
+    svc = CampaignService(settings)  # no audit_sink
+
+    await svc.set_daily_budget(campaign_id=42, budget_rub=500, _applying_plan_id="bypass")
+
+    assert fake_direct.budget_calls == [(42, 500, "STANDARD")]
