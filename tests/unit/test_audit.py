@@ -425,6 +425,47 @@ class TestAuditActionEmitFailureSemantics:
                 raise RuntimeError("api failed")
 
     @pytest.mark.asyncio
+    async def test_cancelled_error_on_failed_path_does_not_silently_lose_original(
+        self,
+    ) -> None:
+        # ``asyncio.CancelledError`` inherits from ``BaseException``,
+        # not ``Exception`` — so the ``except OSError`` / ``except
+        # Exception`` guards on the failure path do NOT catch it.
+        # Plausible during async shutdown: ``JsonlSink._append`` runs
+        # via ``asyncio.to_thread`` which is cancellable. Auditor
+        # M2.3a-narrow second-pass HIGH.
+        #
+        # Contract: the ``CancelledError`` must propagate (task
+        # infrastructure expects it), but the original wrapped-
+        # operation exception MUST be preserved as ``__context__``
+        # so the operator's debugging path isn't lost. Today's
+        # implementation lets ``CancelledError`` propagate but the
+        # original ``exc`` is only on the implicit chain — pin
+        # both: (a) caller sees ``CancelledError``, (b)
+        # ``__context__`` carries the original ``RuntimeError``.
+        import asyncio
+
+        class _CancelledOnFailedSink:
+            async def emit(self, event: AuditEvent) -> None:
+                if event.action.endswith(".failed"):
+                    raise asyncio.CancelledError()
+
+        with pytest.raises(asyncio.CancelledError) as caught:
+            async with audit_action(
+                _CancelledOnFailedSink(), actor="agent", action="set_campaign_budget"
+            ):
+                raise RuntimeError("api failed")
+
+        # Original wrapped exception must be reachable via the
+        # exception chain — not silently dropped.
+        chain_types: set[type[BaseException]] = set()
+        cur: BaseException | None = caught.value
+        while cur is not None:
+            chain_types.add(type(cur))
+            cur = cur.__context__
+        assert RuntimeError in chain_types, f"original RuntimeError lost from chain: {chain_types}"
+
+    @pytest.mark.asyncio
     async def test_emit_failure_on_requested_path_propagates(self) -> None:
         # The .requested event is the precondition for any audit
         # contract. If it fails, the wrapped block has not yet run —
