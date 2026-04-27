@@ -31,16 +31,15 @@ Each one is TDD, with `security-auditor` sub-agent review before merge.
 All seven reference
 [`docs/PRIOR_ART.md`](./PRIOR_ART.md) → "Agentic PPC Campaign Management".
 
-- [ ] **M2.2 part 3 — `@requires_plan` decorator + `apply-plan`
-      executor** — last slice of §M2.2. Decorator wraps mutating
-      service methods (`set_daily_budget` first), intercepts call,
-      builds an `OperationPlan`, persists via `PendingPlansStore`,
-      and raises `PlanRequired` carrying the plan_id. CLI
-      `yadirect-agent apply-plan <id>` loads the plan, routes it
-      back to the same service method with a `force=True` escape
-      hatch, marks the plan `applied`, and calls
-      `SafetyPipeline.on_applied(context)` to record session
-      TOCTOU state. First wiring target: `CampaignService.set_daily_budget`.
+- [ ] **M2.2 part 3b — service wiring + `apply-plan` CLI** — final
+      slice of §M2.2. Build on the executor infrastructure from part
+      3a: implement `_resolve_safety()` on `CampaignService`,
+      decorate `set_daily_budget` with `@requires_plan` and a real
+      `context_builder` (reads current `AccountBudgetSnapshot` via
+      `list_all()`). Add `yadirect-agent apply-plan <id>` typer
+      command that wires `apply_plan()` against a service-router
+      mapping `action` strings to service methods. Smoke-test the
+      CLI; security-auditor review before merge.
 - [ ] **M2.3: Audit sink** — `audit.py::AuditEvent`, JSONL async writer,
       `*.requested` / `*.ok` / `*.failed` emissions in every mutating
       service method.
@@ -108,6 +107,39 @@ Accumulated work that isn't blocking but will sting later.
     decision was made on. Alternatively, persist the minimal
     identity (keyword_id → approved ceiling) inside
     `OperationPlan.args` and reconstruct at apply time.
+
+- [ ] **`apply-plan` concurrency / file-lock** (from PR-A auditor
+      LOW; deferred, not blocking part 3b merge): two concurrent
+      `apply_plan(<same_id>)` calls would both pass the
+      `status != pending` check (the JSONL store reads before either
+      writes), both re-review, both execute, both write `applied`.
+      Today this is acceptable: yadirect-agent is a single-operator
+      tool and the JSONL is local. When we ship a multi-operator
+      deployment (or apply-plan starts running inside a daemon
+      alongside an interactive CLI), wrap the
+      `get → status check → service_router → update_status` sequence
+      in `apply_plan` with `fcntl.flock` on the JSONL path. Re-evaluate
+      severity then.
+
+- [ ] **Plan-store I/O failure masking** (from PR-A second-pass
+      auditor LOW NF-2; not blocking part 3b): if the JSONL append
+      inside `apply_plan`'s `update_status("failed")` itself raises
+      (disk full, file deleted), the new `OSError` masks the
+      original executor failure. Same risk on `update_status("applied")`
+      — a write failure leaves the plan in `pending` while the API
+      call has succeeded, opening a double-spend window on retry.
+      Fix: wrap both `update_status` calls in their own try/except,
+      log the original exception at error level via structlog, then
+      re-raise with `from original_exc` to preserve causality.
+
+- [ ] **Executor logger should be structlog, not stdlib `logging`**
+      (from PR-A second-pass auditor LOW NF-3; not blocking part 3b):
+      the `on_applied`-failure recovery path in `apply_plan` uses
+      `logging.getLogger(__name__).exception(...)` while the rest of
+      the agent package uses `structlog`. Stdlib `logging` bypasses
+      the contextvars binding (trace_id and friends), so the
+      operator searching by trace_id after a stale TOCTOU register
+      finds nothing. Replace with `structlog.get_logger(__name__)`.
 
 - [ ] **M2.2 pipeline must-haves** (from M2.1 auditor review; block
       M2.2 merge, not just landing):
@@ -339,6 +371,26 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2.2 part 3a — `@requires_plan` decorator + `apply_plan`
+      executor (infrastructure)** — `agent/executor.py`. Decorator
+      hooks `SafetyPipeline.review` into async service methods with
+      three exit paths (allow → run + on_applied; confirm → persist
+      + raise `PlanRequired`; reject → raise `PlanRejected`) and an
+      `_applying_plan_id` escape hatch so apply-plan re-entry skips
+      the pipeline. `apply_plan(plan_id, ...)` validates
+      preconditions (status pending, review_context present),
+      re-reviews against the original snapshot, routes through a
+      caller-supplied `service_router`, and enforces the on_applied
+      invariant from BACKLOG (success path is the only caller; the
+      executor-failure path skips on_applied and marks the plan
+      `failed`). `OperationPlan` extended with
+      `review_context: dict | None` and a `failed` status; pipeline
+      gains `serialize_review_context` / `deserialize_review_context`
+      via pydantic `TypeAdapter` so frozen-dataclass snapshots
+      round-trip without migrating to BaseModel. 11 new executor
+      tests (all four decorator paths + five apply_plan paths),
+      7 new model + serde tests; 405 total green. Service wiring +
+      CLI command land in part 3b.
 - [x] **M2.2 pipeline — SafetyPipeline orchestrator** — second
       slice of §M2.2. `SafetyPipeline.review(plan, context)`
       aggregates all 7 kill-switches + §M2.1 gatekeepers into a
@@ -461,13 +513,3 @@ Last 10 items (newest at top). Older items are available via
       across the suite). Reviewed by `security-auditor` before
       merge — HIGH finding (NFC/NFD) and MEDIUM finding
       (empty-string DoS) closed; 4 design notes added below.
-- [x] **M2 Kill-switch #2 — Max CPC per campaign** — `MaxCpcCheck`
-      enforces per-campaign CPC caps on bid updates. Adds
-      `KeywordSnapshot`, `AccountBidSnapshot`, `ProposedBidChange`
-      (pydantic BaseModel, Field(ge=0), extra=forbid, auditor-hardened
-      from day one), `MaxCpcPolicy`, `load_max_cpc_policy`. 22 new
-      tests: shapes, validation, YAML loader, key-coercion contract,
-      happy paths (below / at cap / no cap), blocks (search, network,
-      both, duplicate ids), silent-skip unknown ids. Reviewed by
-      `security-auditor` before merge — MEDIUM/LOW tests added
-      (both-bids-exceed evaluation order, policy key coercion).
