@@ -119,6 +119,35 @@ class InvalidPlanStateError(Exception):
     """
 
 
+class StaleSnapshotError(Exception):
+    """Raised by ``apply_plan`` when the plan's stored snapshot is
+    older than ``Policy.max_snapshot_age_seconds``.
+
+    KS#1 cap arithmetic and KS#4's ``_is_increase`` both compare
+    proposed values against the snapshot baseline. An apply-plan
+    re-review against an arbitrarily-old snapshot would be invisible
+    to a parallel-operator change between plan creation and apply
+    execution, opening a window for a second consecutive bid bump
+    or cap-skirting move. The plan transitions to ``failed``
+    (terminal); the operator re-issues the plan against a fresh
+    snapshot.
+
+    Attributes:
+        age_seconds: how stale the snapshot was at the moment of
+            the check (float; sub-second precision retained for
+            audit logging).
+        max_age_seconds: the configured ceiling.
+    """
+
+    def __init__(self, plan_id: str, age_seconds: float, max_age_seconds: int) -> None:
+        super().__init__(
+            f"plan {plan_id} snapshot is {age_seconds:.1f}s old, "
+            f"exceeds max_snapshot_age_seconds={max_age_seconds}"
+        )
+        self.age_seconds = age_seconds
+        self.max_age_seconds = max_age_seconds
+
+
 # --------------------------------------------------------------------------
 # Decorated-service contract.
 # --------------------------------------------------------------------------
@@ -358,6 +387,20 @@ async def _apply_plan_inner(
         raise InvalidPlanStateError(msg)
 
     context = deserialize_review_context(plan.review_context)
+
+    # Snapshot-freshness gate: a plan whose baseline_timestamp is
+    # older than the policy ceiling fails terminally. ``None`` is
+    # fail-open ("no signal, can't prove staleness") to keep legacy
+    # plans that predate the timestamp rollout (or context builders
+    # that don't yet stamp it) applicable. Auditor M2-bid-snapshot /
+    # M2-ks3-negatives HIGH-2 follow-up.
+    if context.baseline_timestamp is not None:
+        age = (datetime.now(UTC) - context.baseline_timestamp).total_seconds()
+        max_age = pipeline.policy.max_snapshot_age_seconds
+        if age > max_age:
+            store.update_status(plan_id, "failed")
+            raise StaleSnapshotError(plan_id, age, max_age)
+
     decision = pipeline.review(plan, context)
 
     if decision.status == "reject":
