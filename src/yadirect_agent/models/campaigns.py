@@ -30,10 +30,25 @@ class CampaignStatus(StrEnum):
 
 
 class DailyBudget(BaseModel):
+    """Direct's per-campaign daily budget envelope.
+
+    Accepts both the API's PascalCase keys (``Amount`` / ``Mode``,
+    what ``campaigns.get`` actually returns) and the snake_case
+    field names used by every test fixture and any future
+    programmatic builder. Without these aliases ``Campaign.model_validate``
+    on a real wire response would raise ValidationError on the
+    inner ``amount`` field — silent in tests, loud in production
+    on the first ``DirectService.get_campaigns`` call.
+    """
+
     model_config = ConfigDict(populate_by_name=True)
 
-    amount: int = Field(..., description="Budget in micro-currency units (RUB * 1_000_000)")
-    mode: str = "STANDARD"  # STANDARD | DISTRIBUTED
+    amount: int = Field(
+        ...,
+        alias="Amount",
+        description="Budget in micro-currency units (RUB * 1_000_000)",
+    )
+    mode: str = Field(default="STANDARD", alias="Mode")  # STANDARD | DISTRIBUTED
 
 
 class Campaign(BaseModel):
