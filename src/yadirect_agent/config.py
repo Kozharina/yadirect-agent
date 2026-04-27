@@ -35,7 +35,15 @@ class Settings(BaseSettings):
 
     # --- Agent ---
     agent_policy_path: Path = Path("./agent_policy.yml")
-    agent_max_daily_budget_rub: int = 10_000
+    # M2.4 env-backstop: ``ge=1`` rather than ``ge=0`` rejects both the
+    # negative-typo trap (``-1`` would silently propagate through
+    # ``min(yaml, env)`` into a negative Policy cap that KS#1 cannot
+    # interpret cleanly) and the zero "freeze the agent" anti-pattern
+    # (the right way to disable the agent is ``rollout_stage="shadow"``
+    # in the policy YAML, not a misleading budget=0 that produces a
+    # generic "cap exceeded" rejection on every mutation). Auditor
+    # PR M2.4 MEDIUM-1.
+    agent_max_daily_budget_rub: int = Field(default=10_000, ge=1)
 
     # --- Observability ---
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"

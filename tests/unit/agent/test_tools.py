@@ -11,6 +11,7 @@ Strategy:
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -167,6 +168,197 @@ class TestDefaultRegistry:
         monkeypatch.setattr(tools_mod, "build_safety_pair", _counting)
         build_default_registry(settings)
         assert call_count == 1
+
+
+# --------------------------------------------------------------------------
+# M2.4 — Daily-budget hard guard (env backstop).
+#
+# When ``settings.agent_max_daily_budget_rub`` is tighter than the YAML's
+# ``account_daily_budget_cap_rub``, ``build_safety_pair`` MUST tighten the
+# effective Policy so the env wins. Operators set the env at deployment
+# time; the YAML can drift (typo / copy-paste / stale checkout); the env
+# is the last line of defence.
+# --------------------------------------------------------------------------
+
+
+class TestEnvBackstop:
+    def test_env_tighter_than_yaml_wins(self, tmp_path: Path) -> None:
+        """``min(yaml, env)`` chooses the smaller cap."""
+        from pydantic import SecretStr
+
+        from yadirect_agent.agent.tools import build_safety_pair
+        from yadirect_agent.config import Settings
+
+        # Write a YAML with a generous cap.
+        yaml_path = tmp_path / "agent_policy.yml"
+        yaml_path.write_text("account_daily_budget_cap_rub: 100000\n")
+        settings = Settings(
+            yandex_direct_token=SecretStr("test-direct-token"),
+            yandex_metrika_token=SecretStr("test-metrika-token"),
+            yandex_client_login=None,
+            yandex_use_sandbox=True,
+            anthropic_api_key=SecretStr("test-anthropic-key"),
+            anthropic_model="claude-opus-4-7",
+            agent_policy_path=yaml_path,
+            agent_max_daily_budget_rub=5_000,  # tighter than YAML
+            log_level="INFO",
+            log_format="json",
+            audit_log_path=tmp_path / "logs" / "audit.jsonl",
+        )
+
+        pipeline, _, _ = build_safety_pair(settings)
+        # Env beats YAML.
+        assert pipeline.policy.budget_cap.account_daily_budget_cap_rub == 5_000
+
+    def test_yaml_tighter_than_env_wins(self, tmp_path: Path) -> None:
+        """If the YAML is tighter, env doesn't loosen it."""
+        from pydantic import SecretStr
+
+        from yadirect_agent.agent.tools import build_safety_pair
+        from yadirect_agent.config import Settings
+
+        yaml_path = tmp_path / "agent_policy.yml"
+        yaml_path.write_text("account_daily_budget_cap_rub: 3000\n")
+        settings = Settings(
+            yandex_direct_token=SecretStr("test-direct-token"),
+            yandex_metrika_token=SecretStr("test-metrika-token"),
+            yandex_client_login=None,
+            yandex_use_sandbox=True,
+            anthropic_api_key=SecretStr("test-anthropic-key"),
+            anthropic_model="claude-opus-4-7",
+            agent_policy_path=yaml_path,
+            agent_max_daily_budget_rub=10_000,
+            log_level="INFO",
+            log_format="json",
+            audit_log_path=tmp_path / "logs" / "audit.jsonl",
+        )
+
+        pipeline, _, _ = build_safety_pair(settings)
+        # YAML wins.
+        assert pipeline.policy.budget_cap.account_daily_budget_cap_rub == 3_000
+
+    def test_equal_caps_no_change(self, tmp_path: Path) -> None:
+        from pydantic import SecretStr
+
+        from yadirect_agent.agent.tools import build_safety_pair
+        from yadirect_agent.config import Settings
+
+        yaml_path = tmp_path / "agent_policy.yml"
+        yaml_path.write_text("account_daily_budget_cap_rub: 7500\n")
+        settings = Settings(
+            yandex_direct_token=SecretStr("test-direct-token"),
+            yandex_metrika_token=SecretStr("test-metrika-token"),
+            yandex_client_login=None,
+            yandex_use_sandbox=True,
+            anthropic_api_key=SecretStr("test-anthropic-key"),
+            anthropic_model="claude-opus-4-7",
+            agent_policy_path=yaml_path,
+            agent_max_daily_budget_rub=7_500,
+            log_level="INFO",
+            log_format="json",
+            audit_log_path=tmp_path / "logs" / "audit.jsonl",
+        )
+
+        pipeline, _, _ = build_safety_pair(settings)
+        assert pipeline.policy.budget_cap.account_daily_budget_cap_rub == 7_500
+
+    def test_settings_rejects_negative_env_cap(self) -> None:
+        """Auditor M-1: a negative ``AGENT_MAX_DAILY_BUDGET_RUB``
+        used to silently propagate through ``min(yaml, env)`` into a
+        negative Policy cap that KS#1 then interpreted as "always
+        exceeded" — agent frozen with a misleading "cap exceeded"
+        error from boot. The Settings field now has ``Field(ge=1)``
+        so the typo trap fails fast at parse time.
+        """
+        from pydantic import SecretStr, ValidationError
+
+        from yadirect_agent.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(
+                yandex_direct_token=SecretStr("x"),
+                yandex_metrika_token=SecretStr("x"),
+                anthropic_api_key=SecretStr("x"),
+                anthropic_model="claude-opus-4-7",
+                agent_max_daily_budget_rub=-1,
+            )
+
+    def test_settings_rejects_zero_env_cap(self) -> None:
+        """The "freeze the agent" use case is correctly expressed via
+        ``rollout_stage="shadow"`` in the policy YAML, not via a
+        budget cap of zero (which produces a generic "cap exceeded"
+        rejection on every mutation, indistinguishable from a real
+        cap violation). ``ge=1`` rejects the anti-pattern.
+        """
+        from pydantic import SecretStr, ValidationError
+
+        from yadirect_agent.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(
+                yandex_direct_token=SecretStr("x"),
+                yandex_metrika_token=SecretStr("x"),
+                anthropic_api_key=SecretStr("x"),
+                anthropic_model="claude-opus-4-7",
+                agent_max_daily_budget_rub=0,
+            )
+
+    def test_env_backstop_logged_when_tightening(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Operators MUST see a structured log line when the env-
+        backstop kicks in — silent tightening would be a "why is the
+        agent rejecting valid budgets" debugging trap.
+
+        We capture via a structlog logger stub since the project's
+        ``configure_logging`` may route to JSON / console / stdlib
+        depending on settings, and ``caplog`` only sees stdlib
+        records reliably.
+        """
+        from pydantic import SecretStr
+
+        from yadirect_agent.agent import tools as tools_mod
+        from yadirect_agent.config import Settings
+
+        yaml_path = tmp_path / "agent_policy.yml"
+        yaml_path.write_text("account_daily_budget_cap_rub: 100000\n")
+        settings = Settings(
+            yandex_direct_token=SecretStr("test-direct-token"),
+            yandex_metrika_token=SecretStr("test-metrika-token"),
+            yandex_client_login=None,
+            yandex_use_sandbox=True,
+            anthropic_api_key=SecretStr("test-anthropic-key"),
+            anthropic_model="claude-opus-4-7",
+            agent_policy_path=yaml_path,
+            agent_max_daily_budget_rub=5_000,
+            log_level="INFO",
+            log_format="json",
+            audit_log_path=tmp_path / "logs" / "audit.jsonl",
+        )
+
+        warnings: list[tuple[str, dict[str, Any]]] = []
+        infos: list[tuple[str, dict[str, Any]]] = []
+
+        class _StubLogger:
+            def warning(self, event: str, **kwargs: Any) -> None:
+                warnings.append((event, kwargs))
+
+            def info(self, event: str, **kwargs: Any) -> None:
+                infos.append((event, kwargs))
+
+        monkeypatch.setattr(tools_mod.structlog, "get_logger", lambda *args, **kw: _StubLogger())
+
+        tools_mod.build_safety_pair(settings)
+
+        events = [event for event, _ in warnings]
+        assert "env_backstop_tightening_account_cap" in events
+        # The logged kwargs include the explicit caps so an operator
+        # can grep for the threshold values.
+        idx = events.index("env_backstop_tightening_account_cap")
+        kwargs = warnings[idx][1]
+        assert kwargs["yaml_cap_rub"] == 100_000
+        assert kwargs["env_cap_rub"] == 5_000
+        assert kwargs["effective_cap_rub"] == 5_000
 
 
 # --------------------------------------------------------------------------
