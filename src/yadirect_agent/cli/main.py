@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import asdict
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 import structlog
@@ -45,8 +46,10 @@ from ..agent.executor import (
 from ..agent.loop import Agent, AgentLoopError, AgentRun
 from ..agent.plans import OperationPlan, PendingPlansStore
 from ..agent.tools import build_default_registry, build_safety_pair
+from ..audit import AuditEvent, AuditSink, audit_action
 from ..config import Settings, get_settings
 from ..logging import configure_logging
+from ..rollout import RolloutState, RolloutStateStore
 from ..services.campaigns import CampaignService, CampaignSummary
 from .doctor import (
     CheckResult,
@@ -518,6 +521,206 @@ def apply_plan_cmd(
         raise typer.Exit(code=3) from exc
 
     _out.print(f"[green]applied[/green] plan {_rich_escape(plan_id)}")
+
+
+# --------------------------------------------------------------------------
+# `rollout` — staged-rollout state inspection and promotion (M2.5).
+#
+# The ``rollout_stage`` field on Policy controls which actions an agent
+# run may attempt:
+#   - shadow         → read-only.
+#   - assist         → pause + negative keywords + small bid changes.
+#   - autonomy_light → bid ±25%, budget ±15%, keyword creation.
+#   - autonomy_full  → everything except ``forbidden_operations``.
+#
+# YAML provides the default; ``rollout promote --to <stage>`` writes a
+# state-file that overrides the YAML at boot. Promotions are audit-
+# logged via the same ``JsonlSink`` the agent uses for service events,
+# so the JSONL is a single chronological record of every operator and
+# agent action.
+# --------------------------------------------------------------------------
+
+
+_VALID_STAGES = ("shadow", "assist", "autonomy_light", "autonomy_full")
+
+
+rollout_app = typer.Typer(
+    name="rollout",
+    help="Inspect and promote the agent's rollout stage.",
+    no_args_is_help=True,
+)
+app.add_typer(rollout_app, name="rollout")
+
+
+def _rollout_store(settings: Settings) -> RolloutStateStore:
+    """Convention path: next to the audit log. Same path
+    ``build_safety_pair`` reads from."""
+    return RolloutStateStore(settings.audit_log_path.parent / "rollout_state.json")
+
+
+@rollout_app.command("status")
+def rollout_status_cmd() -> None:
+    """Show the current rollout stage and where it came from.
+
+    Reports both the YAML default (Policy.rollout_stage from
+    ``agent_policy.yml``) and the state-file override if present, so
+    the operator can tell at a glance whether a promote has been
+    applied this deployment.
+    """
+    settings = _bootstrap_settings()
+    pipeline, _, _ = build_safety_pair(settings)
+    yaml_stage = pipeline.policy.rollout_stage  # already overridden if state-file exists
+    state = _rollout_store(settings).load()
+
+    _out.print(f"[bold]effective stage[/bold] {_rich_escape(yaml_stage)}")
+    if state is None:
+        _out.print("[dim]no rollout_state.json — using Policy default from YAML[/dim]")
+    else:
+        _out.print(
+            f"[dim]state-file: promoted from "
+            f"[yellow]{_rich_escape(state.previous_stage)}[/yellow] → "
+            f"[green]{_rich_escape(state.stage)}[/green] at "
+            f"{state.promoted_at.isoformat(timespec='seconds')} "
+            f"by {_rich_escape(state.promoted_by)}[/dim]"
+        )
+
+
+@rollout_app.command("promote")
+def rollout_promote_cmd(
+    to: Annotated[
+        str,
+        typer.Option(
+            "--to",
+            help="Target stage: shadow / assist / autonomy_light / autonomy_full.",
+        ),
+    ],
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            help="Skip the interactive confirmation (for cron / CI).",
+        ),
+    ] = False,
+    actor: Annotated[
+        str | None,
+        typer.Option(
+            "--actor",
+            help="Operator identifier to record in the state-file. "
+            "Defaults to the current OS user (getpass.getuser()).",
+        ),
+    ] = None,
+) -> None:
+    """Promote (or roll back) the agent's rollout stage.
+
+    Writes ``rollout_state.json`` and emits a
+    ``rollout_promote.requested|.ok|.failed`` audit-event triple
+    via the configured JsonlSink. Both upgrades and downgrades are
+    allowed — downgrade is a deliberate safety win so an operator
+    can roll back to ``shadow`` after an incident.
+
+    Exit codes: 0 promoted; 1 invalid stage; 2 operator declined
+    confirmation; 3 audit / state-file write failed.
+    """
+    if to not in _VALID_STAGES:
+        _err.print(f"[red]invalid stage:[/red] {to!r}. Valid: {', '.join(_VALID_STAGES)}")
+        raise typer.Exit(code=1)
+
+    settings = _bootstrap_settings()
+    pipeline, _, audit_sink = build_safety_pair(settings)
+    current_stage = pipeline.policy.rollout_stage
+    store = _rollout_store(settings)
+
+    operator = actor or _resolve_operator()
+
+    _out.print(
+        f"[bold]promote rollout:[/bold] "
+        f"[yellow]{_rich_escape(current_stage)}[/yellow] → "
+        f"[green]{_rich_escape(to)}[/green]"
+    )
+    if to == "autonomy_full":
+        _out.print(
+            "[red]WARNING:[/red] autonomy_full lets the agent perform "
+            "every non-forbidden action. Verify success-gate metrics "
+            "before promoting."
+        )
+
+    if not yes:
+        try:
+            confirmed = typer.confirm("proceed?", default=False)
+        except (EOFError, KeyboardInterrupt):
+            _err.print("[red]aborted[/red]")
+            raise typer.Exit(code=2) from None
+        if not confirmed:
+            _err.print("[red]aborted[/red]")
+            raise typer.Exit(code=2)
+
+    new_state = RolloutState(
+        # ``to`` was validated against ``_VALID_STAGES`` above, so
+        # pydantic Literal acceptance is guaranteed at runtime.
+        stage=to,
+        promoted_at=datetime.now(UTC),
+        promoted_by=operator,
+        previous_stage=current_stage,
+    )
+
+    try:
+        asyncio.run(_persist_promotion(audit_sink, store, new_state, operator))
+    except Exception as exc:
+        _err.print(f"[red]promote failed:[/red] {type(exc).__name__}: {_rich_escape(str(exc))}")
+        raise typer.Exit(code=3) from exc
+
+    _out.print(f"[green]promoted[/green] to {_rich_escape(to)}")
+
+
+async def _persist_promotion(
+    audit_sink: AuditSink,
+    store: RolloutStateStore,
+    new_state: RolloutState,
+    operator: str,
+) -> None:
+    """Save state-file under an audit envelope so promote events land
+    in the JSONL alongside agent activity. Audit emit failures do NOT
+    propagate (we want the state-file write to succeed regardless),
+    but state-file write failures DO propagate so the CLI surfaces
+    them as exit 3."""
+    args = {
+        "from_stage": new_state.previous_stage,
+        "to_stage": new_state.stage,
+        "actor": operator,
+    }
+    async with audit_action(
+        audit_sink,
+        actor="human",
+        action="rollout_promote",
+        resource="rollout",
+        args=args,
+    ) as ctx:
+        store.save(new_state)
+        ctx.set_result(
+            {
+                "status": "promoted",
+                "from_stage": new_state.previous_stage,
+                "to_stage": new_state.stage,
+            }
+        )
+
+
+def _resolve_operator() -> str:
+    """OS-username fallback for ``--actor`` when not supplied."""
+    import getpass
+
+    try:
+        return getpass.getuser()
+    except Exception:
+        return "unknown"
+
+
+# Re-export for tests / type-checkers that look at the public surface.
+_ = AuditEvent
+
+
+# --------------------------------------------------------------------------
 
 
 if __name__ == "__main__":  # pragma: no cover

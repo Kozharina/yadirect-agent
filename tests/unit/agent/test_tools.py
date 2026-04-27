@@ -283,6 +283,83 @@ class TestEnvBackstop:
                 agent_max_daily_budget_rub=-1,
             )
 
+    def test_rollout_state_override_takes_precedence_over_yaml(self, tmp_path: Path) -> None:
+        """When ``rollout_state.json`` exists at the configured path,
+        its ``stage`` must override the YAML's ``rollout_stage``.
+
+        This is how ``yadirect-agent rollout promote`` takes effect
+        without rewriting the policy YAML by hand: the operator
+        promotes once, the state-file is written, every subsequent
+        agent run picks up the new stage at boot.
+        """
+        from datetime import UTC, datetime
+
+        from pydantic import SecretStr
+
+        from yadirect_agent.agent.tools import build_safety_pair
+        from yadirect_agent.config import Settings
+        from yadirect_agent.rollout import RolloutState, RolloutStateStore
+
+        yaml_path = tmp_path / "agent_policy.yml"
+        # YAML says shadow (the safe default).
+        yaml_path.write_text("account_daily_budget_cap_rub: 50000\nrollout_stage: shadow\n")
+        settings = Settings(
+            yandex_direct_token=SecretStr("x"),
+            yandex_metrika_token=SecretStr("x"),
+            yandex_client_login=None,
+            yandex_use_sandbox=True,
+            anthropic_api_key=SecretStr("x"),
+            anthropic_model="claude-opus-4-7",
+            agent_policy_path=yaml_path,
+            agent_max_daily_budget_rub=10_000,
+            log_level="INFO",
+            log_format="json",
+            audit_log_path=tmp_path / "logs" / "audit.jsonl",
+        )
+        # Operator promoted to assist via the CLI; state-file is now
+        # next to the audit log (the convention build_safety_pair uses).
+        store_path = settings.audit_log_path.parent / "rollout_state.json"
+        RolloutStateStore(store_path).save(
+            RolloutState(
+                stage="assist",
+                promoted_at=datetime(2026, 4, 27, 12, 0, tzinfo=UTC),
+                promoted_by="ops",
+                previous_stage="shadow",
+            )
+        )
+
+        pipeline, _, _ = build_safety_pair(settings)
+
+        assert pipeline.policy.rollout_stage == "assist"
+
+    def test_yaml_stage_used_when_state_file_missing(self, tmp_path: Path) -> None:
+        """No state-file → YAML wins. Fresh deployments stay on the
+        configured default until the operator runs ``promote``.
+        """
+        from pydantic import SecretStr
+
+        from yadirect_agent.agent.tools import build_safety_pair
+        from yadirect_agent.config import Settings
+
+        yaml_path = tmp_path / "agent_policy.yml"
+        yaml_path.write_text("account_daily_budget_cap_rub: 50000\nrollout_stage: assist\n")
+        settings = Settings(
+            yandex_direct_token=SecretStr("x"),
+            yandex_metrika_token=SecretStr("x"),
+            yandex_client_login=None,
+            yandex_use_sandbox=True,
+            anthropic_api_key=SecretStr("x"),
+            anthropic_model="claude-opus-4-7",
+            agent_policy_path=yaml_path,
+            agent_max_daily_budget_rub=10_000,
+            log_level="INFO",
+            log_format="json",
+            audit_log_path=tmp_path / "logs" / "audit.jsonl",
+        )
+
+        pipeline, _, _ = build_safety_pair(settings)
+        assert pipeline.policy.rollout_stage == "assist"
+
     def test_settings_rejects_zero_env_cap(self) -> None:
         """The "freeze the agent" use case is correctly expressed via
         ``rollout_stage="shadow"`` in the policy YAML, not via a
