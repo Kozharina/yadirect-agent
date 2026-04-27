@@ -155,17 +155,41 @@ Accumulated work that isn't blocking but will sting later.
       stale flat-namespace examples.
 
 - [ ] **`apply-plan` concurrency / file-lock** (from PR-A auditor
-      LOW; deferred, not blocking part 3b merge): two concurrent
-      `apply_plan(<same_id>)` calls would both pass the
-      `status != pending` check (the JSONL store reads before either
-      writes), both re-review, both execute, both write `applied`.
-      Today this is acceptable: yadirect-agent is a single-operator
-      tool and the JSONL is local. When we ship a multi-operator
-      deployment (or apply-plan starts running inside a daemon
-      alongside an interactive CLI), wrap the
-      `get → status check → service_router → update_status` sequence
-      in `apply_plan` with `fcntl.flock` on the JSONL path. Re-evaluate
-      severity then.
+      LOW, re-raised to MEDIUM by PR-B2 auditor on the live CLI
+      path; not blocking part 3b2 single-operator use): two
+      concurrent `yadirect-agent apply-plan <same-id>` shell
+      invocations would both pass the `status != pending` check
+      (the JSONL store reads before either writes), both re-review,
+      both execute, both call ``pipeline.on_applied``. The
+      ``set_daily_budget`` API call is idempotent against the same
+      target value (Direct accepts the second), so the monetary
+      blast radius is bounded — but the session TOCTOU register
+      gets DOUBLE-incremented, and a future plan within the same
+      pipeline session would slip past a cap that should hold.
+      Acceptance for any future fix: add a regression test
+      simulating concurrent ``apply_plan`` and asserting
+      ``on_applied_calls == 1`` (not 2). Implementation: wrap the
+      `get → status check → service_router → update_status`
+      sequence in `apply_plan` with `fcntl.flock` on the JSONL
+      path. ``yadirect-agent apply-plan`` docstring already
+      documents single-operator-only assumption.
+
+- [ ] **Action-string registry pinning (decorator ↔ router)** (from
+      PR-B2 auditor DESIGN NOTE): the action string
+      ``"set_campaign_budget"`` is hardcoded both on the
+      ``@requires_plan(action=...)`` decorator at
+      ``services/campaigns.py:184`` and in the CLI router at
+      ``cli/main.py:_build_service_router``. If either is renamed
+      without updating the other, every ``apply-plan`` of the
+      affected action silently routes to the unknown-action
+      branch and exits 3. Pin the relationship with either a
+      shared ``ACTION_*`` constant module or a registry pattern
+      (``@register_action("set_campaign_budget")`` decorator that
+      both wires the @requires_plan and registers the router
+      entry). Add a runtime assertion at registry-build time that
+      every decorated method's action string has a corresponding
+      router entry. Defer until a second decorated method
+      exists — the abstraction has no value with one entry.
 
 - [ ] **Plan-store I/O failure masking** (from PR-A second-pass
       auditor LOW NF-2; not blocking part 3b): if the JSONL append

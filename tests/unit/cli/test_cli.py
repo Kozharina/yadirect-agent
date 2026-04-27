@@ -330,7 +330,7 @@ def test_apply_plan_happy_path_marks_applied(
     def stub_review(self: SafetyPipeline, plan: Any, ctx: Any) -> SafetyDecision:
         return SafetyDecision(status="allow", reason="ok")
 
-    captured: list[tuple[int, int]] = []
+    captured: list[tuple[int, int, str | None]] = []
 
     async def fake_set_budget(
         self: CampaignService,
@@ -339,7 +339,11 @@ def test_apply_plan_happy_path_marks_applied(
         *,
         _applying_plan_id: str | None = None,
     ) -> None:
-        captured.append((campaign_id, budget_rub))
+        # Auditor LOW-3: the bypass kwarg MUST reach the wrapped service
+        # method or the @requires_plan decorator will re-enter the
+        # full pipeline review on a plan that's already pending. Pin
+        # the contract by capturing the kwarg.
+        captured.append((campaign_id, budget_rub, _applying_plan_id))
 
     monkeypatch.setattr(SafetyPipeline, "review", stub_review)
     monkeypatch.setattr(CampaignService, "set_daily_budget", fake_set_budget)
@@ -348,7 +352,79 @@ def test_apply_plan_happy_path_marks_applied(
 
     assert result.exit_code == 0, result.output
     assert "applied" in result.output.lower()
-    assert captured == [(42, 800)]
+    # Bypass kwarg forwarded with the right plan_id.
+    assert captured == [(42, 800, "plan-go")]
     final = PendingPlansStore(plans_path).get("plan-go")
     assert final is not None
     assert final.status == "applied"
+
+
+def test_apply_plan_failed_status_cannot_be_re_applied(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+) -> None:
+    """Auditor LOW-1: a plan in ``failed`` (executor raised on a prior
+    apply) must not be silently retryable through apply-plan. Operators
+    triage the failure reason and propose a fresh plan.
+    """
+    from yadirect_agent.agent.plans import PendingPlansStore
+
+    plans_path = settings.audit_log_path.parent / "pending_plans.jsonl"
+    _write_full_plan_with_review_context(plans_path, plan_id="plan-failed")
+    PendingPlansStore(plans_path).update_status("plan-failed", "failed")
+
+    result = runner.invoke(app, ["apply-plan", "plan-failed"])
+
+    assert result.exit_code == 1
+    assert "failed" in result.output.lower()
+
+
+def test_apply_plan_unknown_action_exits_3(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Auditor LOW-2: a plan whose ``action`` string isn't in the CLI
+    router (e.g. a future ``set_keyword_bids`` action that hasn't been
+    wired yet) must surface as a clean failure with exit 3, not silently
+    succeed. The plan moves to ``failed`` status so subsequent
+    apply-plan calls see the terminal state.
+    """
+    from datetime import UTC, datetime
+
+    from yadirect_agent.agent.pipeline import (
+        ReviewContext,
+        SafetyDecision,
+        SafetyPipeline,
+        serialize_review_context,
+    )
+    from yadirect_agent.agent.plans import OperationPlan, PendingPlansStore
+
+    plans_path = settings.audit_log_path.parent / "pending_plans.jsonl"
+    plan = OperationPlan(
+        plan_id="plan-mystery",
+        created_at=datetime(2026, 4, 24, 10, 0, tzinfo=UTC),
+        action="set_keyword_bids",  # not in the router yet
+        resource_type="keyword",
+        resource_ids=[1],
+        args={"updates": []},
+        preview="bid update",
+        reason="needs confirm",
+        review_context=serialize_review_context(ReviewContext()),
+    )
+    PendingPlansStore(plans_path).append(plan)
+
+    def stub_review(self: SafetyPipeline, plan_arg: Any, ctx: Any) -> SafetyDecision:
+        return SafetyDecision(status="allow", reason="ok")
+
+    monkeypatch.setattr(SafetyPipeline, "review", stub_review)
+
+    result = runner.invoke(app, ["apply-plan", "plan-mystery"])
+
+    assert result.exit_code == 3, result.output
+    assert "unknown action" in result.output.lower()
+    final = PendingPlansStore(plans_path).get("plan-mystery")
+    assert final is not None
+    assert final.status == "failed"

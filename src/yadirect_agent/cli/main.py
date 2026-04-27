@@ -33,6 +33,7 @@ from typing import Annotated, Any
 import structlog
 import typer
 from rich.console import Console
+from rich.markup import escape as _rich_escape
 from rich.table import Table
 
 from .. import __version__
@@ -475,26 +476,36 @@ def apply_plan_cmd(
                 service_router=router,
             )
         )
+    # Every interpolated value below is routed through ``_rich_escape`` so a
+    # plan_id / exc.reason carrying rich-markup metacharacters (``[bold]`` …)
+    # cannot manipulate the operator's terminal output. Auditor PR-B2 MEDIUM.
     except KeyError:
         _err.print(f"[red]plan not found: {plan_id!r}[/red]")
         raise typer.Exit(code=1) from None
     except InvalidPlanStateError as exc:
         # Plan exists but is not in ``pending`` (already applied / rejected /
         # failed) or has no stored review_context.
-        _err.print(f"[red]{exc}[/red]")
+        _err.print(f"[red]{_rich_escape(str(exc))}[/red]")
         raise typer.Exit(code=1) from exc
     except PlanRejected as exc:
-        _err.print(f"[red]rejected by re-review:[/red] {exc.reason}")
+        _err.print(f"[red]rejected by re-review:[/red] {_rich_escape(exc.reason)}")
         for r in exc.blocking:
-            _err.print(f"  - [yellow]{r.status}[/yellow] {r.reason or ''}")
+            _err.print(
+                f"  - [yellow]{_rich_escape(r.status)}[/yellow] {_rich_escape(r.reason or '')}"
+            )
         raise typer.Exit(code=2) from exc
     except Exception as exc:
         # Plan has already been moved to ``failed`` inside apply_plan
-        # before the exception escapes — no double-apply risk.
-        _err.print(f"[red]apply failed:[/red] {type(exc).__name__}: {exc}")
+        # before the exception escapes — no double-apply risk for one
+        # process. NB: concurrent apply-plan invocations on the same
+        # plan_id are NOT protected against (no fcntl.flock); the JSONL
+        # store assumes single-operator local use today. Tracked in
+        # docs/BACKLOG.md "apply-plan concurrency / file-lock". Auditor
+        # PR-B2 MEDIUM.
+        _err.print(f"[red]apply failed:[/red] {type(exc).__name__}: {_rich_escape(str(exc))}")
         raise typer.Exit(code=3) from exc
 
-    _out.print(f"[green]applied[/green] plan {plan_id}")
+    _out.print(f"[green]applied[/green] plan {_rich_escape(plan_id)}")
 
 
 if __name__ == "__main__":  # pragma: no cover
