@@ -54,15 +54,7 @@ evals exercise the full safety surface.)*
 
 ## In progress
 
-- [ ] **Per-keyword `AccountBidSnapshot` reader for KS#2 / KS#4**
-      (branch ``feat/m2-bid-snapshot-reader``) — extends
-      ``models/keywords.Keyword`` with bid + productivity fields,
-      extends ``DirectService.get_keywords`` to read them, and rewires
-      ``BiddingService._build_bid_context`` to return a populated
-      ``AccountBidSnapshot``. Without this, KS#2 (max-CPC) and KS#4
-      (QS guard) defer on every bid call and the protection on the
-      bid path is plan→confirm→execute + rollout_stage + audit only.
-      See Tech debt entry for the full motivation.
+*(empty — nothing checked out right now)*
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
@@ -202,26 +194,6 @@ Accumulated work that isn't blocking but will sting later.
       ``audit.infer_actor_from_frame()`` so a future tightening
       (replace frame walk with explicit kwarg threading) lands in
       one place.
-
-- [ ] **Per-keyword AccountBidSnapshot reader for KS#2 / KS#4** —
-      ``BiddingService.apply`` is now ``@requires_plan``-gated
-      (M2 follow-up), but ``_build_bid_context`` returns an empty
-      ``AccountBidSnapshot``. KS#2 (max-CPC) and KS#4 (quality-
-      score guard) silently defer because their per-keyword
-      ``current_search_bid_rub`` / ``quality_score`` fields are
-      missing — that IS their documented "no current bid known →
-      can't prove violation" contract, but it means the
-      protection on this path today is plan→confirm→execute +
-      rollout_stage + audit, not the deeper KS#2/#4 validation.
-      Fix: extend ``models/keywords.Keyword`` to include the
-      Direct API's bid + quality-score fields, extend
-      ``DirectService.get_keywords`` to request them via
-      ``FieldNames``, and have ``_build_bid_context`` populate
-      ``KeywordSnapshot.current_search_bid_rub`` /
-      ``current_network_bid_rub`` / ``quality_score``. Block on
-      this BEFORE any operator configures aggressive
-      ``campaign_max_cpc_rub`` / ``min_quality_score_for_bid_increase``
-      thresholds expecting them to hold.
 
 - [ ] **Pull per-campaign negative keywords for KS#3** — the
       pause/resume context builders currently leave
@@ -565,6 +537,33 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2 follow-up — Per-keyword `AccountBidSnapshot` reader
+      for KS#2 / KS#4** — closes the gap that left both kill-
+      switches deferring on every bid call. ``Keyword`` model gains
+      ``CampaignId``, ``Bid``, ``ContextBid`` and a ``Productivity``
+      envelope, and exposes ``current_search_bid_rub`` /
+      ``current_network_bid_rub`` / ``quality_score`` via computed
+      properties (micro-RUB → RUB at the boundary; rounded int
+      0..10 from ``Productivity.Value`` with out-of-range values
+      falling back to ``None`` so KS#4's "QS=None → defer" branch
+      stays in charge of the unexpected-input case).
+      ``DirectService.get_keywords`` accepts a keyword-only
+      ``keyword_ids`` selection (so the bid-context builder fetches
+      by keyword id rather than running a second adgroup-lookup
+      round trip), broadens ``FieldNames`` to include the new
+      fields for every caller, and refuses calls with no selection
+      at all. ``BiddingService._build_bid_context`` issues exactly
+      one ``get_keywords(keyword_ids=...)`` call and populates a
+      ``KeywordSnapshot`` per row that survives the identity
+      check (``Id`` and ``CampaignId`` both present). Net result:
+      a bid above ``Policy.max_cpc.campaign_max_cpc_rub`` raises
+      ``PlanRejected`` at plan-creation time (KS#2); a bid
+      INCREASE on a keyword whose Productivity-derived QS is
+      below ``min_quality_score_for_bid_increase`` raises the
+      same (KS#4); a DECREASE on a low-QS keyword still passes.
+      Tightening max-CPC / min-QS thresholds in
+      ``agent_policy.yml`` is now meaningful. 25 new tests
+      (13 model + 5 client + 7 service); 542 total green.
 - [x] **M2 follow-up — `BiddingService.apply` gated through
       @requires_plan; MCP denylist now empty** — closes the last
       mutating service method. ``BiddingService.apply`` runs
