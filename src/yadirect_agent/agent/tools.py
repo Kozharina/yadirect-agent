@@ -135,6 +135,25 @@ class ToolRegistry:
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# Privacy: keys we MUST strip from CheckResult.details before returning a
+# rejection to the LLM agent. KS#7 (query drift) populates
+# ``new_queries_sample`` with raw user search queries that may carry
+# names, addresses, medical phrases, etc. The audit sink (M2.3, not yet
+# shipped) is the right place to redact for log persistence; until then
+# we redact at the tool boundary so the raw queries never reach the LLM
+# context (where the API provider may retain them). Auditor PR-B1
+# second-pass MEDIUM.
+# --------------------------------------------------------------------------
+
+_PRIVATE_DETAIL_KEYS: frozenset[str] = frozenset({"new_queries_sample"})
+
+
+def _redact_details(details: dict[str, Any]) -> dict[str, Any]:
+    """Drop privacy-sensitive keys from a CheckResult.details dict."""
+    return {k: v for k, v in details.items() if k not in _PRIVATE_DETAIL_KEYS}
+
+
 # Every tool input model uses ``extra="forbid"`` as defence-in-depth: a
 # silently-accepted unknown key today would be a wire vector tomorrow if
 # any handler ever forwarded fields into the wrapped service. Concretely
@@ -341,9 +360,16 @@ def _make_set_campaign_budget_tool(
                 "reason": exc.reason,
                 # ``details`` carries the numerical context (projected
                 # totals, cap thresholds, etc.) the agent needs to
-                # explain *why* to the user. Include them — auditor LOW.
+                # explain *why* to the user. Include them — but route
+                # through ``_redact_details`` first so privacy-sensitive
+                # keys (e.g. KS#7 raw user queries) never reach the
+                # LLM context. Auditor LOW + second-pass MEDIUM.
                 "blocking": [
-                    {"status": r.status, "reason": r.reason, "details": r.details}
+                    {
+                        "status": r.status,
+                        "reason": r.reason,
+                        "details": _redact_details(r.details),
+                    }
                     for r in exc.blocking
                 ],
             }

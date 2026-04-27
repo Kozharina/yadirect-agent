@@ -133,6 +133,26 @@ Accumulated work that isn't blocking but will sting later.
       against fresh data, or (b) explicitly check `state == "ON"`
       in the per-op check.
 
+- [ ] **Remove KS#7 query-sample privacy blocklist when M2.3 audit
+      sink redacts at source** (from PR-B1 second-pass auditor
+      MEDIUM): tool handler currently strips ``new_queries_sample``
+      via ``_redact_details`` so raw user search queries never
+      reach the LLM agent's response. Once M2.3 audit sink lands
+      with structural redaction at the persistence layer, the
+      tool-boundary blocklist becomes redundant defence — keep it
+      until then but consider whether any other PII-prone keys
+      (KS#3 negative-keyword phrases? KS#5 baseline timestamps?)
+      need adding to ``_PRIVATE_DETAIL_KEYS``.
+
+- [ ] **Quiet `policy_file_not_found` warning in unit-test
+      fixtures** (from PR-B1 second-pass auditor INFO-1): the
+      ``settings`` fixture in ``tests/unit/conftest.py`` points
+      ``agent_policy_path`` at a non-existent ``tmp_path`` file, so
+      every test that calls ``build_default_registry`` triggers a
+      structlog warning. Not a security issue but masks real
+      ``policy_file_not_found`` events in any future log-assertion
+      tests. Fix by writing a minimal valid YAML at fixture setup.
+
 - [ ] **Document `agent/__init__.py` public-API narrowing**
       (from PR-B1 auditor INFO-2): the empty re-exports broke a
       circular import (`services/campaigns.py → agent.executor →

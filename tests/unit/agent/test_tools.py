@@ -118,24 +118,31 @@ class TestDefaultRegistry:
         reg = build_default_registry(settings)
         assert reg.get(name).is_write is is_write
 
-    @pytest.mark.asyncio
-    async def test_input_models_reject_unknown_fields(self, settings: Settings) -> None:
-        # Defence-in-depth (auditor HIGH-2): the agent must not be able
-        # to sneak ``_applying_plan_id`` (or anything else) through the
-        # tool input pydantic model. extra="forbid" on every input
-        # model rejects unknown fields at validation.
+    @pytest.mark.parametrize(
+        "tool_name",
+        [
+            "list_campaigns",
+            "pause_campaigns",
+            "resume_campaigns",
+            "set_campaign_budget",
+            "get_keywords",
+            "set_keyword_bids",
+            "validate_phrases",
+        ],
+    )
+    def test_input_models_reject_unknown_fields(self, settings: Settings, tool_name: str) -> None:
+        # Defence-in-depth (auditor HIGH-2 + second-pass LOW-1): the
+        # agent must not be able to sneak ``_applying_plan_id`` (or
+        # anything else) through the tool input pydantic model.
+        # extra="forbid" lives on each model individually — a future
+        # refactor that drops it from one model is the regression
+        # this parametric sweep catches.
         from pydantic import ValidationError
 
         reg = build_default_registry(settings)
-        tool = reg.get("set_campaign_budget")
+        tool = reg.get(tool_name)
         with pytest.raises(ValidationError):
-            tool.input_model.model_validate(
-                {
-                    "campaign_id": 1,
-                    "budget_rub": 500,
-                    "_applying_plan_id": "agent-injected",
-                }
-            )
+            tool.input_model.model_validate({"_probe_unknown_field": "x"})
 
     def test_build_safety_pair_called_once_per_registry(
         self, settings: Settings, monkeypatch: pytest.MonkeyPatch
@@ -347,6 +354,55 @@ async def test_set_campaign_budget_returns_rejected_on_plan_rejected(
     assert len(result["blocking"]) == 1
     assert result["blocking"][0]["status"] == "blocked"
     assert "budget_cap" in result["blocking"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_set_campaign_budget_redacts_private_keys_from_blocking(
+    settings: Settings,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Auditor second-pass MEDIUM: KS#7 (query drift) populates
+    ``CheckResult.details["new_queries_sample"]`` with raw user search
+    queries. Those terms can contain names, addresses, medical phrases.
+    The handler MUST strip the key before returning to the LLM agent
+    so the raw queries never reach API-provider retention.
+    """
+    from yadirect_agent.agent.executor import PlanRejected
+    from yadirect_agent.agent.safety import CheckResult
+    from yadirect_agent.services.campaigns import CampaignService
+
+    async def fake_set_budget(self: CampaignService, campaign_id: int, budget_rub: int) -> None:
+        raise PlanRejected(
+            reason="query drift exceeds threshold",
+            blocking=[
+                CheckResult(
+                    status="blocked",
+                    reason="query_drift: 0.7 > 0.4",
+                    details={
+                        "new_queries_sample": [
+                            "Иванов Иван Иванович телефон",
+                            "клиника на Тверской 8 запись",
+                        ],
+                        "new_share": 0.7,
+                        "max_new_share": 0.4,
+                    },
+                )
+            ],
+        )
+
+    monkeypatch.setattr(CampaignService, "set_daily_budget", fake_set_budget)
+
+    tool = build_default_registry(settings).get("set_campaign_budget")
+    inp = tool.input_model.model_validate({"campaign_id": 42, "budget_rub": 800})
+    result = await tool.handler(inp, tool_context)
+
+    blocking_details = result["blocking"][0]["details"]
+    # Numerical / non-PII details must remain — the agent uses them.
+    assert blocking_details["new_share"] == 0.7
+    assert blocking_details["max_new_share"] == 0.4
+    # The raw queries MUST be gone.
+    assert "new_queries_sample" not in blocking_details
 
 
 @pytest.mark.asyncio
