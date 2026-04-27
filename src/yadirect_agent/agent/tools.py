@@ -20,7 +20,7 @@ Design choices
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -126,6 +126,14 @@ class ToolRegistry:
 
     def __contains__(self, name: object) -> bool:
         return name in self._tools
+
+    def __iter__(self) -> Iterator[Tool]:
+        """Iterate over registered tools in insertion order.
+
+        Used by the MCP server adapter (M3) to walk the registry
+        without lifting private state.
+        """
+        return iter(self._tools.values())
 
 
 # --------------------------------------------------------------------------
