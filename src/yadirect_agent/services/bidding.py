@@ -25,9 +25,7 @@ BACKLOG.
 
 from __future__ import annotations
 
-import sys
 from datetime import UTC, datetime
-from types import FrameType
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field
@@ -36,7 +34,7 @@ from ..agent.executor import requires_plan
 from ..agent.pipeline import ReviewContext, SafetyPipeline
 from ..agent.plans import PendingPlansStore
 from ..agent.safety import AccountBidSnapshot, KeywordSnapshot, ProposedBidChange
-from ..audit import Actor, AuditSink, audit_action
+from ..audit import AuditSink, audit_action, infer_actor_from_frame
 from ..clients.direct import DirectService
 from ..config import Settings
 from ..models.keywords import KeywordBid
@@ -178,23 +176,6 @@ class BiddingService:
             raise RuntimeError(msg)
         return self._pipeline, self._plans_store
 
-    def _infer_actor(self) -> Actor:
-        """Frame walk identical to ``CampaignService._infer_actor`` —
-        ``_applying_plan_id`` in the @requires_plan ``wrapper`` frame
-        means the operator drove this call via apply-plan, not the
-        agent's allow path."""
-        frame: FrameType | None = sys._getframe(1)
-        for _ in range(8):
-            if frame is None:
-                break
-            if (
-                frame.f_code.co_name == "wrapper"
-                and frame.f_locals.get("_applying_plan_id") is not None
-            ):
-                return "human"
-            frame = frame.f_back
-        return "agent"
-
     @requires_plan(
         action="set_keyword_bids",
         resource_type="keyword",
@@ -241,7 +222,7 @@ class BiddingService:
             await self._do_apply(updates)
             return
 
-        actor = self._infer_actor()
+        actor = infer_actor_from_frame()
         async with audit_action(
             self._audit_sink,
             actor=actor,

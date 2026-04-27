@@ -36,11 +36,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from types import FrameType
 from typing import Any, Literal, Protocol
 
 import structlog
@@ -62,6 +64,61 @@ __all__ = [
 
 
 Actor = Literal["agent", "human", "system"]
+
+
+# --------------------------------------------------------------------------
+# Caller-frame actor inference.
+#
+# Shared between ``CampaignService`` and ``BiddingService``: when a
+# mutating service method is invoked through ``apply_plan``, the
+# decorator's bypass branch sets ``_applying_plan_id`` as a local in
+# its ``wrapper`` closure. Walking the caller's frames for that exact
+# closure pin distinguishes the operator-driven apply-plan path
+# (actor = ``human``) from the agent's allow path (``agent``).
+#
+# Auditor M2-bidding L-1 motivation: extracting the helper means a
+# future tightening (e.g. replacing the frame walk with explicit
+# kwarg threading through the decorator) lands in one place, not
+# duplicated across every ``@requires_plan``-aware service.
+# --------------------------------------------------------------------------
+
+
+_ACTOR_FRAME_WALK_DEPTH = 8
+
+
+def infer_actor_from_frame() -> Actor:
+    """Identify the actor of a ``@requires_plan``-decorated call by
+    inspecting the caller's frame stack.
+
+    Returns ``"human"`` if any frame within
+    ``_ACTOR_FRAME_WALK_DEPTH`` of the immediate caller is named
+    exactly ``wrapper`` AND has ``_applying_plan_id`` set in its
+    locals. Returns ``"agent"`` otherwise.
+
+    Pin tighter than ``_applying_plan_id in any frame's locals``:
+    the decorator's wrapper closure is named exactly ``wrapper``,
+    so we match only ``frame.f_code.co_name == "wrapper"``. Auditor
+    HIGH from PR M2.2 part 3b1: the previous implementation flipped
+    the verdict on local-name collisions in unrelated code (test
+    fixtures, middleware) that happened to use ``_applying_plan_id``
+    as a local variable for any reason.
+
+    The 8-frame ceiling prevents runaway walks in deeply-nested
+    middleware / orchestration / test code from wandering into
+    arbitrary frames whose locals have nothing to do with the
+    decorator.
+    """
+    frame: FrameType | None = sys._getframe(1)
+    for _ in range(_ACTOR_FRAME_WALK_DEPTH):
+        if frame is None:
+            break
+        if (
+            frame.f_code.co_name == "wrapper"
+            and frame.f_locals.get("_applying_plan_id") is not None
+        ):
+            return "human"
+        frame = frame.f_back
+    return "agent"
 
 
 class AuditEvent(BaseModel):
