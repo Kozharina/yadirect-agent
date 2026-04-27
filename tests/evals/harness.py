@@ -24,8 +24,12 @@ from typing import Any
 import pytest
 
 # Re-export so tests can ``from .harness import FakeAnthropic, ...``
-# rather than reaching into the unit-test conftest.
-from tests.unit.agent.conftest import (  # noqa: F401
+# rather than reaching into the unit-test conftest. ``__all__``
+# below makes the re-export status explicit (CodeQL py/unused-import
+# respects ``__all__`` membership; ruff F401 is silenced by the
+# noqa). Two signals — one for human readers, one for static
+# analysis — saying "yes, importing these is intentional".
+from tests.unit.agent.conftest import (
     FakeAnthropic,
     FakeMessage,
     make_message,
@@ -37,6 +41,21 @@ from yadirect_agent.agent.tools import build_default_registry
 from yadirect_agent.config import Settings
 from yadirect_agent.models.campaigns import Campaign
 from yadirect_agent.models.keywords import Keyword, KeywordBid
+
+__all__ = [
+    "Agent",
+    "AgentRun",
+    "EvalResult",
+    "FakeAnthropic",
+    "FakeDirectService",
+    "FakeMessage",
+    "make_message",
+    "patch_direct_service",
+    "run_agent_eval",
+    "text_block",
+    "tool_use",
+    "write_policy",
+]
 
 # --------------------------------------------------------------------------
 # Unified DirectService fake covering every method a tool handler may call.
