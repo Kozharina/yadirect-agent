@@ -54,12 +54,7 @@ evals exercise the full safety surface.)*
 
 ## In progress
 
-- [ ] **Dedupe `_infer_actor` between Campaign / Bidding services**
-      (branch ``refactor/dedupe-infer-actor``) — extract the
-      frame-walking helper into ``audit.infer_actor_from_frame()``
-      so a future tightening (replace frame walk with explicit
-      kwarg threading) lands in one place. Auditor M2-bidding L-1
-      tech-debt entry.
+*(empty — nothing checked out right now)*
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
@@ -237,15 +232,6 @@ Accumulated work that isn't blocking but will sting later.
       into ``skipped_checks``. Land alongside (or before) the
       bid-snapshot reader so the signal is meaningful from day
       one.
-
-- [ ] **Dedup `_infer_actor` frame walk between Campaign / Bidding
-      services** (auditor M2-bidding L-1): the frame-walking
-      helper is duplicated verbatim in
-      ``CampaignService._infer_actor`` and
-      ``BiddingService._infer_actor``. Extract into
-      ``audit.infer_actor_from_frame()`` so a future tightening
-      (replace frame walk with explicit kwarg threading) lands in
-      one place.
 
 - [ ] **Snapshot freshness at apply-plan time (archived-campaign
       gap)** (from PR-B1 auditor MEDIUM-3; not blocking M2.3): the
@@ -576,6 +562,19 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **`_infer_actor` dedup → `audit.infer_actor_from_frame()`**
+      (auditor M2-bidding L-1). Both ``CampaignService`` and
+      ``BiddingService`` had a byte-identical 8-frame walker
+      matching the @requires_plan ``wrapper`` closure with
+      ``_applying_plan_id`` in its locals. Extracted into a single
+      module-level helper with a comprehensive docstring capturing
+      the auditor HIGH lesson (match only the canonical
+      ``wrapper`` closure name; the kwarg in any other frame
+      MUST NOT flip the verdict). Frame-walk semantics unchanged;
+      future tightening (e.g. replacing the walk with explicit
+      kwarg threading through the decorator) now lands in one
+      place. 5 new helper unit tests pinning all four contract
+      branches + the 8-frame depth ceiling. 584 total green.
 - [x] **CLI: `--state` filter on `list-campaigns` actually applies**
       — surfaced by a project-wide audit. The flag was silently
       ignored: when ``state is not None`` the CLI branched to
