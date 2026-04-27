@@ -336,9 +336,13 @@ class TestAuditActionEmitFailureSemantics:
     """
 
     @pytest.mark.asyncio
-    async def test_emit_failure_on_ok_path_does_not_propagate(self) -> None:
+    async def test_emit_oserror_on_ok_path_does_not_propagate(self) -> None:
         # Wrapped block succeeded → operation is done → caller MUST NOT
-        # see an exception even if the .ok event can't be persisted.
+        # see an I/O error from the audit sink (disk full, broken pipe,
+        # permission denied — anything OSError-shaped). Auditor M2.3a
+        # ADVISORY-1: this guard was previously ``except Exception``,
+        # masking programmer bugs too. Narrowed to OSError; programmer
+        # errors are covered by the next test.
 
         class _BrokenOnOkSink:
             def __init__(self) -> None:
@@ -347,7 +351,7 @@ class TestAuditActionEmitFailureSemantics:
             async def emit(self, event: AuditEvent) -> None:
                 self.calls.append(event.action)
                 if event.action.endswith(".ok"):
-                    raise RuntimeError("disk full on ok")
+                    raise OSError("disk full on ok")
 
         sink = _BrokenOnOkSink()
         # No exception should escape audit_action even though .ok emit raises.
@@ -358,6 +362,27 @@ class TestAuditActionEmitFailureSemantics:
             "set_campaign_budget.requested",
             "set_campaign_budget.ok",
         ]
+
+    @pytest.mark.asyncio
+    async def test_emit_programmer_error_on_ok_path_propagates(self) -> None:
+        # A programmer bug in a sink subclass (e.g. ValidationError on a
+        # malformed AuditEvent, TypeError from a refactor mismatch,
+        # AttributeError from a missing field) must NOT be hidden behind
+        # a structlog warning. The wrapped operation succeeded, so the
+        # operator's API call is fine — but the audit record is broken
+        # and the operator must see that immediately, not discover it
+        # weeks later when reconciliation fails. Auditor M2.3a ADVISORY-1.
+
+        class _BrokenWithTypeErrorSink:
+            async def emit(self, event: AuditEvent) -> None:
+                if event.action.endswith(".ok"):
+                    raise TypeError("malformed event payload")
+
+        with pytest.raises(TypeError, match="malformed event payload"):
+            async with audit_action(
+                _BrokenWithTypeErrorSink(), actor="agent", action="set_campaign_budget"
+            ) as ctx:
+                ctx.set_result({"status": "applied"})
 
     @pytest.mark.asyncio
     async def test_emit_failure_on_failed_path_does_not_mask_original(self) -> None:
@@ -373,6 +398,29 @@ class TestAuditActionEmitFailureSemantics:
         with pytest.raises(RuntimeError, match="api failed"):
             async with audit_action(
                 _BrokenOnFailedSink(), actor="agent", action="set_campaign_budget"
+            ):
+                raise RuntimeError("api failed")
+
+    @pytest.mark.asyncio
+    async def test_programmer_error_on_failed_path_does_not_mask_original(
+        self,
+    ) -> None:
+        # Wrapped block raised RuntimeError; the .failed emit then raises
+        # a programmer error (TypeError). The caller MUST still see the
+        # original RuntimeError — the audit-emit failure is logged loudly
+        # but never replaces the wrapped-operation exception, otherwise
+        # the operator gets a confusing TypeError with the actual API
+        # failure buried under ``__context__``. Auditor M2.3a
+        # ADVISORY-1.
+
+        class _BrokenWithTypeErrorOnFailed:
+            async def emit(self, event: AuditEvent) -> None:
+                if event.action.endswith(".failed"):
+                    raise TypeError("malformed event payload")
+
+        with pytest.raises(RuntimeError, match="api failed"):
+            async with audit_action(
+                _BrokenWithTypeErrorOnFailed(), actor="agent", action="set_campaign_budget"
             ):
                 raise RuntimeError("api failed")
 
