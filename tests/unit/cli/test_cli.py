@@ -673,11 +673,19 @@ def test_apply_plan_routes_resume_campaigns_to_service(
 
 def test_mcp_serve_help_shows_allow_write_flag(
     runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``yadirect-agent mcp serve --help`` mentions ``--allow-write``
     so an operator running ``--help`` for the first time discovers
     the gating flag without reading source.
+
+    ``COLUMNS=200`` keeps rich from wrapping the flag name across
+    lines in narrow CI terminals (the default 80-column wrap broke
+    ``--allow-write`` into ``--allow-\\nwrite`` which made the
+    substring assertion flake on Linux CI even though it passed
+    locally).
     """
+    monkeypatch.setenv("COLUMNS", "200")
     result = runner.invoke(app, ["mcp", "serve", "--help"])
     assert result.exit_code == 0
     assert "--allow-write" in result.output
