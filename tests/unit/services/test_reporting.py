@@ -1,0 +1,286 @@
+"""Tests for ``ReportingService`` (M6 basic).
+
+Focus: the service's *decisions* — what it asks Metrika for, how it
+joins cost/clicks/conversions into ``CampaignPerformance``, when it
+returns ``cpa_rub=None`` vs a number, and what it raises when the
+operator hasn't configured a counter.
+
+We monkeypatch ``MetrikaService`` so HTTP is mocked at the service
+boundary, not the wire — this is the same seam ``test_campaigns.py``
+uses for ``DirectService``.
+"""
+
+from __future__ import annotations
+
+from datetime import date
+from typing import Any, Self
+
+import pytest
+
+from yadirect_agent.config import Settings
+from yadirect_agent.exceptions import ConfigError
+from yadirect_agent.models.metrika import DateRange, MetrikaGoal, ReportRow
+from yadirect_agent.services import reporting as reporting_module
+from yadirect_agent.services.reporting import ReportingService
+
+# --------------------------------------------------------------------------
+# In-memory stub that replaces MetrikaService.
+# --------------------------------------------------------------------------
+
+
+class _FakeMetrikaService:
+    """Captures calls and replays scripted Metrika responses."""
+
+    def __init__(
+        self,
+        *,
+        report_rows: list[ReportRow] | None = None,
+        goals: list[MetrikaGoal] | None = None,
+    ) -> None:
+        self._report_rows = report_rows or []
+        self._goals = goals or []
+        self.report_calls: list[dict[str, Any]] = []
+        self.goals_calls: list[int] = []
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+    async def get_goals(self, *, counter_id: int) -> list[MetrikaGoal]:
+        self.goals_calls.append(counter_id)
+        return list(self._goals)
+
+    async def get_report(
+        self,
+        *,
+        counter_id: int,
+        metrics: list[str],
+        dimensions: list[str],
+        date_range: DateRange,
+        filters: str | None = None,
+    ) -> list[ReportRow]:
+        self.report_calls.append(
+            {
+                "counter_id": counter_id,
+                "metrics": metrics,
+                "dimensions": dimensions,
+                "date_range": date_range,
+                "filters": filters,
+            },
+        )
+        return list(self._report_rows)
+
+
+def _patch_metrika(monkeypatch: pytest.MonkeyPatch, fake: _FakeMetrikaService) -> None:
+    """Replace ``MetrikaService`` in the reporting module with the fake."""
+    monkeypatch.setattr(reporting_module, "MetrikaService", lambda _settings: fake)
+
+
+def _settings_with_counter(settings: Settings, counter_id: int = 12345) -> Settings:
+    """Return a copy of the fixture settings with counter_id set."""
+    return settings.model_copy(update={"yandex_metrika_counter_id": counter_id})
+
+
+_WEEK = DateRange(start=date(2026, 4, 1), end=date(2026, 4, 7))
+
+
+# --------------------------------------------------------------------------
+# campaign_performance
+# --------------------------------------------------------------------------
+
+
+class TestCampaignPerformance:
+    async def test_happy_path_with_goal(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Wire shape: one row with [visits, directCost, goalConversions].
+        fake = _FakeMetrikaService(
+            report_rows=[
+                ReportRow(
+                    dimensions=[{"name": "brand", "id": 42}],
+                    metrics=[120.0, 850.5, 5.0],
+                ),
+            ],
+        )
+        _patch_metrika(monkeypatch, fake)
+
+        async with ReportingService(_settings_with_counter(settings)) as svc:
+            perf = await svc.campaign_performance(
+                campaign_id=42,
+                campaign_name="brand",
+                date_range=_WEEK,
+                goal_id=100,
+            )
+
+        assert perf.campaign_id == 42
+        assert perf.campaign_name == "brand"
+        assert perf.clicks == 120
+        assert perf.cost_rub == pytest.approx(850.5)
+        assert perf.conversions == 5
+        assert perf.cpa_rub == pytest.approx(170.1)
+        assert perf.cr_pct == pytest.approx(120 * 100 / 120, rel=1e-3)  # 100% (debug)
+        # actual: cr_pct = conversions / clicks * 100 = 5/120 * 100 = 4.166...
+        assert perf.cr_pct == pytest.approx(5 / 120 * 100, rel=1e-3)
+
+    async def test_happy_path_without_goal_carries_none_conversions(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # No goal_id passed → service must not ask Metrika for goal metric.
+        fake = _FakeMetrikaService(
+            report_rows=[
+                ReportRow(
+                    dimensions=[{"name": "brand", "id": 42}],
+                    metrics=[120.0, 850.5],  # only visits + cost, no conversions
+                ),
+            ],
+        )
+        _patch_metrika(monkeypatch, fake)
+
+        async with ReportingService(_settings_with_counter(settings)) as svc:
+            perf = await svc.campaign_performance(
+                campaign_id=42,
+                campaign_name="brand",
+                date_range=_WEEK,
+                goal_id=None,
+            )
+
+        assert perf.conversions == 0
+        assert perf.cpa_rub is None
+        # Metrics requested didn't include any goal field
+        called_metrics = fake.report_calls[0]["metrics"]
+        assert not any("goal" in m for m in called_metrics)
+
+    async def test_zero_conversions_carries_none_cpa(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Cost without conversions — the canonical "burning campaign"
+        # signal. cpa_rub MUST be None, never 0 or infinity, so a
+        # rule-based "kill if cpa > 1000" check doesn't accidentally
+        # nuke a campaign with 0 conversions.
+        fake = _FakeMetrikaService(
+            report_rows=[
+                ReportRow(
+                    dimensions=[{"name": "brand", "id": 42}],
+                    metrics=[80.0, 2400.0, 0.0],
+                ),
+            ],
+        )
+        _patch_metrika(monkeypatch, fake)
+
+        async with ReportingService(_settings_with_counter(settings)) as svc:
+            perf = await svc.campaign_performance(
+                campaign_id=42,
+                campaign_name="brand",
+                date_range=_WEEK,
+                goal_id=100,
+            )
+
+        assert perf.conversions == 0
+        assert perf.cost_rub == pytest.approx(2400.0)
+        assert perf.cpa_rub is None  # never 0, never inf
+        assert perf.cr_pct == pytest.approx(0.0)
+
+    async def test_zero_clicks_carries_none_cr(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Brand-new campaign that hasn't shown yet.
+        fake = _FakeMetrikaService(
+            report_rows=[
+                ReportRow(
+                    dimensions=[{"name": "brand", "id": 42}],
+                    metrics=[0.0, 0.0, 0.0],
+                ),
+            ],
+        )
+        _patch_metrika(monkeypatch, fake)
+
+        async with ReportingService(_settings_with_counter(settings)) as svc:
+            perf = await svc.campaign_performance(
+                campaign_id=42,
+                campaign_name="brand",
+                date_range=_WEEK,
+                goal_id=100,
+            )
+
+        assert perf.clicks == 0
+        assert perf.cr_pct is None
+        assert perf.cpa_rub is None
+
+    async def test_metrika_returns_no_data_for_campaign(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # No rows = Metrika has no record of this campaign's traffic in
+        # the window (could be brand-new, paused, or fresh counter).
+        # Return zero-filled CampaignPerformance instead of crashing.
+        fake = _FakeMetrikaService(report_rows=[])
+        _patch_metrika(monkeypatch, fake)
+
+        async with ReportingService(_settings_with_counter(settings)) as svc:
+            perf = await svc.campaign_performance(
+                campaign_id=42,
+                campaign_name="brand",
+                date_range=_WEEK,
+                goal_id=100,
+            )
+
+        assert perf.clicks == 0
+        assert perf.cost_rub == 0.0
+        assert perf.conversions == 0
+        assert perf.cpa_rub is None
+        assert perf.cr_pct is None
+
+    async def test_filter_targets_specific_campaign(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Filter must reference ym:ad:directCampaignID==<id>; without
+        # it, Metrika would return account-level totals instead of
+        # campaign-level — silently inflating every campaign's data.
+        fake = _FakeMetrikaService(report_rows=[])
+        _patch_metrika(monkeypatch, fake)
+
+        async with ReportingService(_settings_with_counter(settings)) as svc:
+            await svc.campaign_performance(
+                campaign_id=42,
+                campaign_name="brand",
+                date_range=_WEEK,
+                goal_id=100,
+            )
+
+        call = fake.report_calls[0]
+        assert call["filters"] is not None
+        assert "ym:ad:directCampaignID" in call["filters"]
+        assert "42" in call["filters"]
+
+    async def test_missing_counter_id_raises_config_error(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Settings.yandex_metrika_counter_id is None — agent isn't fully
+        # configured. We should fail fast with a clear pointer at the
+        # right env var, not silently call get_report(counter_id=None)
+        # and crash on a 400.
+        _patch_metrika(monkeypatch, _FakeMetrikaService())
+
+        async with ReportingService(settings) as svc:  # counter_id stays None
+            with pytest.raises(ConfigError, match="counter"):
+                await svc.campaign_performance(
+                    campaign_id=42,
+                    campaign_name="brand",
+                    date_range=_WEEK,
+                    goal_id=100,
+                )
