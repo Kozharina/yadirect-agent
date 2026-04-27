@@ -33,12 +33,18 @@ from typing import Annotated, Any
 import structlog
 import typer
 from rich.console import Console
+from rich.markup import escape as _rich_escape
 from rich.table import Table
 
 from .. import __version__
+from ..agent.executor import (
+    InvalidPlanStateError,
+    PlanRejected,
+    apply_plan,
+)
 from ..agent.loop import Agent, AgentLoopError, AgentRun
 from ..agent.plans import OperationPlan, PendingPlansStore
-from ..agent.tools import build_default_registry
+from ..agent.tools import build_default_registry, build_safety_pair
 from ..config import Settings, get_settings
 from ..logging import configure_logging
 from ..services.campaigns import CampaignService, CampaignSummary
@@ -377,6 +383,129 @@ def _render_plan_detail(plan: OperationPlan) -> None:
     if plan.args:
         _out.print("[bold]args:[/bold]")
         _out.print(_compact_json(plan.args))
+
+
+# --------------------------------------------------------------------------
+# `apply-plan` — operator approval for a pending OperationPlan (M2.2 part 3b2).
+#
+# The agent's ``set_campaign_budget`` tool returns ``status="pending"`` +
+# ``plan_id`` when the safety pipeline asks for confirmation. The operator
+# inspects via ``plans show <id>`` and runs ``apply-plan <id>`` to actually
+# send the API request. ``apply_plan`` (in agent/executor.py) does:
+#   1. validate the plan is in ``pending`` state with a stored review_context;
+#   2. RE-REVIEW against the original snapshot (catches snapshot drift);
+#   3. route through ``service_router(action, args, _applying_plan_id=...)``
+#      which dispatches to the matching service method;
+#   4. on success: ``store.update_status(applied)`` then ``on_applied`` (best-
+#      effort); on executor failure: ``store.update_status(failed)`` and
+#      propagate.
+#
+# Exit codes are designed for cron / shell-script consumption:
+#   0  applied successfully
+#   1  preconditions failed (unknown plan_id, not pending, no review_context)
+#   2  re-review rejected the plan
+#   3  the underlying service call raised
+# --------------------------------------------------------------------------
+
+
+# Service-router: a single-process registry mapping ``OperationPlan.action``
+# strings to the service method that should execute them. Adding a new
+# decorated method means adding one entry here. Deliberately a function
+# (not a class) so the closure binds the shared safety pair from
+# ``build_safety_pair`` exactly once per CLI invocation.
+def _build_service_router(
+    settings: Settings,
+    pipeline: Any,
+    store: PendingPlansStore,
+) -> Any:
+    """Return an async callable ``(action, args, *, _applying_plan_id) -> Any``
+    that ``apply_plan`` will dispatch through. Every service is constructed
+    with the same (pipeline, store) pair; the bypass kwarg keeps the
+    decorator from re-reviewing on re-entry.
+    """
+
+    async def router(
+        action: str,
+        args: dict[str, Any],
+        *,
+        _applying_plan_id: str,
+    ) -> Any:
+        if action == "set_campaign_budget":
+            svc = CampaignService(settings, pipeline=pipeline, store=store)
+            return await svc.set_daily_budget(
+                **args,
+                _applying_plan_id=_applying_plan_id,
+            )
+        msg = f"unknown action: {action!r}"
+        raise ValueError(msg)
+
+    return router
+
+
+@app.command("apply-plan")
+def apply_plan_cmd(
+    plan_id: Annotated[
+        str,
+        typer.Argument(help="plan_id from `plans list`."),
+    ],
+) -> None:
+    """Re-review and apply a pending OperationPlan against the live API.
+
+    Exit codes (cron-friendly):
+      0  applied successfully
+      1  preconditions failed (unknown plan_id, not in `pending` state,
+         or stored review_context is missing — see `plans show <id>`)
+      2  re-review by the safety pipeline rejected the plan
+      3  the underlying service call raised
+    """
+    settings = _bootstrap_settings()
+    store = _plans_store(settings)
+    pipeline, _ = build_safety_pair(settings)
+    # Reuse the store path from CLI convention rather than the one
+    # build_safety_pair returned: `_plans_store` already encodes the
+    # contract (next to audit log) and that's what tests / `plans list`
+    # / agent runs all read.
+    router = _build_service_router(settings, pipeline, store)
+
+    try:
+        asyncio.run(
+            apply_plan(
+                plan_id,
+                store=store,
+                pipeline=pipeline,
+                service_router=router,
+            )
+        )
+    # Every interpolated value below is routed through ``_rich_escape`` so a
+    # plan_id / exc.reason carrying rich-markup metacharacters (``[bold]`` …)
+    # cannot manipulate the operator's terminal output. Auditor PR-B2 MEDIUM.
+    except KeyError:
+        _err.print(f"[red]plan not found: {plan_id!r}[/red]")
+        raise typer.Exit(code=1) from None
+    except InvalidPlanStateError as exc:
+        # Plan exists but is not in ``pending`` (already applied / rejected /
+        # failed) or has no stored review_context.
+        _err.print(f"[red]{_rich_escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from exc
+    except PlanRejected as exc:
+        _err.print(f"[red]rejected by re-review:[/red] {_rich_escape(exc.reason)}")
+        for r in exc.blocking:
+            _err.print(
+                f"  - [yellow]{_rich_escape(r.status)}[/yellow] {_rich_escape(r.reason or '')}"
+            )
+        raise typer.Exit(code=2) from exc
+    except Exception as exc:
+        # Plan has already been moved to ``failed`` inside apply_plan
+        # before the exception escapes — no double-apply risk for one
+        # process. NB: concurrent apply-plan invocations on the same
+        # plan_id are NOT protected against (no fcntl.flock); the JSONL
+        # store assumes single-operator local use today. Tracked in
+        # docs/BACKLOG.md "apply-plan concurrency / file-lock". Auditor
+        # PR-B2 MEDIUM.
+        _err.print(f"[red]apply failed:[/red] {type(exc).__name__}: {_rich_escape(str(exc))}")
+        raise typer.Exit(code=3) from exc
+
+    _out.print(f"[green]applied[/green] plan {_rich_escape(plan_id)}")
 
 
 if __name__ == "__main__":  # pragma: no cover

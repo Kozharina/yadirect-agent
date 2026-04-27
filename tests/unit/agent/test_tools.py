@@ -151,20 +151,20 @@ class TestDefaultRegistry:
         # works if every CampaignService-backed tool sees the same
         # pipeline object. The factories take ``(settings, pipeline,
         # store)`` so they share a closure; this test pins that the
-        # registry construction calls ``_build_safety_pair`` exactly
+        # registry construction calls ``build_safety_pair`` exactly
         # once. A future refactor that built per-tool pipelines would
         # silently disable session-level TOCTOU protection.
         from yadirect_agent.agent import tools as tools_mod
 
         call_count = 0
-        original = tools_mod._build_safety_pair
+        original = tools_mod.build_safety_pair
 
         def _counting(s: Settings) -> Any:
             nonlocal call_count
             call_count += 1
             return original(s)
 
-        monkeypatch.setattr(tools_mod, "_build_safety_pair", _counting)
+        monkeypatch.setattr(tools_mod, "build_safety_pair", _counting)
         build_default_registry(settings)
         assert call_count == 1
 

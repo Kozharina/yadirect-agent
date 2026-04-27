@@ -486,7 +486,7 @@ def _make_validate_phrases_tool(settings: Settings) -> Tool:
 # --------------------------------------------------------------------------
 
 
-def _build_safety_pair(settings: Settings) -> tuple[SafetyPipeline, PendingPlansStore]:
+def build_safety_pair(settings: Settings) -> tuple[SafetyPipeline, PendingPlansStore]:
     """Construct the shared ``(SafetyPipeline, PendingPlansStore)`` pair
     that every CampaignService instance in this registry will consume.
 
@@ -571,7 +571,7 @@ def build_default_registry(settings: Settings) -> ToolRegistry:
     SessionState (cross-tool TOCTOU register) survives across tool
     calls within one agent run.
     """
-    pipeline, store = _build_safety_pair(settings)
+    pipeline, store = build_safety_pair(settings)
     reg = ToolRegistry()
     for cf in _CAMPAIGN_FACTORIES:
         reg.add(cf(settings, pipeline, store))
@@ -589,4 +589,5 @@ __all__ = [
     "ToolHandler",
     "ToolRegistry",
     "build_default_registry",
+    "build_safety_pair",
 ]

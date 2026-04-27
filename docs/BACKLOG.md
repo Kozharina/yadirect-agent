@@ -31,14 +31,6 @@ Each one is TDD, with `security-auditor` sub-agent review before merge.
 All seven reference
 [`docs/PRIOR_ART.md`](./PRIOR_ART.md) → "Agentic PPC Campaign Management".
 
-- [ ] **M2.2 part 3b2 — `apply-plan` CLI** — final slice of §M2.2.
-      Add `yadirect-agent apply-plan <id>` typer command that wires
-      `apply_plan()` against a service-router mapping `action`
-      strings to service methods (just `set_campaign_budget` →
-      `CampaignService.set_daily_budget` for now). Reuse the
-      shared SafetyPipeline + PendingPlansStore that
-      `build_default_registry` already builds. Smoke-test the CLI;
-      security-auditor review before merge.
 - [ ] **M2.3: Audit sink** — `audit.py::AuditEvent`, JSONL async writer,
       `*.requested` / `*.ok` / `*.failed` emissions in every mutating
       service method.
@@ -163,17 +155,41 @@ Accumulated work that isn't blocking but will sting later.
       stale flat-namespace examples.
 
 - [ ] **`apply-plan` concurrency / file-lock** (from PR-A auditor
-      LOW; deferred, not blocking part 3b merge): two concurrent
-      `apply_plan(<same_id>)` calls would both pass the
-      `status != pending` check (the JSONL store reads before either
-      writes), both re-review, both execute, both write `applied`.
-      Today this is acceptable: yadirect-agent is a single-operator
-      tool and the JSONL is local. When we ship a multi-operator
-      deployment (or apply-plan starts running inside a daemon
-      alongside an interactive CLI), wrap the
-      `get → status check → service_router → update_status` sequence
-      in `apply_plan` with `fcntl.flock` on the JSONL path. Re-evaluate
-      severity then.
+      LOW, re-raised to MEDIUM by PR-B2 auditor on the live CLI
+      path; not blocking part 3b2 single-operator use): two
+      concurrent `yadirect-agent apply-plan <same-id>` shell
+      invocations would both pass the `status != pending` check
+      (the JSONL store reads before either writes), both re-review,
+      both execute, both call ``pipeline.on_applied``. The
+      ``set_daily_budget`` API call is idempotent against the same
+      target value (Direct accepts the second), so the monetary
+      blast radius is bounded — but the session TOCTOU register
+      gets DOUBLE-incremented, and a future plan within the same
+      pipeline session would slip past a cap that should hold.
+      Acceptance for any future fix: add a regression test
+      simulating concurrent ``apply_plan`` and asserting
+      ``on_applied_calls == 1`` (not 2). Implementation: wrap the
+      `get → status check → service_router → update_status`
+      sequence in `apply_plan` with `fcntl.flock` on the JSONL
+      path. ``yadirect-agent apply-plan`` docstring already
+      documents single-operator-only assumption.
+
+- [ ] **Action-string registry pinning (decorator ↔ router)** (from
+      PR-B2 auditor DESIGN NOTE): the action string
+      ``"set_campaign_budget"`` is hardcoded both on the
+      ``@requires_plan(action=...)`` decorator at
+      ``services/campaigns.py:184`` and in the CLI router at
+      ``cli/main.py:_build_service_router``. If either is renamed
+      without updating the other, every ``apply-plan`` of the
+      affected action silently routes to the unknown-action
+      branch and exits 3. Pin the relationship with either a
+      shared ``ACTION_*`` constant module or a registry pattern
+      (``@register_action("set_campaign_budget")`` decorator that
+      both wires the @requires_plan and registers the router
+      entry). Add a runtime assertion at registry-build time that
+      every decorated method's action string has a corresponding
+      router entry. Defer until a second decorated method
+      exists — the abstraction has no value with one entry.
 
 - [ ] **Plan-store I/O failure masking** (from PR-A second-pass
       auditor LOW NF-2; not blocking part 3b): if the JSONL append
@@ -425,6 +441,20 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2.2 part 3b2 — `apply-plan` CLI** — closes M2.2.
+      ``yadirect-agent apply-plan <id>`` re-reviews the stored plan
+      against its original ReviewContext, dispatches via a service
+      router (currently mapping ``set_campaign_budget`` →
+      ``CampaignService.set_daily_budget``), and prints a green
+      ``applied`` line on success. Cron-friendly exit codes:
+      0 applied, 1 preconditions failed (unknown id / not pending /
+      no review_context), 2 re-review rejected, 3 underlying
+      service raised. ``build_safety_pair`` promoted from
+      ``_build_safety_pair`` so the CLI resolves Policy from the
+      same path as the agent's tools registry, guaranteeing that
+      re-review at apply time uses the same thresholds the
+      original decision was made under. 4 new CLI smoke tests
+      (12 in test_cli.py); 432 total green.
 - [x] **M2.2 part 3b1 — service wiring (CampaignService + tools
       registry)** — first real consumer of the part-3a executor
       infrastructure. ``CampaignService.__init__`` accepts ``pipeline``
@@ -567,14 +597,3 @@ Last 10 items (newest at top). Older items are available via
       baseline warns, details payload carries baseline_total_rub);
       one MEDIUM (baseline provenance) + one DESIGN (ceiling
       warning) escalated to Tech debt.
-- [x] **M2 Kill-switch #4 — Quality Score guardrail** —
-      `QualityScoreGuardCheck` blocks bid *increases* on keywords
-      whose QS is below the configured threshold. Policy is a narrow
-      slice: `min_quality_score_for_bid_increase: int` with
-      `Field(ge=0, le=10)` defaulting to 5. `KeywordSnapshot` grows
-      `quality_score: int | None` and a `__post_init__` guard that
-      rejects float / bool / out-of-range values. Search-before-
-      network evaluation order pinned. 28 new tests (99 safety, 222
-      across the suite). Reviewed by `security-auditor` — no single-
-      call bypass found; 3 follow-ups (cross-call ratchet, None-
-      current defer, §M2.6 trending) moved to Tech debt.
