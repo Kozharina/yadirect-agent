@@ -721,7 +721,7 @@ async def test_resume_campaigns_redacts_ks3_missing_phrases_from_blocking(
     monkeypatch.setattr(CampaignService, "resume", fake_resume)
 
     tool = build_default_registry(settings).get("resume_campaigns")
-    inp = tool.input_model.model_validate({"campaign_ids": [42]})
+    inp = tool.input_model.model_validate({"ids": [42]})
     result = await tool.handler(inp, tool_context)
 
     blocking_details = result["blocking"][0]["details"]
