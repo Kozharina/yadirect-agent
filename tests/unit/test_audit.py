@@ -450,16 +450,24 @@ class TestAuditActionEmitFailureSemantics:
                 if event.action.endswith(".failed"):
                     raise asyncio.CancelledError()
 
-        with pytest.raises(asyncio.CancelledError) as caught:
+        # Plain ``try/except`` rather than ``pytest.raises`` — CodeQL's
+        # py/unreachable-statement check trips on the post-``with`` block
+        # when the body unconditionally raises (CLAUDE.md gotcha).
+        caught: BaseException | None = None
+        try:
             async with audit_action(
                 _CancelledOnFailedSink(), actor="agent", action="set_campaign_budget"
             ):
                 raise RuntimeError("api failed")
+        except asyncio.CancelledError as exc:
+            caught = exc
+
+        assert caught is not None, "expected CancelledError to propagate"
 
         # Original wrapped exception must be reachable via the
         # exception chain — not silently dropped.
         chain_types: set[type[BaseException]] = set()
-        cur: BaseException | None = caught.value
+        cur: BaseException | None = caught
         while cur is not None:
             chain_types.add(type(cur))
             cur = cur.__context__
