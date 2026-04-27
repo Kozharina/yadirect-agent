@@ -417,11 +417,14 @@ def _build_service_router(
     settings: Settings,
     pipeline: Any,
     store: PendingPlansStore,
+    audit_sink: Any,
 ) -> Any:
     """Return an async callable ``(action, args, *, _applying_plan_id) -> Any``
     that ``apply_plan`` will dispatch through. Every service is constructed
-    with the same (pipeline, store) pair; the bypass kwarg keeps the
-    decorator from re-reviewing on re-entry.
+    with the same ``(pipeline, store, audit_sink)`` triple so ``apply-plan``
+    emits the same ``set_campaign_budget.requested|.ok|.failed`` audit
+    line the agent path produces — distinguishable only by the
+    ``actor`` field (``human`` vs ``agent``).
     """
 
     async def router(
@@ -431,7 +434,12 @@ def _build_service_router(
         _applying_plan_id: str,
     ) -> Any:
         if action == "set_campaign_budget":
-            svc = CampaignService(settings, pipeline=pipeline, store=store)
+            svc = CampaignService(
+                settings,
+                pipeline=pipeline,
+                store=store,
+                audit_sink=audit_sink,
+            )
             return await svc.set_daily_budget(
                 **args,
                 _applying_plan_id=_applying_plan_id,
@@ -459,13 +467,16 @@ def apply_plan_cmd(
       3  the underlying service call raised
     """
     settings = _bootstrap_settings()
-    store = _plans_store(settings)
-    pipeline, _ = build_safety_pair(settings)
-    # Reuse the store path from CLI convention rather than the one
-    # build_safety_pair returned: `_plans_store` already encodes the
-    # contract (next to audit log) and that's what tests / `plans list`
-    # / agent runs all read.
-    router = _build_service_router(settings, pipeline, store)
+    # Use the SAME ``(pipeline, store, audit_sink)`` triple the agent's
+    # tools registry constructs, so apply-plan operates on the exact
+    # store the agent wrote to and emits into the exact JSONL the agent
+    # wrote to. Auditor PR M2.3b MEDIUM: the previous version
+    # constructed two PendingPlansStore instances pointing at the same
+    # path — fine today, but a future in-memory cache / lock on the
+    # store would create a coherence trap. ``build_safety_pair``
+    # already encodes the path convention; trust its return value.
+    pipeline, store, audit_sink = build_safety_pair(settings)
+    router = _build_service_router(settings, pipeline, store, audit_sink)
 
     try:
         asyncio.run(
@@ -474,6 +485,7 @@ def apply_plan_cmd(
                 store=store,
                 pipeline=pipeline,
                 service_router=router,
+                audit_sink=audit_sink,
             )
         )
     # Every interpolated value below is routed through ``_rich_escape`` so a

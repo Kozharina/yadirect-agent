@@ -347,3 +347,273 @@ async def test_set_daily_budget_with_safety_persists_plan_on_confirm(
 
     # The DirectService client was NOT called.
     assert fake_direct.budget_calls == []
+
+
+# --------------------------------------------------------------------------
+# Audit emission on the service path (M2.3b).
+#
+# CampaignService.set_daily_budget emits ``set_campaign_budget.requested``
+# and ``set_campaign_budget.ok`` (or .failed) via the audit_sink the
+# constructor receives. Actor is determined by call shape:
+#   - apply-plan re-entry (``_applying_plan_id`` present) → "human"
+#   - direct call from the agent's allow-path → "agent"
+# --------------------------------------------------------------------------
+
+
+class _CapturingSink:
+    """In-memory AuditSink stub for tests."""
+
+    def __init__(self) -> None:
+        from yadirect_agent.audit import AuditEvent
+
+        self.events: list[AuditEvent] = []
+
+    async def emit(self, event: Any) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_set_daily_budget_emits_requested_and_ok_on_apply_plan_path(
+    settings: Settings, fake_direct: _FakeDirectService
+) -> None:
+    """When the operator runs apply-plan (bypass kwarg present), the
+    service-level audit MUST fire as ``actor="human"`` so the JSONL
+    line ties back to the operator action, not a phantom agent call.
+    """
+    sink = _CapturingSink()
+    svc = CampaignService(settings, audit_sink=sink)
+
+    await svc.set_daily_budget(
+        campaign_id=42,
+        budget_rub=500,
+        _applying_plan_id="plan-xyz",
+    )
+
+    assert len(sink.events) == 2
+    requested, ok = sink.events
+    assert requested.action == "set_campaign_budget.requested"
+    assert requested.actor == "human"
+    assert requested.resource == "campaign:42"
+    assert requested.args == {"campaign_id": 42, "budget_rub": 500}
+    assert requested.result is None
+
+    assert ok.action == "set_campaign_budget.ok"
+    assert ok.actor == "human"
+    assert ok.result is not None
+    assert ok.result["status"] == "applied"
+    assert ok.result["campaign_id"] == 42
+
+
+@pytest.mark.asyncio
+async def test_set_daily_budget_emits_failed_when_api_raises(
+    settings: Settings, fake_direct: _FakeDirectService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sink = _CapturingSink()
+    svc = CampaignService(settings, audit_sink=sink)
+
+    # Make DirectService raise when the budget update is sent.
+    async def boom(self: _FakeDirectService, campaign_id: int, budget_rub: int) -> None:
+        raise RuntimeError("API 500")
+
+    monkeypatch.setattr(_FakeDirectService, "update_campaign_budget", boom)
+
+    with pytest.raises(RuntimeError, match="API 500"):
+        await svc.set_daily_budget(campaign_id=42, budget_rub=500, _applying_plan_id="plan-xyz")
+
+    assert len(sink.events) == 2
+    requested, failed = sink.events
+    assert requested.action == "set_campaign_budget.requested"
+    assert failed.action == "set_campaign_budget.failed"
+    assert failed.result is not None
+    assert failed.result["error_type"] == "RuntimeError"
+    assert failed.result["error_message"] == "API 500"
+
+
+@pytest.mark.asyncio
+async def test_set_daily_budget_without_audit_sink_runs_unchanged(
+    settings: Settings, fake_direct: _FakeDirectService
+) -> None:
+    """Backwards-compat: callers that don't pass an audit_sink (test
+    fixtures, future read-only code paths) keep working — the audit
+    layer is opt-in by sink presence so existing tests are not
+    forced to thread one through.
+    """
+    svc = CampaignService(settings)  # no audit_sink
+
+    await svc.set_daily_budget(campaign_id=42, budget_rub=500, _applying_plan_id="bypass")
+
+    assert fake_direct.budget_calls == [(42, 500, "STANDARD")]
+
+
+@pytest.mark.asyncio
+async def test_set_daily_budget_emits_actor_agent_on_full_decorator_path(
+    settings: Settings, fake_direct: _FakeDirectService, tmp_path: Any
+) -> None:
+    """Auditor HIGH: the actor inference must report ``agent`` for
+    calls that go through the @requires_plan decorator's allow path,
+    not just for the bypass path. We exercise this by configuring the
+    policy so the proposed mutation passes the kill-switches AND the
+    approval tier (``auto_approve_pause`` is the only currently-
+    auto-approvable action that lands in CampaignService, but
+    ``set_daily_budget`` requires confirm by default — so we use the
+    confirm path's persisted plan as the proxy: when re-applied via
+    apply_plan, the inner emit is human; when the agent's allow path
+    fires it would emit agent).
+
+    Since today's policy has no ``auto_approve_budget_change`` knob,
+    the agent's set_daily_budget call ALWAYS lands as confirm — the
+    inner emit doesn't fire on the agent path. So the cleanest
+    actor=agent assertion is via a synthetic test that bypasses the
+    decorator (calls the underlying _do_set_daily_budget directly
+    after wrapping in audit_action with explicit actor) — but that's
+    asserting the audit layer, not the actor inference.
+
+    The actually-meaningful test for actor=agent is: the production
+    call path produces NO ``set_campaign_budget`` audit event at all
+    on the agent flow today, because the decorator returns confirm
+    before the wrapped method runs. This test pins that contract
+    instead — the only way ``actor=agent`` events fire is if a
+    future ``auto_approve_budget_change`` knob lands. Until then, the
+    agent path emits zero service-level audit events for budget
+    changes, only the @requires_plan decision (out-of-scope for this
+    PR) and the apply_plan envelope (actor=human).
+    """
+    from yadirect_agent.agent.executor import PlanRequired
+    from yadirect_agent.agent.pipeline import SafetyPipeline
+    from yadirect_agent.agent.plans import PendingPlansStore
+    from yadirect_agent.agent.safety import (
+        BudgetCapPolicy,
+        ConversionIntegrityPolicy,
+        MaxCpcPolicy,
+        Policy,
+        QueryDriftPolicy,
+    )
+
+    fake_direct._campaigns = [
+        Campaign(
+            id=42,
+            name="alpha",
+            state=CampaignState.ON,
+            status=CampaignStatus.ACCEPTED,
+            type="TEXT_CAMPAIGN",
+            daily_budget=DailyBudget(amount=500_000_000, mode="STANDARD"),
+        )
+    ]
+    policy = Policy(
+        budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=100_000),
+        max_cpc=MaxCpcPolicy(),
+        query_drift=QueryDriftPolicy(),
+        conversion_integrity=ConversionIntegrityPolicy(
+            min_conversions_total=1,
+            min_ratio_vs_baseline=0.5,
+            require_all_baseline_goals_present=True,
+        ),
+        rollout_stage="autonomy_full",
+    )
+    pipeline = SafetyPipeline(policy)
+    store = PendingPlansStore(tmp_path / "pending_plans.jsonl")
+    sink = _CapturingSink()
+
+    svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
+
+    # Agent path: the decorator returns confirm BEFORE the wrapped
+    # body runs, so no ``set_campaign_budget.*`` event fires.
+    with pytest.raises(PlanRequired):
+        await svc.set_daily_budget(campaign_id=42, budget_rub=800)
+
+    # No service-level audit events on the agent confirm path.
+    assert [e.action for e in sink.events if "set_campaign_budget" in e.action] == []
+    # The DirectService client was NOT called.
+    assert fake_direct.budget_calls == []
+
+
+@pytest.mark.asyncio
+async def test_set_daily_budget_through_apply_plan_emits_actor_human(
+    settings: Settings, fake_direct: _FakeDirectService, tmp_path: Any
+) -> None:
+    """Auditor HIGH: drive the FULL apply_plan → router → decorated
+    method chain and assert the inner ``set_campaign_budget.*`` audit
+    pair carries ``actor="human"`` — i.e. the frame walk located the
+    decorator's wrapper frame, not a test-function frame that happens
+    to declare ``_applying_plan_id``.
+    """
+    from yadirect_agent.agent.executor import apply_plan
+    from yadirect_agent.agent.pipeline import (
+        ReviewContext,
+        SafetyPipeline,
+        serialize_review_context,
+    )
+    from yadirect_agent.agent.plans import OperationPlan, PendingPlansStore
+    from yadirect_agent.agent.safety import (
+        AccountBudgetSnapshot,
+        BudgetCapPolicy,
+        BudgetChange,
+        CampaignBudget,
+        ConversionIntegrityPolicy,
+        MaxCpcPolicy,
+        Policy,
+        QueryDriftPolicy,
+    )
+
+    policy = Policy(
+        budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=100_000),
+        max_cpc=MaxCpcPolicy(),
+        query_drift=QueryDriftPolicy(),
+        conversion_integrity=ConversionIntegrityPolicy(
+            min_conversions_total=1,
+            min_ratio_vs_baseline=0.5,
+            require_all_baseline_goals_present=True,
+        ),
+        rollout_stage="autonomy_full",
+    )
+    pipeline = SafetyPipeline(policy)
+    store = PendingPlansStore(tmp_path / "pending_plans.jsonl")
+    sink = _CapturingSink()
+
+    # Seed a pending plan with a real ReviewContext.
+    ctx = ReviewContext(
+        budget_snapshot=AccountBudgetSnapshot(
+            campaigns=[
+                CampaignBudget(id=42, name="alpha", daily_budget_rub=500.0, state="ON"),
+            ]
+        ),
+        budget_changes=[BudgetChange(campaign_id=42, new_daily_budget_rub=800)],
+    )
+    from datetime import UTC, datetime
+
+    plan = OperationPlan(
+        plan_id="plan-go",
+        created_at=datetime(2026, 4, 27, 12, 0, tzinfo=UTC),
+        action="set_campaign_budget",
+        resource_type="campaign",
+        resource_ids=[42],
+        args={"campaign_id": 42, "budget_rub": 800},
+        preview="raise budget",
+        reason="confirm",
+        review_context=serialize_review_context(ctx),
+    )
+    store.append(plan)
+
+    svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
+
+    async def router(action: str, args: Any, *, _applying_plan_id: str) -> Any:
+        if action == "set_campaign_budget":
+            return await svc.set_daily_budget(**args, _applying_plan_id=_applying_plan_id)
+        raise ValueError(action)
+
+    await apply_plan(
+        "plan-go",
+        store=store,
+        pipeline=pipeline,
+        service_router=router,
+        audit_sink=sink,
+    )
+
+    # Inner set_campaign_budget pair fires from the decorated path —
+    # frame walk MUST find the @requires_plan wrapper and label both
+    # events ``actor="human"``.
+    inner = [e for e in sink.events if e.action.startswith("set_campaign_budget.")]
+    assert len(inner) == 2
+    assert all(e.actor == "human" for e in inner)
+    assert inner[0].action == "set_campaign_budget.requested"
+    assert inner[1].action == "set_campaign_budget.ok"
