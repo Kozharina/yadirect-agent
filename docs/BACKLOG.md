@@ -31,9 +31,10 @@ Each one is TDD, with `security-auditor` sub-agent review before merge.
 All seven reference
 [`docs/PRIOR_ART.md`](./PRIOR_ART.md) → "Agentic PPC Campaign Management".
 
-- [ ] **M2.5: Staged rollout** — `rollout_stage` field in policy,
-      `yadirect-agent rollout promote` (audit-logged, requires human
-      confirmation).
+*(M2 fully shipped — see Done. Next safety work happens
+inside other milestones: M3 MCP `--allow-write` gating builds on
+M2's pipeline; M5 A/B testing service inherits M2 audit; M7
+evals exercise the full safety surface.)*
 
 ### 🔌 M3 — MCP server
 
@@ -501,6 +502,29 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2.5 — Staged rollout (state-file + CLI)** — closes
+      §M2 entirely. New module ``yadirect_agent.rollout``
+      shipping ``RolloutState`` (frozen pydantic, AwareDatetime,
+      Literal stage) + ``RolloutStateStore`` (single-snapshot
+      JSON read/write; corrupt-file boot-safe). New
+      ``_apply_rollout_state_override`` in tools.py overrides
+      ``Policy.rollout_stage`` from YAML when the state-file is
+      present (logs ``rollout_state_override`` info). New
+      ``yadirect-agent rollout`` subapp:
+      - ``status``: shows effective stage + source (YAML default
+        vs state-file override with timestamp + actor +
+        previous-stage transition).
+      - ``promote --to <stage> [--yes] [--actor <id>]``:
+        validates target, prints transition (red WARNING for
+        autonomy_full), interactive confirm by default, persists
+        ``rollout_state.json`` AND emits the
+        ``rollout_promote.requested|.ok|.failed`` audit envelope.
+      Exit codes: 0 / 1 invalid stage / 2 declined / 3 write
+      failure. Both upgrades and downgrades allowed —
+      downgrade-to-shadow is the safety win after an incident.
+      ``--actor`` defaults to ``getpass.getuser()``. 11 new
+      tests in ``test_rollout.py`` + 2 in test_tools.py + 6 in
+      test_cli.py; 489 total green.
 - [x] **M2.4 — Daily-budget hard guard (env backstop)** — closes
       §M2.4. ``build_safety_pair`` now applies an env-level
       backstop on the account budget cap: every Policy is built
@@ -660,19 +684,3 @@ Last 10 items (newest at top). Older items are available via
       16-hex-char ids. 28 new tests (plans + CLI smoke; 350 total).
       Orchestrator / @requires_plan decorator / apply-plan
       executor land in the next PR.
-- [x] **M2.1 — Unified Policy schema** — single frozen pydantic
-      `Policy` aggregates all 7 slice-policies plus §M2.1's four
-      groups (approval tiers, per-op thresholds, forbidden_ops,
-      rollout_stage). YAML stays flat; `load_policy(path)` routes
-      each key to its slice and rejects unknown keys loudly.
-      64 KiB file-size guard against billion-laughs YAML. Seven
-      individual `load_*_policy` helpers remain for backwards
-      compat. `forbidden_operations` has a `field_validator` that
-      rejects blank entries and normalises case/whitespace so the
-      M2.2 pipeline can do case-insensitive lookup. Sync-test
-      pins `_*_KEYS` frozensets == slice `model_fields` to catch
-      the "add field, forget key map" maintenance trap. 23 new
-      tests (199 safety / 322 total). Reviewed by
-      `security-auditor` — MEDIUM + 3 LOW + 1 DESIGN all closed
-      in-PR; `auto_approve_negative_keywords` default explicitly
-      flagged for M2.2 decision.
