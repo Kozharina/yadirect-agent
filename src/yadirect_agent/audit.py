@@ -387,13 +387,39 @@ async def audit_action(
             # the original API failure. Log loudly so the broken
             # sink surfaces in operator-visible logs, then fall
             # through to the bare ``raise`` below which re-raises
-            # the original ``exc``. Auditor M2.3a ADVISORY-1.
+            # the original ``exc``. ``structlog.exception`` captures
+            # ``sink_exc``'s traceback intentionally — that's what
+            # we want surfaced in the sink-bug log line; the
+            # original exception type is recorded explicitly via
+            # ``wrapped_error_type`` for log viewers that don't
+            # render ``__context__`` chains. Auditor M2.3a
+            # ADVISORY-1.
             structlog.get_logger(__name__).exception(
                 "audit_emit_programmer_error_in_failure_path",
                 action=f"{action}.failed",
                 wrapped_error_type=type(exc).__name__,
                 sink_error_type=type(sink_exc).__name__,
             )
+        except BaseException as sink_exc:
+            # ``CancelledError`` / ``KeyboardInterrupt`` /
+            # ``SystemExit`` are BaseException-only and bypass the
+            # ``except Exception`` clause above. Without this
+            # explicit branch they propagate silently; the original
+            # wrapped exception still survives via Python's automatic
+            # ``__context__`` chain, but log viewers that don't
+            # render the chain see only the cancellation. Emit a
+            # structured log entry naming both error types so the
+            # operator's debugging path stays visible, then re-raise
+            # the cancellation — task infrastructure requires that
+            # signal to propagate. Auditor M2.3a-narrow second-pass
+            # HIGH.
+            structlog.get_logger(__name__).warning(
+                "audit_emit_cancelled_in_failure_path",
+                action=f"{action}.failed",
+                wrapped_error_type=type(exc).__name__,
+                sink_error_type=type(sink_exc).__name__,
+            )
+            raise
         raise
 
     ok = AuditEvent(
