@@ -152,7 +152,7 @@ def list_campaigns_cmd(
         str | None,
         typer.Option(
             "--state",
-            help="ON | OFF | SUSPENDED | ENDED | CONVERTED | ARCHIVED (repeatable).",
+            help="ON | OFF | SUSPENDED | ENDED | CONVERTED | ARCHIVED.",
         ),
     ] = None,
     as_json: Annotated[
@@ -160,14 +160,38 @@ def list_campaigns_cmd(
         typer.Option("--json", help="Emit JSON to stdout instead of a table."),
     ] = False,
 ) -> None:
-    """Direct pass-through to CampaignService — no LLM involved."""
+    """Direct pass-through to CampaignService — no LLM involved.
+
+    ``--state`` filters the result client-side. We always fetch
+    ``list_all()`` and apply the filter in Python rather than
+    routing through ``list_active()`` (which hardcodes ON+SUSPENDED
+    and was previously called for every non-empty ``state``,
+    silently ignoring the requested value — auditor finding).
+    Invalid state values are rejected with a non-zero exit so a
+    typo can't masquerade as "no campaigns in that state".
+    """
+    from ..models.campaigns import CampaignState
+
+    requested_state: str | None = None
+    if state is not None:
+        normalised = state.strip().upper()
+        valid = {s.value for s in CampaignState}
+        if normalised not in valid:
+            valid_list = ", ".join(sorted(valid))
+            raise typer.BadParameter(
+                f"invalid state {state!r}; expected one of: {valid_list}",
+                param_hint="--state",
+            )
+        requested_state = normalised
+
     settings = _bootstrap_settings()
     service = CampaignService(settings)
 
     async def fetch() -> list[CampaignSummary]:
-        if state is None:
-            return await service.list_all()
-        return await service.list_active()
+        summaries = await service.list_all()
+        if requested_state is None:
+            return summaries
+        return [s for s in summaries if s.state == requested_state]
 
     summaries = asyncio.run(fetch())
     if as_json:

@@ -99,6 +99,118 @@ def test_list_campaigns_empty_state(
     assert "no campaigns" in result.output
 
 
+def test_list_campaigns_state_filter_returns_only_matching_state(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_bootstrap: None,
+) -> None:
+    """Auditor finding: ``--state`` is silently ignored — the CLI
+    branches to ``list_active()`` whenever ``state is not None``,
+    but ``list_active`` hardcodes ``[ON, SUSPENDED]`` regardless of
+    the requested filter. Pin the expected behaviour: ``--state OFF``
+    must surface ONLY OFF campaigns.
+    """
+    from yadirect_agent.services.campaigns import CampaignService
+
+    async def fake_list_all(self: CampaignService, _limit: int = 500) -> list:
+        return [
+            CampaignSummary(
+                id=1,
+                name="on-1",
+                state="ON",
+                status="ACCEPTED",
+                type="TEXT_CAMPAIGN",
+                daily_budget_rub=500.0,
+            ),
+            CampaignSummary(
+                id=2,
+                name="off-1",
+                state="OFF",
+                status="ACCEPTED",
+                type="TEXT_CAMPAIGN",
+                daily_budget_rub=300.0,
+            ),
+            CampaignSummary(
+                id=3,
+                name="off-2",
+                state="OFF",
+                status="ACCEPTED",
+                type="TEXT_CAMPAIGN",
+                daily_budget_rub=200.0,
+            ),
+            CampaignSummary(
+                id=4,
+                name="archived-1",
+                state="ARCHIVED",
+                status="ACCEPTED",
+                type="TEXT_CAMPAIGN",
+                daily_budget_rub=0.0,
+            ),
+        ]
+
+    monkeypatch.setattr(CampaignService, "list_all", fake_list_all)
+
+    result = runner.invoke(app, ["list-campaigns", "--state", "OFF", "--json"])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout.strip().splitlines()[-1])
+    assert {row["id"] for row in data} == {2, 3}
+    assert all(row["state"] == "OFF" for row in data)
+
+
+def test_list_campaigns_state_filter_normalises_case(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_bootstrap: None,
+) -> None:
+    """Operator typing ``--state off`` (lowercase) is the same intent
+    as ``--state OFF``. Direct's ``CampaignState`` enum is uppercase;
+    the CLI must normalise so the filter doesn't silently drop every
+    row on a case mismatch."""
+    from yadirect_agent.services.campaigns import CampaignService
+
+    async def fake_list_all(self: CampaignService, _limit: int = 500) -> list:
+        return [
+            CampaignSummary(
+                id=1,
+                name="off-1",
+                state="OFF",
+                status="ACCEPTED",
+                type="TEXT_CAMPAIGN",
+                daily_budget_rub=300.0,
+            ),
+        ]
+
+    monkeypatch.setattr(CampaignService, "list_all", fake_list_all)
+
+    result = runner.invoke(app, ["list-campaigns", "--state", "off", "--json"])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout.strip().splitlines()[-1])
+    assert [row["id"] for row in data] == [1]
+
+
+def test_list_campaigns_state_filter_rejects_unknown_state(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_bootstrap: None,
+) -> None:
+    """Typo / invalid state must error loudly rather than silently
+    return an empty result (which would be indistinguishable from
+    "no campaigns in that state" — operator confusion guaranteed)."""
+    from yadirect_agent.services.campaigns import CampaignService
+
+    async def fake_list_all(self: CampaignService, _limit: int = 500) -> list:
+        return []
+
+    monkeypatch.setattr(CampaignService, "list_all", fake_list_all)
+
+    result = runner.invoke(app, ["list-campaigns", "--state", "YOLO"])
+
+    assert result.exit_code != 0
+    assert "YOLO" in result.output or "invalid" in result.output.lower()
+
+
 def test_run_dispatches_into_agent_run(
     runner: CliRunner,
     monkeypatch: pytest.MonkeyPatch,
