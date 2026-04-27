@@ -54,7 +54,14 @@ evals exercise the full safety surface.)*
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **M7.2 — agent evals framework** (branch
+      ``feat/m7.2-evals-framework``) — first PR: eval runner
+      skeleton + ``EvalResult`` metrics shape + 2-3 starter evals
+      covering safety happy path, reject path, confirm path.
+      ``make evals`` target. Wires up ``FakeAnthropic`` +
+      service fakes for cost-free regression testing of agent
+      reasoning. Subsequent PRs add evals incrementally as M4 /
+      M5 / M6 features land.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
