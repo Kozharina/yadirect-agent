@@ -499,6 +499,42 @@ def _make_validate_phrases_tool(settings: Settings) -> Tool:
 # --------------------------------------------------------------------------
 
 
+def _apply_env_backstop(policy: Policy, settings: Settings) -> Policy:
+    """Tighten the Policy's account budget cap with the env-level
+    backstop ``settings.agent_max_daily_budget_rub`` (M2.4).
+
+    The function is purely-functional: returns either the original
+    ``policy`` (when the env is loose enough that ``min`` picks the
+    YAML) or a deep-copied ``Policy`` with a new
+    ``budget_cap.account_daily_budget_cap_rub``.
+
+    Logs a structured ``env_backstop`` warning whenever it actually
+    tightens — silent tightening would be a "why is the agent
+    rejecting valid budgets" debugging trap.
+    """
+    yaml_cap = policy.budget_cap.account_daily_budget_cap_rub
+    env_cap = settings.agent_max_daily_budget_rub
+    effective = min(yaml_cap, env_cap)
+    if effective == yaml_cap:
+        return policy
+
+    structlog.get_logger(__name__).warning(
+        "env_backstop_tightening_account_cap",
+        yaml_cap_rub=yaml_cap,
+        env_cap_rub=env_cap,
+        effective_cap_rub=effective,
+        note=(
+            "AGENT_MAX_DAILY_BUDGET_RUB is tighter than the YAML's "
+            "account_daily_budget_cap_rub; env wins. Mutations now "
+            "reject above the env ceiling."
+        ),
+    )
+    new_budget_cap = policy.budget_cap.model_copy(
+        update={"account_daily_budget_cap_rub": effective}
+    )
+    return policy.model_copy(update={"budget_cap": new_budget_cap})
+
+
 def build_safety_pair(
     settings: Settings,
 ) -> tuple[SafetyPipeline, PendingPlansStore, JsonlSink]:
@@ -550,6 +586,17 @@ def build_safety_pair(
                 require_all_baseline_goals_present=True,
             ),
         )
+
+    # M2.4 daily-budget hard guard: ``AGENT_MAX_DAILY_BUDGET_RUB``
+    # is the deployment-time ceiling. If it's tighter than the
+    # YAML's ``account_daily_budget_cap_rub`` (typo / stale
+    # checkout / generous YAML in dev that leaked to staging), the
+    # env wins. We tighten the Policy at build time rather than
+    # adding a second check — KS#1 BudgetCapCheck stays the single
+    # enforcement point with one audit reason; the env is just one
+    # more input into the cap. ``min`` always picks the safer
+    # number; if the YAML is already tighter, this is a no-op.
+    policy = _apply_env_backstop(policy, settings)
 
     pipeline = SafetyPipeline(policy)
     store = PendingPlansStore(settings.audit_log_path.parent / "pending_plans.jsonl")

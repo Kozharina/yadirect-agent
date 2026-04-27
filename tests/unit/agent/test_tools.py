@@ -263,17 +263,20 @@ class TestEnvBackstop:
         assert pipeline.policy.budget_cap.account_daily_budget_cap_rub == 7_500
 
     def test_env_backstop_logged_when_tightening(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Operators MUST see a structured log line when the env-
         backstop kicks in — silent tightening would be a "why is the
         agent rejecting valid budgets" debugging trap.
-        """
-        import logging
 
+        We capture via a structlog logger stub since the project's
+        ``configure_logging`` may route to JSON / console / stdlib
+        depending on settings, and ``caplog`` only sees stdlib
+        records reliably.
+        """
         from pydantic import SecretStr
 
-        from yadirect_agent.agent.tools import build_safety_pair
+        from yadirect_agent.agent import tools as tools_mod
         from yadirect_agent.config import Settings
 
         yaml_path = tmp_path / "agent_policy.yml"
@@ -292,13 +295,25 @@ class TestEnvBackstop:
             audit_log_path=tmp_path / "logs" / "audit.jsonl",
         )
 
-        with caplog.at_level(logging.WARNING):
-            build_safety_pair(settings)
+        warnings: list[tuple[str, dict[str, Any]]] = []
 
-        # Either stdlib or structlog can produce the message — check
-        # the records directly.
-        tightening_logs = [r for r in caplog.records if "env_backstop" in r.message]
-        assert len(tightening_logs) == 1
+        class _StubLogger:
+            def warning(self, event: str, **kwargs: Any) -> None:
+                warnings.append((event, kwargs))
+
+        monkeypatch.setattr(tools_mod.structlog, "get_logger", lambda *args, **kw: _StubLogger())
+
+        tools_mod.build_safety_pair(settings)
+
+        events = [event for event, _ in warnings]
+        assert "env_backstop_tightening_account_cap" in events
+        # The logged kwargs include the explicit caps so an operator
+        # can grep for the threshold values.
+        idx = events.index("env_backstop_tightening_account_cap")
+        kwargs = warnings[idx][1]
+        assert kwargs["yaml_cap_rub"] == 100_000
+        assert kwargs["env_cap_rub"] == 5_000
+        assert kwargs["effective_cap_rub"] == 5_000
 
 
 # --------------------------------------------------------------------------
