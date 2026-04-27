@@ -38,6 +38,23 @@ from mcp.server.lowlevel import Server
 from ..agent.tools import Tool, ToolContext, ToolRegistry, build_default_registry
 from ..config import Settings
 
+# Write tools that are NOT yet wrapped with @requires_plan and therefore
+# MUST NOT be exposed over MCP even with --allow-write. Each entry here
+# is a hard scope boundary for the M3 release: agent can read, agent
+# can run gated mutations through pause/resume/set_campaign_budget, but
+# agent CANNOT call ungated write surfaces. Promote a name out of this
+# denylist in the same PR that adds @requires_plan to the underlying
+# service method. Auditor M3 MEDIUM M-2.
+_MCP_WRITE_TOOLS_DENYLIST: frozenset[str] = frozenset(
+    {
+        # ``BiddingService.apply`` is not yet @requires_plan-gated; the
+        # +50% per-call ceiling is a TODO in services/bidding.py. Until
+        # that lands, exposing this tool to a Claude Desktop agent would
+        # let it set arbitrary bids without safety review.
+        "set_keyword_bids",
+    }
+)
+
 
 @dataclass
 class McpServerHandle:
@@ -96,6 +113,13 @@ def build_mcp_server(settings: Settings, *, allow_write: bool) -> McpServerHandl
     published: list[mcp_types.Tool] = []
     for tool in registry:
         if tool.is_write and not allow_write:
+            continue
+        if tool.name in _MCP_WRITE_TOOLS_DENYLIST:
+            # Auditor M-2: a write tool that is not yet @requires_plan-
+            # gated must not be exposed over MCP even with --allow-write.
+            # Without the per-method gate, an MCP client could call this
+            # tool in a loop with no safety review, no plan, no audit.
+            # Promote out of the denylist only after the gate lands.
             continue
         exposed[tool.name] = tool
         published.append(

@@ -103,11 +103,30 @@ opt in to mutations by adding `--allow-write` (or
 ```
 
 Now the agent can also see `pause_campaigns`, `resume_campaigns`,
-`set_campaign_budget`, `set_keyword_bids`. **Every mutating call
-still flows through `@requires_plan`** — it returns
-`{status: "pending", plan_id: ...}` and you must run
-`yadirect-agent apply-plan <id>` from a terminal to actually apply.
-The MCP path cannot bypass that step.
+`set_campaign_budget`. **Every mutating call still flows through
+`@requires_plan`** — `set_campaign_budget` and `resume_campaigns`
+return `{status: "pending", plan_id: ...}` and you must run
+`yadirect-agent apply-plan <id>` from a terminal to actually
+apply. `pause_campaigns` is auto-approved by default
+(`auto_approve_pause=True` in the policy) and completes in one
+shot without an apply-plan step — it's reversible (just resume)
+and the audit JSONL records every pause regardless. The MCP
+path cannot bypass any of these.
+
+**`set_keyword_bids` is NOT exposed over MCP yet**, even with
+`--allow-write`. `BiddingService.apply` doesn't have its
+`@requires_plan` gate yet (KS#2 / KS#4 wiring is the next safety
+PR), and the MCP layer keeps it on a denylist until then —
+otherwise an MCP client could set arbitrary bids without a
+safety review. Run keyword bid changes through the in-process
+agent loop (`yadirect-agent run "..."`) until the gate lands.
+
+**Flag/env precedence**: `--allow-write` and `MCP_ALLOW_WRITE` are
+both treated as enabling. The CLI flag wins on its own; the env
+can also enable. The env CANNOT disable a flag-set true. If you
+remove `--allow-write` from `args` to roll back to read-only,
+also clear `MCP_ALLOW_WRITE` from the `env` block — otherwise
+write mode silently stays on.
 
 ## Operator workflow with mutations
 

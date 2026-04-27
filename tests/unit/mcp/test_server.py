@@ -17,13 +17,17 @@ import pytest
 from yadirect_agent.mcp.server import build_mcp_server
 
 _READ_ONLY_TOOLS = {"list_campaigns", "get_keywords", "validate_phrases"}
-_WRITE_TOOLS = {
+_GATED_WRITE_TOOLS = {
     "pause_campaigns",
     "resume_campaigns",
     "set_campaign_budget",
-    "set_keyword_bids",
 }
-_ALL_TOOLS = _READ_ONLY_TOOLS | _WRITE_TOOLS
+# ``set_keyword_bids`` is on the MCP write-tool denylist until
+# ``BiddingService.apply`` gets ``@requires_plan`` (auditor M3 MEDIUM
+# M-2). Until then the tool is NEVER published over MCP, even with
+# ``--allow-write``.
+_DENYLISTED_WRITE_TOOLS = {"set_keyword_bids"}
+_ALL_EXPOSED_WITH_WRITE = _READ_ONLY_TOOLS | _GATED_WRITE_TOOLS
 
 
 class TestBuildMcpServer:
@@ -40,7 +44,8 @@ class TestBuildMcpServer:
         names = {t.name for t in handle.tools}
 
         assert _READ_ONLY_TOOLS.issubset(names)
-        assert names.isdisjoint(_WRITE_TOOLS)
+        assert names.isdisjoint(_GATED_WRITE_TOOLS)
+        assert names.isdisjoint(_DENYLISTED_WRITE_TOOLS)
 
     def test_allow_write_exposes_all_tools(self, settings: Any) -> None:
         """``--allow-write`` (or ``MCP_ALLOW_WRITE=true``) opts in to
@@ -53,7 +58,12 @@ class TestBuildMcpServer:
         handle = build_mcp_server(settings, allow_write=True)
         names = {t.name for t in handle.tools}
 
-        assert _ALL_TOOLS.issubset(names)
+        # Read-only + the three gated write tools are exposed.
+        assert _ALL_EXPOSED_WITH_WRITE.issubset(names)
+        # Auditor M3 M-2: denylisted write tools (currently
+        # set_keyword_bids) are NEVER published, even with
+        # --allow-write, until they get @requires_plan gating.
+        assert names.isdisjoint(_DENYLISTED_WRITE_TOOLS)
 
     def test_tool_input_schemas_match_pydantic_models(self, settings: Any) -> None:
         """Each MCP tool's inputSchema must come from the pydantic
@@ -75,6 +85,21 @@ class TestBuildMcpServer:
         # propagate so Claude Desktop's MCP client rejects unknown
         # fields before they ever reach our handler.
         assert scb.inputSchema.get("additionalProperties") is False
+
+    def test_denylisted_write_tool_never_dispatchable_even_with_allow_write(
+        self, settings: Any
+    ) -> None:
+        """Auditor M3 M-2 regression guard: a write tool on the
+        denylist (``set_keyword_bids`` today) MUST refuse to dispatch
+        even when the operator passed ``--allow-write``. The tool is
+        not registered, so ``dispatch`` looks up ``_exposed`` and
+        misses — surfacing as ``ValueError("unknown tool ...")``.
+        """
+        import asyncio
+
+        handle = build_mcp_server(settings, allow_write=True)
+        with pytest.raises(ValueError, match="unknown tool"):
+            asyncio.run(handle.dispatch("set_keyword_bids", {"updates": []}))
 
     def test_tool_descriptions_propagate(self, settings: Any) -> None:
         """The agent in Claude Desktop relies on the ``description``
