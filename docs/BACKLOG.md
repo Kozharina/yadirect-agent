@@ -31,9 +31,33 @@ Each one is TDD, with `security-auditor` sub-agent review before merge.
 All seven reference
 [`docs/PRIOR_ART.md`](./PRIOR_ART.md) → "Agentic PPC Campaign Management".
 
-- [ ] **M2.3: Audit sink** — `audit.py::AuditEvent`, JSONL async writer,
-      `*.requested` / `*.ok` / `*.failed` emissions in every mutating
-      service method.
+- [ ] **M2.3b: Audit sink wiring** — wire ``audit_action`` (already
+      shipped via M2.3a in audit.py) into ``CampaignService.set_daily_budget``,
+      ``apply_plan`` executor, and ``build_default_registry`` (which
+      now constructs a shared ``JsonlSink`` alongside the
+      pipeline+store). Every mutating call emits
+      ``<action>.requested`` before and ``<action>.ok|.failed`` after.
+      Sink-level redaction strips ``new_queries_sample`` (KS#7) and
+      ``missing`` (KS#3). Privacy walk already done by the M2.3a
+      second-pass auditor — every other ``CheckResult.details`` key
+      across KS#1–7 + pipeline gatekeepers is safe (numeric / id /
+      threshold). Two pre-merge decisions remain:
+
+      1. **``group`` (KS#1) decision** — ``BudgetCapCheck.details``
+         carries ``group: str`` (operator-defined campaign group
+         label). Not PII per se but may encode advertiser names,
+         competitive verticals, or budget-tier strategies. Decide:
+         (a) add to ``_PRIVATE_KEYS`` if labels are commercially
+         sensitive, or (b) accept as safe-as-is and document the
+         posture inline. The choice is operator-policy-bound; pick
+         one in the M2.3b PR.
+
+      2. **KS#3 reason-string interpolation** — see separate
+         BACKLOG item below; pick a remediation option (count /
+         hash / accept) and land it in M2.3b.
+
+      Verify pause/resume + future bidding methods inherit the
+      wrapper before claiming "everything is audited".
 - [ ] **M2.4: Daily-budget hard guard** — pre-op check that summed
       active-campaign budgets stay ≤ `AGENT_MAX_DAILY_BUDGET_RUB`.
 - [ ] **M2.5: Staged rollout** — `rollout_stage` field in policy,
@@ -98,6 +122,60 @@ Accumulated work that isn't blocking but will sting later.
     decision was made on. Alternatively, persist the minimal
     identity (keyword_id → approved ceiling) inside
     `OperationPlan.args` and reconstruct at apply time.
+
+- [ ] **Audit emit guards: narrow `except Exception` to `OSError`**
+      (from PR M2.3a second-pass auditor ADVISORY-1; non-blocking):
+      ``audit_action``'s success / failure-path emit guards swallow
+      every ``Exception``, but the documented intent is "I/O
+      failures don't mask the wrapped operation". A custom sink
+      raising ``ValidationError`` (programmer bug — malformed
+      AuditEvent in a future sink subclass) or ``TypeError`` /
+      ``AttributeError`` (silent runtime error) would be hidden
+      behind a structlog warning. Tighten to ``OSError`` or at
+      minimum re-raise programmer-error classes. Document the gap
+      between intent and implementation in the inline comment.
+
+- [ ] **Audit module: bind ``_logger`` once at module level**
+      (from PR M2.3a second-pass auditor ADVISORY-2; non-blocking
+      stylistic): ``audit_action`` calls
+      ``structlog.get_logger(__name__)`` at each except site rather
+      than at module import. Cheap (proxy object) but inconsistent
+      with the rest of the codebase. Replace with a single
+      ``_logger = structlog.get_logger(__name__)`` binding next to
+      the other module-level constants.
+
+- [ ] **KS#3 ``CheckResult.reason`` leaks operator-supplied negative
+      keywords** (from PR M2.3a auditor M-2 follow-up): the audit
+      sink's ``redact_for_audit`` strips the ``missing`` details key
+      cleanly, but ``CheckResult.reason`` is a free-form string that
+      KS#3 builds via f-string interpolation
+      (``"campaign 42 is missing required negative keywords: BrandX,
+      Competitor Y, sensitive medical phrase"`` at safety.py:651-652).
+      Free-form strings cannot be redacted by a key-based blocklist;
+      the reason is persisted into AuditEvent.action="*.failed" /
+      ``result.error_message`` paths verbatim. Decide between:
+      (a) replace the joined-list with a count
+      (``"... missing 3 required negative keywords"``);
+      (b) hash each phrase before inclusion;
+      (c) accept the leak as policy-bound (operator owns the YAML
+      that supplied the phrases).
+
+- [ ] **Audit JSONL durability — fsync on emit** (from PR M2.3a
+      auditor M-3): ``JsonlSink._append`` calls ``open().close()``
+      which flushes Python's buffer to the OS but does not call
+      ``fsync``. A power loss / SIGKILL between close-return and the
+      OS-buffer flush silently loses the most recent event. Single-
+      operator local use is acceptable today; for compliance /
+      regulatory archival add ``f.flush(); os.fsync(f.fileno())``
+      before the context manager exits, accepting the latency hit
+      (50–200 µs per emit on consumer SSD).
+
+- [ ] **Audit JSONL rotation** (from PR M2.3a hunt list): a long-
+      running agent fills ``audit.jsonl`` forever. Rotation is
+      out-of-scope for the data layer but should land alongside the
+      first deployment that runs more than a week. Either a sidecar
+      ``logrotate`` config or a built-in size-based rotator inside
+      ``JsonlSink``.
 
 - [ ] **M2 mutating methods awaiting `@requires_plan` gating**
       (from PR-B1 auditor HIGH-1; track before claiming "all
@@ -441,6 +519,25 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2.3a — Audit sink module (data layer)** — first slice of
+      §M2.3. ``src/yadirect_agent/audit.py`` ships ``AuditEvent``
+      (frozen pydantic, ``extra="forbid"``,
+      ``actor`` Literal{agent,human,system}), an ``AuditSink``
+      Protocol so a future deployment can swap JSONL for Kafka /
+      Postgres without touching service code, and a default
+      ``JsonlSink`` that ``asyncio.to_thread``-wraps the blocking
+      ``open(..., "a")`` so the agent's event loop never stalls
+      on disk I/O. ``audit_action`` async context manager emits
+      ``<action>.requested`` on entry and ``<action>.ok`` (with
+      ``ctx.set_result()`` + ``ctx.set_units_spent()`` payloads)
+      or ``<action>.failed`` (preserving partial result +
+      appending error_type/error_message + re-raising the
+      original) on exit. Sink-level redaction via
+      ``redact_for_audit`` walks dicts/lists and drops
+      ``_PRIVATE_KEYS = {"new_queries_sample"}`` — same blocklist
+      the tools-layer response redactor uses (PR #25), defence in
+      depth. 16 new tests; 450 total green. Wiring into services
+      lands in M2.3b.
 - [x] **M2.2 part 3b2 — `apply-plan` CLI** — closes M2.2.
       ``yadirect-agent apply-plan <id>`` re-reviews the stored plan
       against its original ReviewContext, dispatches via a service
@@ -582,18 +679,3 @@ Last 10 items (newest at top). Older items are available via
       (negative-count bypass + counter_id mismatch) closed in-PR;
       2 design items moved to Tech debt (global-gatekeeper marker
       for M2.2, warn-in-autonomous-mode policy for M2.2).
-- [x] **M2 Kill-switch #5 — Budget-balance drift** —
-      `BudgetBalanceDriftCheck` refuses plans that shift any
-      campaign's share of active daily budget more than
-      `max_shift_pct_per_day` (default 0.3, `gt=0, le=1`) vs. a
-      baseline snapshot. First kill-switch with a temporal
-      dimension. Reuses `AccountBudgetSnapshot` + `BudgetChange`;
-      projects changes via shared `BudgetCapCheck._project`. IEEE
-      754 boundary handled with `math.isclose(abs_tol=1e-14)`.
-      Empty baseline → `warn` (not `ok`) to surface first-run /
-      missing-backfill cases in M2.3 audit. 22 new tests (120
-      safety, 244 across the suite). Reviewed by `security-auditor`
-      — three findings closed in-PR (tolerance tightened, empty
-      baseline warns, details payload carries baseline_total_rub);
-      one MEDIUM (baseline provenance) + one DESIGN (ceiling
-      warning) escalated to Tech debt.
