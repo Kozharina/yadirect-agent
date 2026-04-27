@@ -54,7 +54,12 @@ evals exercise the full safety surface.)*
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **Dedupe `_infer_actor` between Campaign / Bidding services**
+      (branch ``refactor/dedupe-infer-actor``) — extract the
+      frame-walking helper into ``audit.infer_actor_from_frame()``
+      so a future tightening (replace frame walk with explicit
+      kwarg threading) lands in one place. Auditor M2-bidding L-1
+      tech-debt entry.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
