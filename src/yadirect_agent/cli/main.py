@@ -722,6 +722,81 @@ _ = AuditEvent
 
 
 # --------------------------------------------------------------------------
+# `mcp` — Model Context Protocol server (M3).
+#
+# ``yadirect-agent mcp serve`` exposes the seven existing tools over MCP
+# stdio so a Claude Desktop / Claude Code agent can drive the account
+# through the same handlers the in-process agent loop uses. By default
+# write tools (pause / resume / set_*) are NOT registered — the LLM
+# literally cannot see them. Use ``--allow-write`` (or
+# ``MCP_ALLOW_WRITE=true``) to opt in. Mutations still flow through the
+# safety pipeline + plan→confirm→execute, so an MCP-driven mutation
+# returns ``{status: pending, plan_id: ...}`` and the operator must run
+# ``yadirect-agent apply-plan <id>`` from a terminal to actually apply.
+# --------------------------------------------------------------------------
+
+
+mcp_app = typer.Typer(
+    name="mcp",
+    help="Run yadirect-agent as a Model Context Protocol server.",
+    no_args_is_help=True,
+)
+app.add_typer(mcp_app, name="mcp")
+
+
+@mcp_app.command("serve")
+def mcp_serve_cmd(
+    allow_write: Annotated[
+        bool,
+        typer.Option(
+            "--allow-write",
+            help=(
+                "Expose mutating tools (pause / resume / set_*) to the MCP "
+                "client. Off by default — mutations still flow through "
+                "@requires_plan and need an out-of-band apply-plan from "
+                "the operator's terminal. Equivalent env var: "
+                "MCP_ALLOW_WRITE=true."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Run the MCP server over stdio. Foreground process.
+
+    Designed to be launched by Claude Desktop / Claude Code via the
+    ``mcpServers`` configuration block (see docs/CLAUDE_DESKTOP.md).
+    Logs go to stderr in JSON; stdout is reserved for the MCP
+    protocol stream.
+    """
+    import os
+
+    from ..mcp.server import build_mcp_server
+
+    settings = _bootstrap_settings()
+    # ``--allow-write`` CLI flag wins; otherwise fall back to env.
+    if not allow_write and os.environ.get("MCP_ALLOW_WRITE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }:
+        allow_write = True
+
+    handle = build_mcp_server(settings, allow_write=allow_write)
+    asyncio.run(_run_mcp_stdio(handle))
+
+
+async def _run_mcp_stdio(handle: Any) -> None:
+    """Connect the MCP server to stdio and pump messages until the
+    client disconnects. Factored out so unit tests can construct
+    the handle without binding to stdio.
+    """
+    from mcp.server.stdio import stdio_server
+
+    async with stdio_server() as (read_stream, write_stream):
+        await handle.server.run(
+            read_stream,
+            write_stream,
+            handle.server.create_initialization_options(),
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover
