@@ -664,3 +664,129 @@ def test_apply_plan_routes_resume_campaigns_to_service(
     final = PendingPlansStore(plans_path).get("plan-resume")
     assert final is not None
     assert final.status == "applied"
+
+
+# --------------------------------------------------------------------------
+# `mcp` subcommand (M3).
+# --------------------------------------------------------------------------
+
+
+def test_mcp_serve_command_documents_allow_write_in_help_text() -> None:
+    """The ``--allow-write`` flag's help text must mention
+    ``MCP_ALLOW_WRITE`` so operators discover the env-var equivalent.
+    Read the typer.Option's ``help=`` field directly via
+    ``get_type_hints(include_extras=True)`` rather than via
+    ``--help`` rendered output — rich + typer interleave ANSI
+    escapes inside the flag name in non-tty CI terminals, which
+    breaks any substring assertion on the rendered text.
+    """
+    import inspect
+    import typing
+
+    from yadirect_agent.cli.main import mcp_serve_cmd
+
+    sig = inspect.signature(mcp_serve_cmd)
+    assert "allow_write" in sig.parameters
+    assert mcp_serve_cmd.__doc__ is not None
+
+    hints = typing.get_type_hints(mcp_serve_cmd, include_extras=True)
+    metadata = typing.get_args(hints["allow_write"])[1:]  # skip bool
+    option_helps = [getattr(m, "help", "") or "" for m in metadata if hasattr(m, "help")]
+    combined = " ".join(option_helps)
+    assert "MCP_ALLOW_WRITE" in combined, combined
+
+
+def test_mcp_serve_help_command_exits_cleanly(runner: CliRunner) -> None:
+    """Companion guard: ``yadirect-agent mcp serve --help`` exits
+    cleanly. Together with the help-text doc test above this
+    guarantees operators can discover the flag without needing a
+    rendering-sensitive substring match.
+    """
+    result = runner.invoke(app, ["mcp", "serve", "--help"])
+    assert result.exit_code == 0
+
+
+def test_mcp_serve_invokes_build_mcp_server_with_allow_write_default_false(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without ``--allow-write`` and without ``MCP_ALLOW_WRITE`` env,
+    the CLI passes ``allow_write=False`` to ``build_mcp_server``.
+    Stdio transport is mocked so the test doesn't hang.
+    """
+    captured: dict[str, Any] = {}
+
+    def fake_build(s: Any, *, allow_write: bool) -> Any:
+        captured["allow_write"] = allow_write
+
+        class _Handle:
+            class _Server:
+                async def run(self, *a: Any, **kw: Any) -> None:
+                    return None
+
+                def create_initialization_options(self) -> dict[str, Any]:
+                    return {}
+
+            server = _Server()
+
+        return _Handle()
+
+    async def fake_run_stdio(handle: Any) -> None:
+        # Mock out stdio binding entirely.
+        return None
+
+    from yadirect_agent.cli import main as cli_main
+
+    monkeypatch.setattr(cli_main, "_run_mcp_stdio", fake_run_stdio)
+    monkeypatch.setenv("MCP_ALLOW_WRITE", "")
+
+    # Patch the import inside the command body so build_mcp_server stays
+    # mocked.
+    monkeypatch.setattr("yadirect_agent.mcp.server.build_mcp_server", fake_build)
+
+    result = runner.invoke(app, ["mcp", "serve"])
+    assert result.exit_code == 0, result.output
+    assert captured["allow_write"] is False
+
+
+def test_mcp_serve_respects_env_allow_write_true(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``MCP_ALLOW_WRITE=true`` env enables write tools when the CLI
+    flag isn't passed. Confirms operators can configure the gating
+    posture via the deployment env without changing the launch command.
+    """
+    captured: dict[str, Any] = {}
+
+    def fake_build(s: Any, *, allow_write: bool) -> Any:
+        captured["allow_write"] = allow_write
+
+        class _Handle:
+            class _Server:
+                async def run(self, *a: Any, **kw: Any) -> None:
+                    return None
+
+                def create_initialization_options(self) -> dict[str, Any]:
+                    return {}
+
+            server = _Server()
+
+        return _Handle()
+
+    async def fake_run_stdio(handle: Any) -> None:
+        return None
+
+    from yadirect_agent.cli import main as cli_main
+
+    monkeypatch.setattr(cli_main, "_run_mcp_stdio", fake_run_stdio)
+    monkeypatch.setenv("MCP_ALLOW_WRITE", "true")
+    monkeypatch.setattr("yadirect_agent.mcp.server.build_mcp_server", fake_build)
+
+    result = runner.invoke(app, ["mcp", "serve"])
+    assert result.exit_code == 0
+    assert captured["allow_write"] is True

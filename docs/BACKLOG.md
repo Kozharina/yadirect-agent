@@ -36,14 +36,7 @@ inside other milestones: M3 MCP `--allow-write` gating builds on
 M2's pipeline; M5 A/B testing service inherits M2 audit; M7
 evals exercise the full safety surface.)*
 
-### 🔌 M3 — MCP server
-
-- [ ] **M3.1 + M3.2: MCP bootstrap + flag gating** (§M3): reuse the
-      `ToolRegistry` from M1; `--allow-write` flag (or
-      `MCP_ALLOW_WRITE=true`); structured results + human-readable
-      strings from each tool. Use skill `mcp-builder` as reference.
-- [ ] **M3.3: Claude Desktop docs** — `docs/CLAUDE_DESKTOP.md` with a
-      ready-to-paste `mcpServers` JSON block.
+*(M3 fully shipped — see Done.)*
 
 ### 🔎 Semantics, A/B, reporting (later milestones)
 
@@ -530,6 +523,31 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M3 — MCP server (bootstrap + flag gating + Claude
+      Desktop docs)** — closes §M3 entirely. New module
+      ``yadirect_agent.mcp.server`` ships ``build_mcp_server`` +
+      ``McpServerHandle``: thin publishing wrapper over
+      ``build_default_registry`` reusing pipeline / store /
+      audit_sink / @requires_plan / 7 tool handlers. Read-only
+      mode (``allow_write=False``, default) hides write tools
+      from the LLM entirely — defence in depth on top of
+      @requires_plan. ``--allow-write`` (or env
+      ``MCP_ALLOW_WRITE=true``) opts in; mutations still flow
+      through plan→confirm→execute and require an out-of-band
+      ``yadirect-agent apply-plan <id>`` from the operator's
+      terminal. Schema preservation: each MCP tool's
+      ``inputSchema`` is the pydantic ``input_model``'s
+      ``model_json_schema()`` verbatim — ``extra="forbid"``
+      becomes ``additionalProperties: false`` so MCP clients
+      reject unknown fields before they reach our handler. New
+      ``yadirect-agent mcp serve`` typer subapp with
+      ``--allow-write`` flag and env fallback. ``ToolRegistry``
+      gains ``__iter__`` for clean walk. Operator runbook
+      ``docs/CLAUDE_DESKTOP.md`` shipped with copy-pasteable
+      Claude Desktop ``mcpServers`` JSON blocks (read-only +
+      write modes), full operator workflow, troubleshooting
+      table, and rollout-stage promotion sequence. 10 new tests
+      (7 server unit + 3 CLI smoke); 510 total green.
 - [x] **M2 follow-up — pause / resume gated through @requires_plan**
       — closes the HIGH-1 finding from PR-B1 second-pass auditor.
       ``CampaignService.pause`` and ``CampaignService.resume`` now
@@ -709,12 +727,3 @@ Last 10 items (newest at top). Older items are available via
       gatekeepers / per-op / tiers / session / skipped; 386 total).
       `security-auditor` pre-merge review: CRITICAL + 2 HIGH + 2
       MEDIUM + 1 LOW all addressed before green tree.
-- [x] **chore(deps): pin ruff version across pyproject + pre-commit** —
-      replaced `"ruff>=0.6"` with `"ruff==0.15.11"` in dev extras
-      and bumped `.pre-commit-config.yaml` `ruff-pre-commit` rev
-      from the stale `v0.8.4` to `v0.15.11`. Three sources of
-      truth (local venv / CI `pip install` / pre-commit hook)
-      now resolve to the same build, closing the version-skew
-      bug that had been hitting KS PRs as `ruff format --check`
-      CI failures on code that passed locally. Bumping ruff is
-      now a 3-file operation documented in both config comments.

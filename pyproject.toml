@@ -46,8 +46,11 @@ dev = [
 ]
 
 [project.scripts]
-# Two entrypoints — shared core, two adapters
-yadirect-mcp = "yadirect_agent.mcp_server.server:main"
+# Single entrypoint with sub-apps (run / chat / list-campaigns / plans /
+# apply-plan / rollout / mcp / doctor). The MCP server is reachable via
+# ``yadirect-agent mcp serve`` — there is no separate ``yadirect-mcp``
+# binary. A previous ``yadirect-mcp`` script that pointed at a never-
+# implemented ``mcp_server`` package was removed in M3 (auditor M-1).
 yadirect-agent = "yadirect_agent.cli.main:app"
 
 [build-system]
@@ -76,6 +79,7 @@ strict = true
 warn_return_any = true
 disallow_untyped_defs = true
 plugins = ["pydantic.mypy"]
+
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

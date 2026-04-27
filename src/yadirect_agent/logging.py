@@ -36,7 +36,11 @@ def configure_logging(settings: Settings) -> None:
     if settings.log_format == "json":
         renderer: Any = structlog.processors.JSONRenderer()
     else:
-        renderer = structlog.dev.ConsoleRenderer(colors=sys.stdout.isatty())
+        # Check stderr (where the logs actually go) for tty, not
+        # stdout — under ``yadirect-agent mcp serve`` stdout is the
+        # MCP protocol stream and isatty() should not influence
+        # log-renderer styling decisions. Auditor M3 LOW-1.
+        renderer = structlog.dev.ConsoleRenderer(colors=sys.stderr.isatty())
 
     structlog.configure(
         processors=[*shared_processors, renderer],
