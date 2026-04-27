@@ -59,6 +59,16 @@ class ApiTransientError(YaDirectError):
     """Transient server/network error — safe to retry."""
 
 
+class ConfigError(Exception):
+    """Raised when a required configuration value is missing or invalid.
+
+    Distinct from ValidationError (which is about API inputs) — this one
+    means the operator hasn't finished setting up the agent. Examples:
+    Metrika counter_id required by ReportingService but not in env or
+    Settings; OAuth scope missing for the call we're trying to make.
+    """
+
+
 class AgentSafetyError(Exception):
     """Raised by the safety layer when an operation violates policy."""
 

@@ -51,10 +51,7 @@ demo-only, technically; it cannot be handed to a non-developer.
       status` surface. **Required before autonomy** — otherwise LLM
       spend creeps invisibly and the agent silently dies at
       month-end.
-- [ ] **M6 (basic) — Metrika reporting** (§M6): `get_goals`,
-      `get_report`, `conversion_by_source` — needed for the
-      Phase-0 first-look "вот что у тебя в кабинете" report and
-      for the rule-based health check (M15.5).
+- [x] ~~**M6 (basic) — Metrika reporting**~~ — shipped, see Done.
 
 ### 🛡️ Phase 2 (Assist) — release 0.3.0
 
@@ -151,6 +148,31 @@ the PR merges or is abandoned.
 ## Tech debt / follow-ups
 
 Accumulated work that isn't blocking but will sting later.
+
+- [ ] **MetrikaService report pagination** (M6 follow-up):
+      ``/stat/v1/data`` returns up to 100k rows by default. For an
+      account with thousands of keywords/campaigns over a long
+      window the report can exceed the cap and silently truncate.
+      Today ``get_report`` ignores the response's ``total_rows``
+      field and never paginates; for ``account_overview`` (one row
+      per campaign, no keyword breakdown) this is fine, but as
+      soon as a future caller groups by keyword or search query
+      we'll silently drop data. Fix when the first such caller
+      lands: read ``total_rows``, page via ``offset`` until
+      drained, surface a warning in audit if a single page is at
+      the cap. Defer until measurement says we're hitting it.
+
+- [ ] **MetrikaService TSV / dimension-id types** (M6 follow-up):
+      ``account_overview`` accepts campaign id as int OR numeric
+      string from Metrika's dimension envelope, depending on which
+      report endpoint version answered. Right now we accept both
+      and skip everything else. We should pin the tested behaviour
+      against an actual sandbox response (currently both paths are
+      synthetic in tests) before the M15.5 rule-based health check
+      starts depending on it for real-money decisions. Add a VCR
+      cassette against ``api-metrika.yandex.net`` once we have a
+      working sandbox token — runs gated by ``METRIKA_SANDBOX``
+      env var, scrubbed of OAuth tokens.
 
 - [ ] **`Policy.require_baseline_timestamp` knob for fail-closed
       snapshot freshness** (auditor M2-snapshot-age first-pass
@@ -632,6 +654,29 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M6 (basic) — Metrika reading** (§M6, Phase 0+1, release
+      0.2.0). Three Metrika endpoints
+      (`MetrikaService.get_goals`, `get_report`,
+      `get_conversion_by_source`) with retry, error mapping
+      (AuthError / ValidationError / RateLimitError /
+      ApiTransientError), and Authorization header validated to
+      use the Metrika token. New `services/reporting.py` with
+      `ReportingService.campaign_performance` (campaign-level
+      Direct↔Metrika join via ``ym:ad:directCampaignID==`` filter,
+      single Metrika query, all data sourced from Metrika's Direct
+      integration) and `account_overview` (batch view grouped by
+      ``ym:ad:directCampaignID``, no filter, defensive parsing of
+      mixed-type id field). New ``yandex_metrika_counter_id``
+      Settings knob (optional, ``ge=1``); ConfigError with
+      operator-pointing message when missing. ``cpa_rub`` and
+      ``cr_pct`` contract enforced centrally via ``_compute_cpa`` /
+      ``_compute_cr_pct``: None whenever undefined (zero
+      conversions / zero clicks / zero cost), never 0 or
+      infinity — the contract any future rule-based filter
+      (M15.5) must respect. ``DateRange`` invariant (end >=
+      start) on construction. 44 new unit tests
+      (12 model + 18 client + 14 service); 631 total green.
 
 - [x] **Audit emit guards narrowed to OSError** (auditor M2.3a
       ADVISORY-1). ``audit_action``'s emit-guards now distinguish

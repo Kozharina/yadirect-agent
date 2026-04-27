@@ -73,6 +73,16 @@ Takes ~10 minutes. This is where bad things hide.
 15. **Secret handling.** Tokens only through `SecretStr`. The one place
     where `.get_secret_value()` is called — typically a header builder —
     is obvious and isolated.
+16. **Metrika dimension privacy gate.** When a PR adds a new
+    `MetrikaService.get_report` call site, audit the `dimensions`
+    list against
+    [Metrika API reference](https://yandex.com/dev/metrika/doc/api2/api_v1/data.html).
+    User-identifying dimensions (`ym:s:clientIP`, `ym:s:userId`,
+    `ym:s:referer`, `ym:s:url`) MUST be raised in the PR description
+    and consulted with the privacy policy before merge. Bucketed
+    source labels (`ym:s:lastDirectClickSourceName`, `ym:ad:directCampaignID`)
+    are fine. (Reasoning lives on `ReportRow` docstring;
+    cross-checked here so reviewers can't miss it.)
 </tier_3_safety>
 
 ## <tier_4_tests>
