@@ -25,7 +25,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 import structlog
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..clients.direct import DirectService
 from ..clients.wordstat import DirectKeywordsResearch
@@ -135,7 +135,17 @@ class ToolRegistry:
 # --------------------------------------------------------------------------
 
 
+# Every tool input model uses ``extra="forbid"`` as defence-in-depth: a
+# silently-accepted unknown key today would be a wire vector tomorrow if
+# any handler ever forwarded fields into the wrapped service. Concretely
+# this prevents an LLM from sneaking ``_applying_plan_id`` into the
+# tool-call JSON to bypass the @requires_plan gate (auditor HIGH-2).
+_STRICT = ConfigDict(extra="forbid")
+
+
 class _ListCampaignsInput(BaseModel):
+    model_config = _STRICT
+
     states: list[str] | None = Field(
         default=None,
         description=(
@@ -146,10 +156,14 @@ class _ListCampaignsInput(BaseModel):
 
 
 class _IdListInput(BaseModel):
+    model_config = _STRICT
+
     ids: list[int] = Field(..., description="One or more campaign ids.")
 
 
 class _SetCampaignBudgetInput(BaseModel):
+    model_config = _STRICT
+
     campaign_id: int = Field(..., description="Target campaign id.")
     budget_rub: int = Field(
         ...,
@@ -159,6 +173,8 @@ class _SetCampaignBudgetInput(BaseModel):
 
 
 class _GetKeywordsInput(BaseModel):
+    model_config = _STRICT
+
     adgroup_ids: list[int] = Field(
         ...,
         min_length=1,
@@ -167,6 +183,8 @@ class _GetKeywordsInput(BaseModel):
 
 
 class _BidUpdateInput(BaseModel):
+    model_config = _STRICT
+
     keyword_id: int
     new_search_bid_rub: float | None = Field(
         default=None,
@@ -179,6 +197,8 @@ class _BidUpdateInput(BaseModel):
 
 
 class _SetKeywordBidsInput(BaseModel):
+    model_config = _STRICT
+
     updates: list[_BidUpdateInput] = Field(
         ...,
         min_length=1,
@@ -190,6 +210,8 @@ class _SetKeywordBidsInput(BaseModel):
 
 
 class _ValidatePhrasesInput(BaseModel):
+    model_config = _STRICT
+
     phrases: list[str] = Field(
         ...,
         min_length=1,
@@ -317,7 +339,13 @@ def _make_set_campaign_budget_tool(
             return {
                 "status": "rejected",
                 "reason": exc.reason,
-                "blocking": [{"status": r.status, "reason": r.reason} for r in exc.blocking],
+                # ``details`` carries the numerical context (projected
+                # totals, cap thresholds, etc.) the agent needs to
+                # explain *why* to the user. Include them — auditor LOW.
+                "blocking": [
+                    {"status": r.status, "reason": r.reason, "details": r.details}
+                    for r in exc.blocking
+                ],
             }
         ctx.logger.info(
             "tool.set_campaign_budget.ok",
@@ -454,6 +482,21 @@ def _build_safety_pair(settings: Settings) -> tuple[SafetyPipeline, PendingPlans
     if settings.agent_policy_path.exists():
         policy: Policy = load_policy(settings.agent_policy_path)
     else:
+        # Auditor MEDIUM: silent fallback is operationally invisible — an
+        # operator with a typo in AGENT_POLICY_PATH would never know why
+        # the agent returns rollout-stage rejections. Log the path we
+        # were looking for so the structured-log search resolves it.
+        # NB: with default rollout_stage="shadow" mutations are *rejected*
+        # in this fallback (intentionally — feature is off until configured).
+        structlog.get_logger(__name__).warning(
+            "policy_file_not_found",
+            path=str(settings.agent_policy_path),
+            note=(
+                "using default Policy with rollout_stage='shadow' "
+                "(read-only); mutations will be rejected until a real "
+                "agent_policy.yml is provided."
+            ),
+        )
         policy = Policy(
             budget_cap=BudgetCapPolicy(
                 account_daily_budget_cap_rub=settings.agent_max_daily_budget_rub,

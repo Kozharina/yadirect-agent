@@ -118,6 +118,49 @@ class TestDefaultRegistry:
         reg = build_default_registry(settings)
         assert reg.get(name).is_write is is_write
 
+    @pytest.mark.asyncio
+    async def test_input_models_reject_unknown_fields(self, settings: Settings) -> None:
+        # Defence-in-depth (auditor HIGH-2): the agent must not be able
+        # to sneak ``_applying_plan_id`` (or anything else) through the
+        # tool input pydantic model. extra="forbid" on every input
+        # model rejects unknown fields at validation.
+        from pydantic import ValidationError
+
+        reg = build_default_registry(settings)
+        tool = reg.get("set_campaign_budget")
+        with pytest.raises(ValidationError):
+            tool.input_model.model_validate(
+                {
+                    "campaign_id": 1,
+                    "budget_rub": 500,
+                    "_applying_plan_id": "agent-injected",
+                }
+            )
+
+    def test_build_safety_pair_called_once_per_registry(
+        self, settings: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # SafetyPipeline.SessionState (cross-tool TOCTOU register) only
+        # works if every CampaignService-backed tool sees the same
+        # pipeline object. The factories take ``(settings, pipeline,
+        # store)`` so they share a closure; this test pins that the
+        # registry construction calls ``_build_safety_pair`` exactly
+        # once. A future refactor that built per-tool pipelines would
+        # silently disable session-level TOCTOU protection.
+        from yadirect_agent.agent import tools as tools_mod
+
+        call_count = 0
+        original = tools_mod._build_safety_pair
+
+        def _counting(s: Settings) -> Any:
+            nonlocal call_count
+            call_count += 1
+            return original(s)
+
+        monkeypatch.setattr(tools_mod, "_build_safety_pair", _counting)
+        build_default_registry(settings)
+        assert call_count == 1
+
 
 # --------------------------------------------------------------------------
 # Per-tool handlers — dispatched against monkeypatched services.

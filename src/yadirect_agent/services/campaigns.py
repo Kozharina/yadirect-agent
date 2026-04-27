@@ -159,12 +159,22 @@ class CampaignService:
         return [CampaignSummary.from_model(c) for c in campaigns]
 
     async def pause(self, campaign_ids: list[int]) -> None:
+        # NB(M2): not yet wired through @requires_plan. Pause is fully
+        # reversible (the agent can always resume) so the spending-risk
+        # is bounded, but the rollout-stage gate, forbidden_operations
+        # check, and the §M2.1 ``auto_approve_pause`` knob are dead
+        # code on this path until decoration lands. Tracked in
+        # docs/BACKLOG.md "M2 mutating methods awaiting @requires_plan".
         self._logger.info("campaigns.pause.request", ids=campaign_ids)
         async with DirectService(self._settings) as api:
             await api.suspend_campaigns(campaign_ids)
         self._logger.info("campaigns.pause.ok", ids=campaign_ids)
 
     async def resume(self, campaign_ids: list[int]) -> None:
+        # NB(M2): same status as pause. Resume STARTS spending and is
+        # the primary trigger for KS#3 (negative-keyword floor) per
+        # the safety-spec; not yet @requires_plan-gated. Tracked in
+        # docs/BACKLOG.md "M2 mutating methods awaiting @requires_plan".
         self._logger.info("campaigns.resume.request", ids=campaign_ids)
         async with DirectService(self._settings) as api:
             await api.resume_campaigns(campaign_ids)

@@ -107,6 +107,41 @@ Accumulated work that isn't blocking but will sting later.
     identity (keyword_id → approved ceiling) inside
     `OperationPlan.args` and reconstruct at apply time.
 
+- [ ] **M2 mutating methods awaiting `@requires_plan` gating**
+      (from PR-B1 auditor HIGH-1; track before claiming "all
+      mutating ops gated"): `CampaignService.pause` and
+      `CampaignService.resume` are wired into the tools registry
+      with the shared `(SafetyPipeline, PendingPlansStore)` pair but
+      do not run their methods through the decorator yet. Pause is
+      reversible (low spending risk) but resume is the primary
+      KS#3 (negative-keyword floor) trigger per safety-spec — the
+      check is dead code on this path until decoration lands. Same
+      story for `BiddingService.apply` (KS#2 / KS#4) once it gets
+      its own `@requires_plan` wiring. Suggested order: resume →
+      bidding → pause (in the order of risk).
+
+- [ ] **Snapshot freshness at apply-plan time (archived-campaign
+      gap)** (from PR-B1 auditor MEDIUM-3; not blocking M2.3): the
+      ReviewContext serialised into `OperationPlan.review_context`
+      is built from `CampaignService.list_all()` (no state filter)
+      at plan creation. If the target campaign is archived between
+      plan creation and `apply-plan` execution, the snapshot still
+      shows it as `state=ARCHIVED, daily_budget_rub=0.0`. KS#1
+      arithmetic stays correct, but the eventual
+      `update_campaign_budget` wire call will fail. Consider
+      either (a) refresh snapshot at apply time and re-review
+      against fresh data, or (b) explicitly check `state == "ON"`
+      in the per-op check.
+
+- [ ] **Document `agent/__init__.py` public-API narrowing**
+      (from PR-B1 auditor INFO-2): the empty re-exports broke a
+      circular import (`services/campaigns.py → agent.executor →
+      agent.__init__ → tools → campaigns`). Anyone importing
+      `from yadirect_agent.agent import Agent` now gets ImportError.
+      Add a note in `docs/ARCHITECTURE.md` clarifying the
+      submodule-only public surface, and audit the README for any
+      stale flat-namespace examples.
+
 - [ ] **`apply-plan` concurrency / file-lock** (from PR-A auditor
       LOW; deferred, not blocking part 3b merge): two concurrent
       `apply_plan(<same_id>)` calls would both pass the
