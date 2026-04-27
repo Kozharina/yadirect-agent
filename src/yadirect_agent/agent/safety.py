@@ -1416,6 +1416,17 @@ class Policy(BaseModel):
     max_bid_increase_pct: float = Field(default=0.5, ge=0, le=10)
     max_bid_change_per_day_pct: float = Field(default=0.25, ge=0, le=1)
     max_bulk_size: int = Field(default=50, ge=1)
+    # Snapshot-freshness ceiling for apply-plan re-review: a plan
+    # whose ``ReviewContext.baseline_timestamp`` is older than this
+    # many seconds at apply time fails terminally and the operator
+    # re-issues against fresh data. KS#1 / KS#4 both compare
+    # proposed values against snapshot baselines — without this
+    # bound, a parallel-operator change between plan creation and
+    # apply is invisible to the guard. Default 300 s matches the
+    # expected operator workflow (read plan, type command, apply)
+    # while being tight enough that hours-old plans get re-checked.
+    # Auditor M2-bid-snapshot / M2-ks3-negatives HIGH-2 follow-up.
+    max_snapshot_age_seconds: int = Field(default=300, ge=1)
 
     # --- Forbidden operations (always blocked) -----------------------------
     forbidden_operations: list[str] = Field(
@@ -1483,6 +1494,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "max_bid_increase_pct",
         "max_bid_change_per_day_pct",
         "max_bulk_size",
+        "max_snapshot_age_seconds",
         "forbidden_operations",
         "rollout_stage",
     }

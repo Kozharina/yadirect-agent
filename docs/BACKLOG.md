@@ -71,25 +71,24 @@ the PR merges or is abandoned.
 
 Accumulated work that isn't blocking but will sting later.
 
-- [ ] **`max_snapshot_age_seconds` policy enforcement at apply-plan
-      re-review** (auditor M2-bid-snapshot HIGH-2 follow-up + auditor
-      M2-ks3-negatives HIGH-2 follow-up): both bid and budget context
-      builders now stamp ``ReviewContext.baseline_timestamp`` (PR #35
-      and the per-campaign negatives PR), but ``apply_plan`` does not
-      yet read it. Operator-driven ``apply-plan <id>`` minutes / hours /
-      days after plan creation re-reviews against an arbitrarily stale
-      snapshot. KS#4's ``_is_increase`` and KS#1's cap arithmetic both
-      compare proposed values against snapshot baselines — a parallel-
-      operator bid bump or budget change between plan creation and
-      apply execution is currently invisible to the guard, opening a
-      window for a second consecutive increase / cap-skirting move.
-      Fix: add ``max_snapshot_age_seconds: int`` to ``Policy`` (default
-      300 s); in ``apply_plan``, if ``review_context.baseline_timestamp``
-      is present and older than the policy ceiling, mark the plan
-      ``failed`` with a clear stale-snapshot reason and require the
-      operator to re-issue. Now that all four context builders stamp
-      the timestamp, this is a single-PR change with no cross-cutting
-      prerequisites.
+- [ ] **`Policy.require_baseline_timestamp` knob for fail-closed
+      snapshot freshness** (auditor M2-snapshot-age first-pass
+      followup): the staleness check in ``apply_plan`` is fail-OPEN
+      on ``baseline_timestamp=None`` so legacy plans that predate
+      the timestamp rollout (or any future context builder that
+      doesn't yet stamp it) keep applying. Threat-model gap: an
+      attacker who can write the JSONL plan store can set
+      ``baseline_timestamp: null`` on a corrupt row and bypass the
+      staleness gate entirely. Single-operator local-trust threat
+      model (acknowledged in the file-lock LOW) makes this LOW
+      today, but becomes a blocker for any multi-operator or
+      remote-store deployment. Fix: add
+      ``Policy.require_baseline_timestamp: bool = Field(default=False)``;
+      when True, a missing timestamp at ``apply_plan`` time raises
+      ``StaleSnapshotError`` (or a sibling) and the plan transitions
+      to ``failed``. Test both branches. Defer until either the
+      threat model widens or every context builder is verified to
+      stamp reliably across a release cycle.
 
 - [ ] **`AccountBidSnapshot.find` O(n²) at large bulk sizes** (auditor
       M2-bid-snapshot second-pass NEW LOW): now that the bid snapshot
@@ -572,6 +571,33 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2 follow-up — `max_snapshot_age_seconds` enforcement at
+      apply-plan** — closes the deferred half of the auditor
+      M2-bid-snapshot HIGH-2 (and M2-ks3-negatives HIGH-2)
+      findings. ``Policy.max_snapshot_age_seconds`` (default 300 s,
+      ``ge=1``) added to the flat-YAML loader's top-level keys so
+      operators can override per agent_policy.yml.
+      ``_apply_plan_inner`` now reads
+      ``context.baseline_timestamp`` AFTER plan-state validation
+      and BEFORE the re-review: a plan whose snapshot is older
+      than the ceiling raises ``StaleSnapshotError``, plan
+      transitions to ``failed`` (terminal), executor never runs,
+      ``on_applied`` not called. Audit emission preserved
+      (``apply_plan.failed`` carries ``error_type:
+      StaleSnapshotError`` + the human-readable age in the
+      message body).
+      Fail-open on ``baseline_timestamp=None`` keeps legacy plans
+      applicable; defaulting to a fail-closed knob is BACKLOG'd
+      as ``Policy.require_baseline_timestamp``. Negative age
+      (future timestamp from NTP jitter or corrupt JSONL row)
+      clamps to zero so a far-future ``baseline_timestamp`` cannot
+      trivially bypass the gate via the ``negative > max_age``
+      route — auditor second-pass blocker, fixed in the same PR
+      with a year-2099 regression test. After this PR, all four
+      kill-switch paths (KS#1 set_daily_budget, KS#1+KS#3
+      pause / resume, KS#2+KS#4 set_keyword_bids) honor the
+      same staleness contract end-to-end. 7 new tests
+      (3 policy + 4 executor); 573 total green.
 - [x] **`DailyBudget` API alias fix** — added ``alias="Amount"`` /
       ``alias="Mode"`` to ``DailyBudget`` so ``Campaign.model_validate``
       against the real wire JSON shape populates ``daily_budget``

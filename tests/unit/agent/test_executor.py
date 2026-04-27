@@ -48,6 +48,20 @@ from yadirect_agent.agent.safety import (
 
 
 @dataclass
+class _StubPolicy:
+    """Minimal policy stand-in exposing the fields the executor reads.
+
+    Real ``SafetyPipeline.policy`` returns a full ``Policy``; the
+    stub only needs the freshness ceiling. Default 86_400 (one day)
+    so existing tests with stamped-or-unstamped contexts pass through
+    the staleness check unchanged. Tests that exercise the staleness
+    branch override per-instance.
+    """
+
+    max_snapshot_age_seconds: int = 86_400
+
+
+@dataclass
 class _StubPipeline:
     """Captures every `review` + `on_applied` call for assertions.
 
@@ -59,6 +73,7 @@ class _StubPipeline:
     )
     review_calls: list[tuple[OperationPlan, ReviewContext]] = field(default_factory=list)
     on_applied_calls: list[ReviewContext] = field(default_factory=list)
+    policy: _StubPolicy = field(default_factory=_StubPolicy)
 
     def review(self, plan: OperationPlan, context: ReviewContext) -> SafetyDecision:
         self.review_calls.append((plan, context))
@@ -418,6 +433,207 @@ class TestApplyPlanPreconditions:
                 pipeline=pipe,
                 service_router=lambda *a, **kw: None,  # type: ignore[arg-type]
             )
+
+    async def test_stale_snapshot_marks_plan_failed_and_skips_executor(
+        self, store: PendingPlansStore
+    ) -> None:
+        """Auditor M2-bid-snapshot HIGH-2 / M2-ks3-negatives HIGH-2
+        follow-up closure: a plan whose ``review_context.baseline_timestamp``
+        is older than ``policy.max_snapshot_age_seconds`` must NOT
+        execute. The pre-fix gap was that the timestamp was emitted
+        by every context builder but never consulted at apply-plan
+        time, so an operator running ``apply-plan <id>`` minutes /
+        hours later would re-review against a stale snapshot — KS#1
+        cap arithmetic and KS#4 ``_is_increase`` both compare
+        proposed values against snapshot baselines, and a parallel-
+        operator change between plan creation and apply was invisible
+        to the guard.
+
+        Pin: stale timestamp → ``StaleSnapshotError``, plan goes to
+        ``failed``, executor never runs.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        from yadirect_agent.agent.executor import StaleSnapshotError
+        from yadirect_agent.agent.pipeline import ReviewContext, serialize_review_context
+        from yadirect_agent.agent.plans import OperationPlan
+
+        # Build a plan whose stored review_context is 600 s old.
+        stale_ctx = ReviewContext(
+            budget_snapshot=_snap(),
+            budget_changes=[BudgetChange(campaign_id=1, new_daily_budget_rub=150)],
+            baseline_timestamp=datetime.now(UTC) - timedelta(seconds=600),
+        )
+        stale_plan = OperationPlan(
+            plan_id="stale-1",
+            created_at=datetime.now(UTC) - timedelta(seconds=600),
+            action="set_campaign_budget",
+            resource_type="campaign",
+            resource_ids=[1],
+            args={"campaign_id": 1, "new_budget_rub": 200},
+            preview="set budget on campaign 1 to 200 RUB",
+            reason="needs confirm",
+            review_context=serialize_review_context(stale_ctx),
+        )
+        store.append(stale_plan)
+
+        pipe = _StubPipeline(policy=_StubPolicy(max_snapshot_age_seconds=300))
+        svc = _FakeService(pipe, store)
+
+        with pytest.raises(StaleSnapshotError):
+            await apply_plan(
+                stale_plan.plan_id,
+                store=store,
+                pipeline=pipe,
+                service_router=lambda action, args, _applying_plan_id: _route_set_budget(
+                    svc, action, args, _applying_plan_id=_applying_plan_id
+                ),
+            )
+
+        # Executor never ran.
+        assert svc.calls == []
+        # on_applied not called — the plan never reached the success path.
+        assert pipe.on_applied_calls == []
+        # Plan transitioned to failed (terminal). Operators re-issue
+        # against fresh data; no silent retry through the same record.
+        final = store.get(stale_plan.plan_id)
+        assert final is not None
+        assert final.status == "failed"
+
+    async def test_fresh_snapshot_within_age_ceiling_passes_through(
+        self, store: PendingPlansStore
+    ) -> None:
+        """Inverse pin: a plan whose timestamp is well within the
+        ceiling proceeds normally. Locks in the asymmetry — the
+        check fires only on ACTUALLY stale snapshots."""
+        from datetime import UTC, datetime, timedelta
+
+        from yadirect_agent.agent.pipeline import ReviewContext, serialize_review_context
+        from yadirect_agent.agent.plans import OperationPlan
+
+        fresh_ctx = ReviewContext(
+            budget_snapshot=_snap(),
+            budget_changes=[BudgetChange(campaign_id=1, new_daily_budget_rub=150)],
+            baseline_timestamp=datetime.now(UTC) - timedelta(seconds=10),
+        )
+        fresh_plan = OperationPlan(
+            plan_id="fresh-1",
+            created_at=datetime.now(UTC),
+            action="set_campaign_budget",
+            resource_type="campaign",
+            resource_ids=[1],
+            args={"campaign_id": 1, "new_budget_rub": 200},
+            preview="set budget on campaign 1 to 200 RUB",
+            reason="needs confirm",
+            review_context=serialize_review_context(fresh_ctx),
+        )
+        store.append(fresh_plan)
+
+        pipe = _StubPipeline(policy=_StubPolicy(max_snapshot_age_seconds=300))
+        svc = _FakeService(pipe, store)
+
+        result = await apply_plan(
+            fresh_plan.plan_id,
+            store=store,
+            pipeline=pipe,
+            service_router=lambda action, args, _applying_plan_id: _route_set_budget(
+                svc, action, args, _applying_plan_id=_applying_plan_id
+            ),
+        )
+
+        assert result == "ok"
+        assert svc.calls == [{"campaign_id": 1, "new_budget_rub": 200}]
+        final = store.get(fresh_plan.plan_id)
+        assert final is not None
+        assert final.status == "applied"
+
+    async def test_future_baseline_timestamp_does_not_bypass_age_check(
+        self, store: PendingPlansStore
+    ) -> None:
+        """Auditor M2-snapshot-age second-pass: a malicious or
+        corrupt JSONL row with ``baseline_timestamp`` arbitrarily
+        far in the future would otherwise produce a NEGATIVE age
+        (now - future = negative) which trivially passes
+        ``> max_age``, bypassing the staleness check entirely. An
+        attacker who can write to the store could set the timestamp
+        to year 2099 and guarantee no plan ever ages out.
+
+        Pin: a future timestamp clamps to age=0 (treated as "just
+        created"), passes the staleness gate, and the plan executes
+        normally. Small negative values from NTP jitter are
+        absorbed by the same clamp without false-rejecting valid
+        plans.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        from yadirect_agent.agent.pipeline import ReviewContext, serialize_review_context
+        from yadirect_agent.agent.plans import OperationPlan
+
+        future_ctx = ReviewContext(
+            budget_snapshot=_snap(),
+            budget_changes=[BudgetChange(campaign_id=1, new_daily_budget_rub=150)],
+            # Year 2099 — well beyond any plausible NTP skew window.
+            baseline_timestamp=datetime.now(UTC) + timedelta(days=365 * 70),
+        )
+        future_plan = OperationPlan(
+            plan_id="future-1",
+            created_at=datetime.now(UTC),
+            action="set_campaign_budget",
+            resource_type="campaign",
+            resource_ids=[1],
+            args={"campaign_id": 1, "new_budget_rub": 200},
+            preview="set budget on campaign 1 to 200 RUB",
+            reason="needs confirm",
+            review_context=serialize_review_context(future_ctx),
+        )
+        store.append(future_plan)
+
+        pipe = _StubPipeline(policy=_StubPolicy(max_snapshot_age_seconds=300))
+        svc = _FakeService(pipe, store)
+
+        # Plan executes normally — clamp protects the gate from
+        # negative-age trivial pass.
+        result = await apply_plan(
+            future_plan.plan_id,
+            store=store,
+            pipeline=pipe,
+            service_router=lambda action, args, _applying_plan_id: _route_set_budget(
+                svc, action, args, _applying_plan_id=_applying_plan_id
+            ),
+        )
+
+        assert result == "ok"
+        assert svc.calls == [{"campaign_id": 1, "new_budget_rub": 200}]
+
+    async def test_plan_without_baseline_timestamp_passes_age_check(
+        self, store: PendingPlansStore
+    ) -> None:
+        """A plan whose review_context predates the
+        baseline_timestamp rollout (or is built by a context builder
+        that doesn't yet stamp it) carries ``baseline_timestamp=None``.
+        Treat None as "no freshness signal, can't prove staleness" —
+        same fail-open contract as KS#4's QS=None / current-bid=None.
+        Without this, every legacy plan in the JSONL store would
+        suddenly fail at apply time after this PR ships, which is
+        worse than the staleness gap it closes."""
+        pipe = _StubPipeline(policy=_StubPolicy(max_snapshot_age_seconds=300))
+        plan_id = await _seed_pending_plan(store, pipe)
+        # _seed_pending_plan builds a plan whose ReviewContext has no
+        # baseline_timestamp (the test's _async_ctx_builder returns
+        # _ctx() which leaves the field at its None default).
+        svc = _FakeService(pipe, store)
+
+        result = await apply_plan(
+            plan_id,
+            store=store,
+            pipeline=pipe,
+            service_router=lambda action, args, _applying_plan_id: _route_set_budget(
+                svc, action, args, _applying_plan_id=_applying_plan_id
+            ),
+        )
+
+        assert result == "ok"
+        assert svc.calls == [{"campaign_id": 1, "new_budget_rub": 200}]
 
     async def test_plan_with_no_review_context_cannot_be_applied(
         self, store: PendingPlansStore
