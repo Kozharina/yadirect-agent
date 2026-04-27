@@ -512,8 +512,6 @@ def test_rollout_promote_writes_state_file_and_emits_audit(
 ) -> None:
     """Happy path: --yes skips confirmation; state-file written; audit
     JSONL contains rollout_promote.requested + rollout_promote.ok."""
-    import json
-
     from yadirect_agent.rollout import RolloutStateStore
 
     settings.agent_policy_path.parent.mkdir(parents=True, exist_ok=True)
