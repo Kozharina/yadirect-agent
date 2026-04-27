@@ -63,7 +63,19 @@ def _compute_cr_pct(clicks: int, conversions: int) -> float | None:
 
 
 class ReportingService:
-    """Thin facade over MetrikaService that produces joined DTOs."""
+    """Thin facade over MetrikaService that produces joined DTOs.
+
+    Currently stateless: ``__aenter__`` / ``__aexit__`` are noops and
+    each method opens its own short-lived ``MetrikaService`` block.
+    The async-context shape is preserved for symmetry with
+    ``CampaignService`` / ``BiddingService`` / ``MetrikaService``,
+    and as a place to put per-session state if/when caching is
+    introduced (auditor M6 LOW-9). If/when that happens, anything
+    cached in ``__aenter__`` MUST be invalidated in ``__aexit__`` —
+    the M14 agency-mode rollout will reuse this class across multiple
+    accounts and silent state-leak between accounts would be a
+    cross-tenant data leak, not a perf bug.
+    """
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings

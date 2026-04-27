@@ -84,6 +84,19 @@ class ReportRow(BaseModel):
     structured metadata (icon URLs for sources, region IDs, etc.).
     The reporting service knows which positions mean what — the model
     just preserves the wire shape faithfully.
+
+    Privacy gate (auditor M6 LOW-8): ``extra="allow"`` is correct for
+    forward-compat with new dimensions Yandex adds, but a few of
+    Metrika's dimension identifiers carry user-identifying data
+    (``ym:s:clientIP``, ``ym:s:userId``, ``ym:s:referer``,
+    ``ym:s:url``). When you add a new ``get_report`` call, audit
+    the dimension list against
+    https://yandex.com/dev/metrika/doc/api2/api_v1/data.html and
+    if any of the chosen dimensions can carry PII, raise it
+    explicitly in the PR description and consult the privacy
+    policy before merging. Today's two dimensions
+    (``ym:ad:directCampaignID`` and ``ym:s:lastDirectClickSourceName``)
+    are bucketed source labels, not PII.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -142,6 +155,16 @@ class CampaignPerformance:
     RUB; production accounts for the Russian Direct cabinet are RUB).
     Multi-currency is a future concern we'll address with explicit
     typing if/when it becomes real.
+
+    ``campaign_name`` is untrusted free-text from Direct / Metrika
+    (auditor M6 LOW-7) — it can contain arbitrary Unicode including
+    control characters and ANSI-escape-shaped sequences that affect
+    terminal rendering or JSON-serialise oddly. Internal Python use
+    is safe; when this DTO is rendered into LLM tool results or
+    operator-visible terminal output (M15.5 tools), the renderer
+    must strip/escape control characters. The model layer does not
+    sanitise here because doing so would lose information that's
+    useful for operator-side debugging.
     """
 
     campaign_id: int
