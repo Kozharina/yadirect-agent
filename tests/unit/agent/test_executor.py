@@ -510,32 +510,40 @@ class TestBoundArgsDict:
         return _bound_args_dict(fn, fn_args, fn_kwargs)
 
     def test_basic_positional_binds_to_param_names(self) -> None:
-        async def f(self: Any, a: int, b: int) -> None: ...
+        # ``pass`` over ``...`` to keep CodeQL's py/ineffectual-statement
+        # rule quiet on the synthetic function bodies; the body never
+        # runs (we only inspect the signature).
+        async def f(self: Any, a: int, b: int) -> None:
+            pass
 
         assert self._make((1, 2), {}, f) == {"a": 1, "b": 2}
 
     def test_keyword_binds_to_param_names(self) -> None:
-        async def f(self: Any, a: int, b: int) -> None: ...
+        async def f(self: Any, a: int, b: int) -> None:
+            pass
 
         assert self._make((), {"a": 1, "b": 2}, f) == {"a": 1, "b": 2}
 
     def test_omitted_default_is_filled_in(self) -> None:
         # Auditor M-2: defaulted params must be captured at call time so
         # a deployment with a changed default replays the original intent.
-        async def f(self: Any, a: int, b: int = 99) -> None: ...
+        async def f(self: Any, a: int, b: int = 99) -> None:
+            pass
 
         assert self._make((1,), {}, f) == {"a": 1, "b": 99}
 
     def test_overflow_positional_args_raise(self) -> None:
         # Auditor H-1: silent drop is a faithful-replay hazard. bind()
         # must surface it as TypeError.
-        async def f(self: Any, a: int) -> None: ...
+        async def f(self: Any, a: int) -> None:
+            pass
 
         with pytest.raises(TypeError):
             self._make((1, 2, 3), {}, f)
 
     def test_unknown_kwarg_raises(self) -> None:
-        async def f(self: Any, a: int) -> None: ...
+        async def f(self: Any, a: int) -> None:
+            pass
 
         with pytest.raises(TypeError):
             self._make((), {"a": 1, "mystery": 2}, f)
@@ -543,7 +551,8 @@ class TestBoundArgsDict:
     def test_var_positional_preserved_as_tuple(self) -> None:
         # Auditor H-1: *args must round-trip as a tuple, not be
         # collapsed to its first element.
-        async def f(self: Any, a: int, *ids: int) -> None: ...
+        async def f(self: Any, a: int, *ids: int) -> None:
+            pass
 
         result = self._make((1, 10, 20, 30), {}, f)
         assert result == {"a": 1, "ids": (10, 20, 30)}
@@ -551,6 +560,7 @@ class TestBoundArgsDict:
     def test_applying_plan_id_is_filtered(self) -> None:
         # The bypass kwarg must never reach the wrapped function's
         # signature, so it must not appear in plan.args either.
-        async def f(self: Any, a: int) -> None: ...
+        async def f(self: Any, a: int) -> None:
+            pass
 
         assert self._make((), {"a": 1, "_applying_plan_id": "xyz"}, f) == {"a": 1}
