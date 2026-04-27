@@ -235,8 +235,75 @@ async def test_set_campaign_budget_passes_through(
     inp = tool.input_model.model_validate({"campaign_id": 42, "budget_rub": 500})
     result = await tool.handler(inp, tool_context)
 
+    # Status field added in M2.2 part 3b1: handlers now distinguish
+    # applied / pending / rejected so the agent can relay the next
+    # step to the user.
     assert captured == [(42, 500)]
-    assert result == {"campaign_id": 42, "budget_rub": 500}
+    assert result == {"status": "applied", "campaign_id": 42, "budget_rub": 500}
+
+
+@pytest.mark.asyncio
+async def test_set_campaign_budget_returns_pending_on_plan_required(
+    settings: Settings,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pipeline ``confirm`` path: handler must surface plan_id + the
+    operator's next step, not raise. The agent uses this response to
+    tell the user how to approve.
+    """
+    from yadirect_agent.agent.executor import PlanRequired
+    from yadirect_agent.services.campaigns import CampaignService
+
+    async def fake_set_budget(self: CampaignService, campaign_id: int, budget_rub: int) -> None:
+        raise PlanRequired(
+            plan_id="abc123",
+            preview="set daily budget on campaign 42 to 800 RUB",
+            reason="awaiting operator confirmation",
+        )
+
+    monkeypatch.setattr(CampaignService, "set_daily_budget", fake_set_budget)
+
+    tool = build_default_registry(settings).get("set_campaign_budget")
+    inp = tool.input_model.model_validate({"campaign_id": 42, "budget_rub": 800})
+    result = await tool.handler(inp, tool_context)
+
+    assert result["status"] == "pending"
+    assert result["plan_id"] == "abc123"
+    assert "campaign 42" in result["preview"]
+    assert "apply-plan abc123" in result["next_step"]
+
+
+@pytest.mark.asyncio
+async def test_set_campaign_budget_returns_rejected_on_plan_rejected(
+    settings: Settings,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pipeline ``reject`` path: handler must surface the reason +
+    blocking checks; agent relays to user without leaking internals.
+    """
+    from yadirect_agent.agent.executor import PlanRejected
+    from yadirect_agent.agent.safety import CheckResult
+    from yadirect_agent.services.campaigns import CampaignService
+
+    async def fake_set_budget(self: CampaignService, campaign_id: int, budget_rub: int) -> None:
+        raise PlanRejected(
+            reason="exceeds account cap",
+            blocking=[CheckResult(status="blocked", reason="budget_cap: account total > 100000")],
+        )
+
+    monkeypatch.setattr(CampaignService, "set_daily_budget", fake_set_budget)
+
+    tool = build_default_registry(settings).get("set_campaign_budget")
+    inp = tool.input_model.model_validate({"campaign_id": 42, "budget_rub": 800})
+    result = await tool.handler(inp, tool_context)
+
+    assert result["status"] == "rejected"
+    assert "cap" in result["reason"]
+    assert len(result["blocking"]) == 1
+    assert result["blocking"][0]["status"] == "blocked"
+    assert "budget_cap" in result["blocking"][0]["reason"]
 
 
 @pytest.mark.asyncio
