@@ -1,8 +1,9 @@
 # Architecture
 
-> Complement to `docs/BRIEF.md` and `docs/TECHNICAL_SPEC.md`. This file
-> answers **"where does new code go and what can it depend on?"**. Enforced
-> in review (`docs/REVIEW.md`) and by `mypy --strict`.
+> Complement to [`README.md`](../README.md) (what the product does) and
+> [`docs/TECHNICAL_SPEC.md`](./TECHNICAL_SPEC.md) (where it's going). This
+> file answers **"where does new code go and what can it depend on?"**.
+> Enforced in review ([`docs/REVIEW.md`](./REVIEW.md)) and by `mypy --strict`.
 
 ## Layers
 
