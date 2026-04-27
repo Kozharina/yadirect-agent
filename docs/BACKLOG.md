@@ -54,7 +54,14 @@ evals exercise the full safety surface.)*
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **`max_snapshot_age_seconds` enforcement at apply-plan**
+      (branch ``feat/m2-snapshot-age-enforcement``) — adds the
+      ``Policy.max_snapshot_age_seconds`` field and reads
+      ``review_context.baseline_timestamp`` in ``apply_plan`` to
+      reject stale snapshots. Closes the deferred half of the
+      auditor M2-bid-snapshot HIGH-2 (and M2-ks3-negatives HIGH-2)
+      findings — all four context builders already stamp the
+      timestamp.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
