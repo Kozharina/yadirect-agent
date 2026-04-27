@@ -90,6 +90,19 @@ Accumulated work that isn't blocking but will sting later.
       baseline_timestamp today either; the bid reader is just the
       first to make freshness load-bearing).
 
+- [ ] **`AccountBidSnapshot.find` O(n²) at large bulk sizes** (auditor
+      M2-bid-snapshot second-pass NEW LOW): now that the bid snapshot
+      is populated from a real API call, a single ``apply`` with N
+      keyword updates triggers N linear ``find`` scans over a list of
+      up to N entries. ``Policy.max_bulk_size`` defaults to 50 so the
+      cost is harmless today (50 × 50 = 2 500 comparisons per call).
+      If the bulk ceiling is ever raised — ``max_bulk_size = 500``
+      means 250 000 comparisons — the cost grows unnoticed inside the
+      hot path. Fix: when the snapshot grows past a threshold (say
+      100 entries), build a ``dict[keyword_id, KeywordSnapshot]`` once
+      and look up by id. Lazy: only convert when ``len(keywords) >
+      threshold``. Defer until the bulk ceiling actually moves.
+
 - [ ] **Audit redaction for live bid values in CheckResult.details**
       (auditor M2-bid-snapshot LOW): ``QualityScoreGuardCheck`` and
       ``MaxCpcCheck`` emit ``current_rub``, ``proposed_rub`` and
