@@ -220,8 +220,13 @@ async def test_resume_delegates_to_client_resume(
 async def test_set_daily_budget_rejects_below_minimum(
     settings: Settings, fake_direct: _FakeDirectService
 ) -> None:
+    # Bypass the @requires_plan decorator with _applying_plan_id so we
+    # exercise the inner validation path (the decorator now wraps this
+    # method; without bypass we'd hit _resolve_safety before validation).
     with pytest.raises(ValueError, match=">= 300 RUB"):
-        await CampaignService(settings).set_daily_budget(campaign_id=1, budget_rub=299)
+        await CampaignService(settings).set_daily_budget(
+            campaign_id=1, budget_rub=299, _applying_plan_id="test-bypass"
+        )
 
     # We rejected early — the client must not have been called.
     assert fake_direct.budget_calls == []
@@ -231,7 +236,9 @@ async def test_set_daily_budget_rejects_below_minimum(
 async def test_set_daily_budget_accepts_minimum(
     settings: Settings, fake_direct: _FakeDirectService
 ) -> None:
-    await CampaignService(settings).set_daily_budget(campaign_id=42, budget_rub=300)
+    await CampaignService(settings).set_daily_budget(
+        campaign_id=42, budget_rub=300, _applying_plan_id="test-bypass"
+    )
 
     assert fake_direct.budget_calls == [(42, 300, "STANDARD")]
 
@@ -242,6 +249,101 @@ async def test_set_daily_budget_passes_through_amount_in_rubles(
 ) -> None:
     # The service speaks rubles; the client is responsible for converting to
     # micro-currency. We verify that contract here.
-    await CampaignService(settings).set_daily_budget(campaign_id=42, budget_rub=1500)
+    await CampaignService(settings).set_daily_budget(
+        campaign_id=42, budget_rub=1500, _applying_plan_id="test-bypass"
+    )
 
     assert fake_direct.budget_calls == [(42, 1500, "STANDARD")]
+
+
+# --------------------------------------------------------------------------
+# @requires_plan wiring on set_daily_budget (M2.2 part 3b1).
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_daily_budget_without_safety_raises_runtime_error(
+    settings: Settings, fake_direct: _FakeDirectService
+) -> None:
+    """Passing no pipeline/store but calling set_daily_budget without the
+    bypass kwarg must fail loudly. Silent fallback would be a security hole
+    — every mutating method must be gated unless explicitly opted out via
+    the apply-plan re-entry path.
+    """
+    from yadirect_agent.agent.executor import requires_plan  # noqa: F401
+
+    svc = CampaignService(settings)  # no pipeline / no store
+    with pytest.raises(RuntimeError, match="SafetyPipeline"):
+        await svc.set_daily_budget(campaign_id=42, budget_rub=500)
+
+
+@pytest.mark.asyncio
+async def test_set_daily_budget_with_safety_persists_plan_on_confirm(
+    settings: Settings, fake_direct: _FakeDirectService, tmp_path: Any
+) -> None:
+    """End-to-end: a budget change above the auto-approve threshold (which
+    today is *every* budget change since auto_approve_budget_change isn't
+    a knob) flows through @requires_plan → pipeline.review → confirm,
+    producing a persisted OperationPlan in the JSONL store and raising
+    PlanRequired without touching DirectService.
+    """
+    from yadirect_agent.agent.executor import PlanRequired
+    from yadirect_agent.agent.pipeline import SafetyPipeline
+    from yadirect_agent.agent.plans import PendingPlansStore
+    from yadirect_agent.agent.safety import (
+        BudgetCapPolicy,
+        ConversionIntegrityPolicy,
+        MaxCpcPolicy,
+        Policy,
+        QueryDriftPolicy,
+    )
+
+    # Seed the fake API with one campaign so list_all() in context_builder
+    # has something to convert into AccountBudgetSnapshot.
+    fake_direct._campaigns = [
+        Campaign(
+            id=42,
+            name="alpha",
+            state=CampaignState.ON,
+            status=CampaignStatus.ACCEPTED,
+            type="TEXT_CAMPAIGN",
+            daily_budget=DailyBudget(amount=500_000_000, mode="STANDARD"),
+        )
+    ]
+
+    policy = Policy(
+        budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=100_000),
+        max_cpc=MaxCpcPolicy(),
+        query_drift=QueryDriftPolicy(),
+        conversion_integrity=ConversionIntegrityPolicy(
+            min_conversions_total=1,
+            min_ratio_vs_baseline=0.5,
+            require_all_baseline_goals_present=True,
+        ),
+        rollout_stage="autonomy_full",
+    )
+    pipeline = SafetyPipeline(policy)
+    store = PendingPlansStore(tmp_path / "pending_plans.jsonl")
+
+    svc = CampaignService(settings, pipeline=pipeline, store=store)
+
+    # Raise budget from 500 → 800 RUB. Within the +20% per-call ceiling
+    # and well under the 100,000 account cap, so the kill-switches pass.
+    # But there is no auto_approve_budget_change knob, so the approval-tier
+    # check returns confirm.
+    with pytest.raises(PlanRequired) as exc:
+        await svc.set_daily_budget(campaign_id=42, budget_rub=800)
+
+    # Plan was persisted, with the canonical action name and raw args.
+    assert exc.value.plan_id
+    plan = store.get(exc.value.plan_id)
+    assert plan is not None
+    assert plan.status == "pending"
+    assert plan.action == "set_campaign_budget"
+    assert plan.resource_ids == [42]
+    assert plan.args == {"campaign_id": 42, "budget_rub": 800}
+    # review_context populated so apply-plan can re-review later.
+    assert plan.review_context is not None
+
+    # The DirectService client was NOT called.
+    assert fake_direct.budget_calls == []

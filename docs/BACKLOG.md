@@ -31,15 +31,14 @@ Each one is TDD, with `security-auditor` sub-agent review before merge.
 All seven reference
 [`docs/PRIOR_ART.md`](./PRIOR_ART.md) → "Agentic PPC Campaign Management".
 
-- [ ] **M2.2 part 3b — service wiring + `apply-plan` CLI** — final
-      slice of §M2.2. Build on the executor infrastructure from part
-      3a: implement `_resolve_safety()` on `CampaignService`,
-      decorate `set_daily_budget` with `@requires_plan` and a real
-      `context_builder` (reads current `AccountBudgetSnapshot` via
-      `list_all()`). Add `yadirect-agent apply-plan <id>` typer
-      command that wires `apply_plan()` against a service-router
-      mapping `action` strings to service methods. Smoke-test the
-      CLI; security-auditor review before merge.
+- [ ] **M2.2 part 3b2 — `apply-plan` CLI** — final slice of §M2.2.
+      Add `yadirect-agent apply-plan <id>` typer command that wires
+      `apply_plan()` against a service-router mapping `action`
+      strings to service methods (just `set_campaign_budget` →
+      `CampaignService.set_daily_budget` for now). Reuse the
+      shared SafetyPipeline + PendingPlansStore that
+      `build_default_registry` already builds. Smoke-test the CLI;
+      security-auditor review before merge.
 - [ ] **M2.3: Audit sink** — `audit.py::AuditEvent`, JSONL async writer,
       `*.requested` / `*.ok` / `*.failed` emissions in every mutating
       service method.
@@ -107,6 +106,61 @@ Accumulated work that isn't blocking but will sting later.
     decision was made on. Alternatively, persist the minimal
     identity (keyword_id → approved ceiling) inside
     `OperationPlan.args` and reconstruct at apply time.
+
+- [ ] **M2 mutating methods awaiting `@requires_plan` gating**
+      (from PR-B1 auditor HIGH-1; track before claiming "all
+      mutating ops gated"): `CampaignService.pause` and
+      `CampaignService.resume` are wired into the tools registry
+      with the shared `(SafetyPipeline, PendingPlansStore)` pair but
+      do not run their methods through the decorator yet. Pause is
+      reversible (low spending risk) but resume is the primary
+      KS#3 (negative-keyword floor) trigger per safety-spec — the
+      check is dead code on this path until decoration lands. Same
+      story for `BiddingService.apply` (KS#2 / KS#4) once it gets
+      its own `@requires_plan` wiring. Suggested order: resume →
+      bidding → pause (in the order of risk).
+
+- [ ] **Snapshot freshness at apply-plan time (archived-campaign
+      gap)** (from PR-B1 auditor MEDIUM-3; not blocking M2.3): the
+      ReviewContext serialised into `OperationPlan.review_context`
+      is built from `CampaignService.list_all()` (no state filter)
+      at plan creation. If the target campaign is archived between
+      plan creation and `apply-plan` execution, the snapshot still
+      shows it as `state=ARCHIVED, daily_budget_rub=0.0`. KS#1
+      arithmetic stays correct, but the eventual
+      `update_campaign_budget` wire call will fail. Consider
+      either (a) refresh snapshot at apply time and re-review
+      against fresh data, or (b) explicitly check `state == "ON"`
+      in the per-op check.
+
+- [ ] **Remove KS#7 query-sample privacy blocklist when M2.3 audit
+      sink redacts at source** (from PR-B1 second-pass auditor
+      MEDIUM): tool handler currently strips ``new_queries_sample``
+      via ``_redact_details`` so raw user search queries never
+      reach the LLM agent's response. Once M2.3 audit sink lands
+      with structural redaction at the persistence layer, the
+      tool-boundary blocklist becomes redundant defence — keep it
+      until then but consider whether any other PII-prone keys
+      (KS#3 negative-keyword phrases? KS#5 baseline timestamps?)
+      need adding to ``_PRIVATE_DETAIL_KEYS``.
+
+- [ ] **Quiet `policy_file_not_found` warning in unit-test
+      fixtures** (from PR-B1 second-pass auditor INFO-1): the
+      ``settings`` fixture in ``tests/unit/conftest.py`` points
+      ``agent_policy_path`` at a non-existent ``tmp_path`` file, so
+      every test that calls ``build_default_registry`` triggers a
+      structlog warning. Not a security issue but masks real
+      ``policy_file_not_found`` events in any future log-assertion
+      tests. Fix by writing a minimal valid YAML at fixture setup.
+
+- [ ] **Document `agent/__init__.py` public-API narrowing**
+      (from PR-B1 auditor INFO-2): the empty re-exports broke a
+      circular import (`services/campaigns.py → agent.executor →
+      agent.__init__ → tools → campaigns`). Anyone importing
+      `from yadirect_agent.agent import Agent` now gets ImportError.
+      Add a note in `docs/ARCHITECTURE.md` clarifying the
+      submodule-only public surface, and audit the README for any
+      stale flat-namespace examples.
 
 - [ ] **`apply-plan` concurrency / file-lock** (from PR-A auditor
       LOW; deferred, not blocking part 3b merge): two concurrent
@@ -371,6 +425,29 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2.2 part 3b1 — service wiring (CampaignService + tools
+      registry)** — first real consumer of the part-3a executor
+      infrastructure. ``CampaignService.__init__`` accepts ``pipeline``
+      / ``store`` keyword-only optional, with ``_resolve_safety``
+      raising ``RuntimeError`` rather than silently bypassing.
+      ``set_daily_budget`` decorated with ``@requires_plan`` +
+      ``_build_set_budget_context`` async builder that reads the
+      current ``AccountBudgetSnapshot`` via ``list_all()``.
+      ``build_default_registry`` constructs a single shared
+      ``SafetyPipeline`` + ``PendingPlansStore`` per registry build
+      so the cross-tool TOCTOU register survives one agent run;
+      Policy resolved from ``settings.agent_policy_path`` if present,
+      otherwise a default seeded from
+      ``settings.agent_max_daily_budget_rub``. ``set_campaign_budget``
+      tool handler catches ``PlanRequired`` / ``PlanRejected`` and
+      surfaces ``{status: "pending" | "rejected" | "applied", ...}``
+      so the agent can relay the next step to the user.
+      ``agent/__init__.py`` no longer eagerly re-exports submodules
+      — eager re-exports formed an import cycle the moment
+      ``services/campaigns.py`` started importing
+      ``agent.executor``. 26 tests in test_tools.py (was 24), 13 in
+      test_campaigns.py (was 10), 419 total green; mypy + ruff
+      clean. ``apply-plan`` CLI lands in part 3b2.
 - [x] **M2.2 part 3a — `@requires_plan` decorator + `apply_plan`
       executor (infrastructure)** — `agent/executor.py`. Decorator
       hooks `SafetyPipeline.review` into async service methods with
@@ -501,15 +578,3 @@ Last 10 items (newest at top). Older items are available via
       across the suite). Reviewed by `security-auditor` — no single-
       call bypass found; 3 follow-ups (cross-call ratchet, None-
       current defer, §M2.6 trending) moved to Tech debt.
-- [x] **M2 Kill-switch #3 — Negative-keyword floor** —
-      `NegativeKeywordFloorCheck` refuses to resume a campaign that
-      does not carry every required negative keyword. Reuses KS#1
-      shapes (AccountBudgetSnapshot, BudgetChange). CampaignBudget
-      grows `negative_keywords: frozenset[str]` default-empty, so
-      existing KS#1/#2 tests stay green. Local `_normalize_keyword`
-      applies NFC → strip → lower; case- and whitespace-insensitive
-      and Unicode-canonical. Policy rejects empty/whitespace-only
-      entries via a `@field_validator`. 24 new tests (71 safety, 194
-      across the suite). Reviewed by `security-auditor` before
-      merge — HIGH finding (NFC/NFD) and MEDIUM finding
-      (empty-string DoS) closed; 4 design notes added below.

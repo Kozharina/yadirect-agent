@@ -118,6 +118,56 @@ class TestDefaultRegistry:
         reg = build_default_registry(settings)
         assert reg.get(name).is_write is is_write
 
+    @pytest.mark.parametrize(
+        "tool_name",
+        [
+            "list_campaigns",
+            "pause_campaigns",
+            "resume_campaigns",
+            "set_campaign_budget",
+            "get_keywords",
+            "set_keyword_bids",
+            "validate_phrases",
+        ],
+    )
+    def test_input_models_reject_unknown_fields(self, settings: Settings, tool_name: str) -> None:
+        # Defence-in-depth (auditor HIGH-2 + second-pass LOW-1): the
+        # agent must not be able to sneak ``_applying_plan_id`` (or
+        # anything else) through the tool input pydantic model.
+        # extra="forbid" lives on each model individually — a future
+        # refactor that drops it from one model is the regression
+        # this parametric sweep catches.
+        from pydantic import ValidationError
+
+        reg = build_default_registry(settings)
+        tool = reg.get(tool_name)
+        with pytest.raises(ValidationError):
+            tool.input_model.model_validate({"_probe_unknown_field": "x"})
+
+    def test_build_safety_pair_called_once_per_registry(
+        self, settings: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # SafetyPipeline.SessionState (cross-tool TOCTOU register) only
+        # works if every CampaignService-backed tool sees the same
+        # pipeline object. The factories take ``(settings, pipeline,
+        # store)`` so they share a closure; this test pins that the
+        # registry construction calls ``_build_safety_pair`` exactly
+        # once. A future refactor that built per-tool pipelines would
+        # silently disable session-level TOCTOU protection.
+        from yadirect_agent.agent import tools as tools_mod
+
+        call_count = 0
+        original = tools_mod._build_safety_pair
+
+        def _counting(s: Settings) -> Any:
+            nonlocal call_count
+            call_count += 1
+            return original(s)
+
+        monkeypatch.setattr(tools_mod, "_build_safety_pair", _counting)
+        build_default_registry(settings)
+        assert call_count == 1
+
 
 # --------------------------------------------------------------------------
 # Per-tool handlers — dispatched against monkeypatched services.
@@ -235,8 +285,124 @@ async def test_set_campaign_budget_passes_through(
     inp = tool.input_model.model_validate({"campaign_id": 42, "budget_rub": 500})
     result = await tool.handler(inp, tool_context)
 
+    # Status field added in M2.2 part 3b1: handlers now distinguish
+    # applied / pending / rejected so the agent can relay the next
+    # step to the user.
     assert captured == [(42, 500)]
-    assert result == {"campaign_id": 42, "budget_rub": 500}
+    assert result == {"status": "applied", "campaign_id": 42, "budget_rub": 500}
+
+
+@pytest.mark.asyncio
+async def test_set_campaign_budget_returns_pending_on_plan_required(
+    settings: Settings,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pipeline ``confirm`` path: handler must surface plan_id + the
+    operator's next step, not raise. The agent uses this response to
+    tell the user how to approve.
+    """
+    from yadirect_agent.agent.executor import PlanRequired
+    from yadirect_agent.services.campaigns import CampaignService
+
+    async def fake_set_budget(self: CampaignService, campaign_id: int, budget_rub: int) -> None:
+        raise PlanRequired(
+            plan_id="abc123",
+            preview="set daily budget on campaign 42 to 800 RUB",
+            reason="awaiting operator confirmation",
+        )
+
+    monkeypatch.setattr(CampaignService, "set_daily_budget", fake_set_budget)
+
+    tool = build_default_registry(settings).get("set_campaign_budget")
+    inp = tool.input_model.model_validate({"campaign_id": 42, "budget_rub": 800})
+    result = await tool.handler(inp, tool_context)
+
+    assert result["status"] == "pending"
+    assert result["plan_id"] == "abc123"
+    assert "campaign 42" in result["preview"]
+    assert "apply-plan abc123" in result["next_step"]
+
+
+@pytest.mark.asyncio
+async def test_set_campaign_budget_returns_rejected_on_plan_rejected(
+    settings: Settings,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pipeline ``reject`` path: handler must surface the reason +
+    blocking checks; agent relays to user without leaking internals.
+    """
+    from yadirect_agent.agent.executor import PlanRejected
+    from yadirect_agent.agent.safety import CheckResult
+    from yadirect_agent.services.campaigns import CampaignService
+
+    async def fake_set_budget(self: CampaignService, campaign_id: int, budget_rub: int) -> None:
+        raise PlanRejected(
+            reason="exceeds account cap",
+            blocking=[CheckResult(status="blocked", reason="budget_cap: account total > 100000")],
+        )
+
+    monkeypatch.setattr(CampaignService, "set_daily_budget", fake_set_budget)
+
+    tool = build_default_registry(settings).get("set_campaign_budget")
+    inp = tool.input_model.model_validate({"campaign_id": 42, "budget_rub": 800})
+    result = await tool.handler(inp, tool_context)
+
+    assert result["status"] == "rejected"
+    assert "cap" in result["reason"]
+    assert len(result["blocking"]) == 1
+    assert result["blocking"][0]["status"] == "blocked"
+    assert "budget_cap" in result["blocking"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_set_campaign_budget_redacts_private_keys_from_blocking(
+    settings: Settings,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Auditor second-pass MEDIUM: KS#7 (query drift) populates
+    ``CheckResult.details["new_queries_sample"]`` with raw user search
+    queries. Those terms can contain names, addresses, medical phrases.
+    The handler MUST strip the key before returning to the LLM agent
+    so the raw queries never reach API-provider retention.
+    """
+    from yadirect_agent.agent.executor import PlanRejected
+    from yadirect_agent.agent.safety import CheckResult
+    from yadirect_agent.services.campaigns import CampaignService
+
+    async def fake_set_budget(self: CampaignService, campaign_id: int, budget_rub: int) -> None:
+        raise PlanRejected(
+            reason="query drift exceeds threshold",
+            blocking=[
+                CheckResult(
+                    status="blocked",
+                    reason="query_drift: 0.7 > 0.4",
+                    details={
+                        "new_queries_sample": [
+                            "Иванов Иван Иванович телефон",
+                            "клиника на Тверской 8 запись",
+                        ],
+                        "new_share": 0.7,
+                        "max_new_share": 0.4,
+                    },
+                )
+            ],
+        )
+
+    monkeypatch.setattr(CampaignService, "set_daily_budget", fake_set_budget)
+
+    tool = build_default_registry(settings).get("set_campaign_budget")
+    inp = tool.input_model.model_validate({"campaign_id": 42, "budget_rub": 800})
+    result = await tool.handler(inp, tool_context)
+
+    blocking_details = result["blocking"][0]["details"]
+    # Numerical / non-PII details must remain — the agent uses them.
+    assert blocking_details["new_share"] == 0.7
+    assert blocking_details["max_new_share"] == 0.4
+    # The raw queries MUST be gone.
+    assert "new_queries_sample" not in blocking_details
 
 
 @pytest.mark.asyncio

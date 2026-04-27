@@ -25,13 +25,24 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 import structlog
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..clients.direct import DirectService
 from ..clients.wordstat import DirectKeywordsResearch
 from ..config import Settings
 from ..services.bidding import BiddingService, BidUpdate
 from ..services.campaigns import CampaignService
+from .executor import PlanRejected, PlanRequired
+from .pipeline import SafetyPipeline
+from .plans import PendingPlansStore
+from .safety import (
+    BudgetCapPolicy,
+    ConversionIntegrityPolicy,
+    MaxCpcPolicy,
+    Policy,
+    QueryDriftPolicy,
+    load_policy,
+)
 
 # --------------------------------------------------------------------------
 # Context + value types.
@@ -124,7 +135,36 @@ class ToolRegistry:
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# Privacy: keys we MUST strip from CheckResult.details before returning a
+# rejection to the LLM agent. KS#7 (query drift) populates
+# ``new_queries_sample`` with raw user search queries that may carry
+# names, addresses, medical phrases, etc. The audit sink (M2.3, not yet
+# shipped) is the right place to redact for log persistence; until then
+# we redact at the tool boundary so the raw queries never reach the LLM
+# context (where the API provider may retain them). Auditor PR-B1
+# second-pass MEDIUM.
+# --------------------------------------------------------------------------
+
+_PRIVATE_DETAIL_KEYS: frozenset[str] = frozenset({"new_queries_sample"})
+
+
+def _redact_details(details: dict[str, Any]) -> dict[str, Any]:
+    """Drop privacy-sensitive keys from a CheckResult.details dict."""
+    return {k: v for k, v in details.items() if k not in _PRIVATE_DETAIL_KEYS}
+
+
+# Every tool input model uses ``extra="forbid"`` as defence-in-depth: a
+# silently-accepted unknown key today would be a wire vector tomorrow if
+# any handler ever forwarded fields into the wrapped service. Concretely
+# this prevents an LLM from sneaking ``_applying_plan_id`` into the
+# tool-call JSON to bypass the @requires_plan gate (auditor HIGH-2).
+_STRICT = ConfigDict(extra="forbid")
+
+
 class _ListCampaignsInput(BaseModel):
+    model_config = _STRICT
+
     states: list[str] | None = Field(
         default=None,
         description=(
@@ -135,10 +175,14 @@ class _ListCampaignsInput(BaseModel):
 
 
 class _IdListInput(BaseModel):
+    model_config = _STRICT
+
     ids: list[int] = Field(..., description="One or more campaign ids.")
 
 
 class _SetCampaignBudgetInput(BaseModel):
+    model_config = _STRICT
+
     campaign_id: int = Field(..., description="Target campaign id.")
     budget_rub: int = Field(
         ...,
@@ -148,6 +192,8 @@ class _SetCampaignBudgetInput(BaseModel):
 
 
 class _GetKeywordsInput(BaseModel):
+    model_config = _STRICT
+
     adgroup_ids: list[int] = Field(
         ...,
         min_length=1,
@@ -156,6 +202,8 @@ class _GetKeywordsInput(BaseModel):
 
 
 class _BidUpdateInput(BaseModel):
+    model_config = _STRICT
+
     keyword_id: int
     new_search_bid_rub: float | None = Field(
         default=None,
@@ -168,6 +216,8 @@ class _BidUpdateInput(BaseModel):
 
 
 class _SetKeywordBidsInput(BaseModel):
+    model_config = _STRICT
+
     updates: list[_BidUpdateInput] = Field(
         ...,
         min_length=1,
@@ -179,6 +229,8 @@ class _SetKeywordBidsInput(BaseModel):
 
 
 class _ValidatePhrasesInput(BaseModel):
+    model_config = _STRICT
+
     phrases: list[str] = Field(
         ...,
         min_length=1,
@@ -197,10 +249,12 @@ class _ValidatePhrasesInput(BaseModel):
 # --------------------------------------------------------------------------
 
 
-def _make_list_campaigns_tool(settings: Settings) -> Tool:
+def _make_list_campaigns_tool(
+    settings: Settings, pipeline: SafetyPipeline, store: PendingPlansStore
+) -> Tool:
     async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
         inp: _ListCampaignsInput = raw  # type: ignore[assignment]
-        svc = CampaignService(settings)
+        svc = CampaignService(settings, pipeline=pipeline, store=store)
         summaries = await svc.list_all() if inp.states is None else await svc.list_active()
         ctx.logger.info("tool.list_campaigns.ok", count=len(summaries))
         return [asdict(s) for s in summaries]
@@ -219,10 +273,12 @@ def _make_list_campaigns_tool(settings: Settings) -> Tool:
     )
 
 
-def _make_pause_campaigns_tool(settings: Settings) -> Tool:
+def _make_pause_campaigns_tool(
+    settings: Settings, pipeline: SafetyPipeline, store: PendingPlansStore
+) -> Tool:
     async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
         inp: _IdListInput = raw  # type: ignore[assignment]
-        svc = CampaignService(settings)
+        svc = CampaignService(settings, pipeline=pipeline, store=store)
         await svc.pause(inp.ids)
         ctx.logger.info("tool.pause_campaigns.ok", ids=inp.ids)
         return {"paused": inp.ids}
@@ -239,10 +295,12 @@ def _make_pause_campaigns_tool(settings: Settings) -> Tool:
     )
 
 
-def _make_resume_campaigns_tool(settings: Settings) -> Tool:
+def _make_resume_campaigns_tool(
+    settings: Settings, pipeline: SafetyPipeline, store: PendingPlansStore
+) -> Tool:
     async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
         inp: _IdListInput = raw  # type: ignore[assignment]
-        svc = CampaignService(settings)
+        svc = CampaignService(settings, pipeline=pipeline, store=store)
         await svc.resume(inp.ids)
         ctx.logger.info("tool.resume_campaigns.ok", ids=inp.ids)
         return {"resumed": inp.ids}
@@ -259,24 +317,82 @@ def _make_resume_campaigns_tool(settings: Settings) -> Tool:
     )
 
 
-def _make_set_campaign_budget_tool(settings: Settings) -> Tool:
+def _make_set_campaign_budget_tool(
+    settings: Settings, pipeline: SafetyPipeline, store: PendingPlansStore
+) -> Tool:
     async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
         inp: _SetCampaignBudgetInput = raw  # type: ignore[assignment]
-        svc = CampaignService(settings)
-        await svc.set_daily_budget(inp.campaign_id, inp.budget_rub)
+        svc = CampaignService(settings, pipeline=pipeline, store=store)
+        try:
+            await svc.set_daily_budget(inp.campaign_id, inp.budget_rub)
+        except PlanRequired as exc:
+            # Pipeline returned ``confirm`` — operator must run apply-plan.
+            # Surface the plan_id back to the agent so it can include the
+            # next step in its message to the user.
+            ctx.logger.info(
+                "tool.set_campaign_budget.pending",
+                campaign_id=inp.campaign_id,
+                budget_rub=inp.budget_rub,
+                plan_id=exc.plan_id,
+            )
+            return {
+                "status": "pending",
+                "plan_id": exc.plan_id,
+                "preview": exc.preview,
+                "reason": exc.reason,
+                "next_step": (
+                    f"Operator approval required. Run "
+                    f"`yadirect-agent apply-plan {exc.plan_id}` to confirm."
+                ),
+            }
+        except PlanRejected as exc:
+            # Pipeline returned ``reject`` — surface enough detail for the
+            # agent to explain to the user why it can't proceed without
+            # leaking internal check names verbatim.
+            ctx.logger.info(
+                "tool.set_campaign_budget.rejected",
+                campaign_id=inp.campaign_id,
+                budget_rub=inp.budget_rub,
+                reason=exc.reason,
+            )
+            return {
+                "status": "rejected",
+                "reason": exc.reason,
+                # ``details`` carries the numerical context (projected
+                # totals, cap thresholds, etc.) the agent needs to
+                # explain *why* to the user. Include them — but route
+                # through ``_redact_details`` first so privacy-sensitive
+                # keys (e.g. KS#7 raw user queries) never reach the
+                # LLM context. Auditor LOW + second-pass MEDIUM.
+                "blocking": [
+                    {
+                        "status": r.status,
+                        "reason": r.reason,
+                        "details": _redact_details(r.details),
+                    }
+                    for r in exc.blocking
+                ],
+            }
         ctx.logger.info(
             "tool.set_campaign_budget.ok",
             campaign_id=inp.campaign_id,
             budget_rub=inp.budget_rub,
         )
-        return {"campaign_id": inp.campaign_id, "budget_rub": inp.budget_rub}
+        return {
+            "status": "applied",
+            "campaign_id": inp.campaign_id,
+            "budget_rub": inp.budget_rub,
+        }
 
     return Tool(
         name="set_campaign_budget",
         description=(
             "Set a campaign's daily budget in rubles. Direct's floor is 300 RUB; "
-            "the service rejects below that. Raises are capped at +20% per call "
-            "by policy; for larger changes, split across days."
+            "the service rejects below that. Most budget changes return "
+            "{status: 'pending', plan_id: ...} requiring operator approval via "
+            "`yadirect-agent apply-plan <id>` — relay that step to the user. "
+            "If status='applied' the change is live; if status='rejected' it "
+            "violated the safety policy (see reason + blocking)."
         ),
         input_model=_SetCampaignBudgetInput,
         is_write=True,
@@ -370,11 +486,77 @@ def _make_validate_phrases_tool(settings: Settings) -> Tool:
 # --------------------------------------------------------------------------
 
 
-_DEFAULT_FACTORIES: list[Callable[[Settings], Tool]] = [
+def _build_safety_pair(settings: Settings) -> tuple[SafetyPipeline, PendingPlansStore]:
+    """Construct the shared ``(SafetyPipeline, PendingPlansStore)`` pair
+    that every CampaignService instance in this registry will consume.
+
+    Constructed once per ``build_default_registry`` call so the
+    ``SessionState`` (cross-tool TOCTOU register inside the pipeline)
+    persists across tool calls within one agent run.
+
+    Policy resolution: read ``settings.agent_policy_path`` if it exists,
+    otherwise fall back to a Policy whose mandatory account cap is
+    seeded from ``settings.agent_max_daily_budget_rub`` (the M2.4 env
+    backstop, default 10_000 RUB). Every slice uses its conservative
+    built-in defaults. The fallback is intentional — a missing policy
+    file is normal during early bring-up and in CI where the file is
+    not committed; it should not prevent the agent from booting.
+    Operators wanting custom thresholds drop a YAML at the configured
+    path.
+    """
+
+    if settings.agent_policy_path.exists():
+        policy: Policy = load_policy(settings.agent_policy_path)
+    else:
+        # Auditor MEDIUM: silent fallback is operationally invisible — an
+        # operator with a typo in AGENT_POLICY_PATH would never know why
+        # the agent returns rollout-stage rejections. Log the path we
+        # were looking for so the structured-log search resolves it.
+        # NB: with default rollout_stage="shadow" mutations are *rejected*
+        # in this fallback (intentionally — feature is off until configured).
+        structlog.get_logger(__name__).warning(
+            "policy_file_not_found",
+            path=str(settings.agent_policy_path),
+            note=(
+                "using default Policy with rollout_stage='shadow' "
+                "(read-only); mutations will be rejected until a real "
+                "agent_policy.yml is provided."
+            ),
+        )
+        policy = Policy(
+            budget_cap=BudgetCapPolicy(
+                account_daily_budget_cap_rub=settings.agent_max_daily_budget_rub,
+            ),
+            max_cpc=MaxCpcPolicy(),
+            query_drift=QueryDriftPolicy(),
+            conversion_integrity=ConversionIntegrityPolicy(
+                min_conversions_total=1,
+                min_ratio_vs_baseline=0.5,
+                require_all_baseline_goals_present=True,
+            ),
+        )
+
+    pipeline = SafetyPipeline(policy)
+    store = PendingPlansStore(settings.audit_log_path.parent / "pending_plans.jsonl")
+    return pipeline, store
+
+
+# Two flavours of factory live in the registry's default set:
+#   - ``Settings``-only factories (read-only / non-CampaignService tools)
+#   - ``Settings + pipeline + store`` factories (CampaignService-backed tools)
+# We dispatch at registry-build time. Listing them in a single tuple keeps
+# the order stable for diffing.
+
+_CampaignFactory = Callable[[Settings, SafetyPipeline, PendingPlansStore], Tool]
+_PlainFactory = Callable[[Settings], Tool]
+
+_CAMPAIGN_FACTORIES: list[_CampaignFactory] = [
     _make_list_campaigns_tool,
     _make_pause_campaigns_tool,
     _make_resume_campaigns_tool,
     _make_set_campaign_budget_tool,
+]
+_PLAIN_FACTORIES: list[_PlainFactory] = [
     _make_get_keywords_tool,
     _make_set_keyword_bids_tool,
     _make_validate_phrases_tool,
@@ -382,10 +564,19 @@ _DEFAULT_FACTORIES: list[Callable[[Settings], Tool]] = [
 
 
 def build_default_registry(settings: Settings) -> ToolRegistry:
-    """Registry with the seven M1 tools bound to a Settings instance."""
+    """Registry with the seven M1 tools bound to a Settings instance.
+
+    Builds a single ``SafetyPipeline`` + ``PendingPlansStore`` pair
+    shared by every CampaignService-backed handler so the pipeline's
+    SessionState (cross-tool TOCTOU register) survives across tool
+    calls within one agent run.
+    """
+    pipeline, store = _build_safety_pair(settings)
     reg = ToolRegistry()
-    for factory in _DEFAULT_FACTORIES:
-        reg.add(factory(settings))
+    for cf in _CAMPAIGN_FACTORIES:
+        reg.add(cf(settings, pipeline, store))
+    for pf in _PLAIN_FACTORIES:
+        reg.add(pf(settings))
     return reg
 
 
