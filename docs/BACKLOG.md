@@ -37,8 +37,12 @@ All seven reference
       now constructs a shared ``JsonlSink`` alongside the
       pipeline+store). Every mutating call emits
       ``<action>.requested`` before and ``<action>.ok|.failed`` after.
-      Privacy redaction at sink boundary already strips
-      ``new_queries_sample``; verify pause/resume + future bidding
+      Sink-level redaction strips ``new_queries_sample`` (KS#7) and
+      ``missing`` (KS#3); pre-merge privacy review: walk every
+      ``CheckResult.details`` key writer in safety.py, decide for
+      each whether it's PII / brand-sensitive / safe-as-is, and
+      either add to ``_PRIVATE_KEYS`` or document the safe-as-is
+      decision inline. Verify pause/resume + future bidding
       methods inherit the wrapper before claiming "everything is
       audited".
 - [ ] **M2.4: Daily-budget hard guard** — pre-op check that summed
@@ -105,6 +109,39 @@ Accumulated work that isn't blocking but will sting later.
     decision was made on. Alternatively, persist the minimal
     identity (keyword_id → approved ceiling) inside
     `OperationPlan.args` and reconstruct at apply time.
+
+- [ ] **KS#3 ``CheckResult.reason`` leaks operator-supplied negative
+      keywords** (from PR M2.3a auditor M-2 follow-up): the audit
+      sink's ``redact_for_audit`` strips the ``missing`` details key
+      cleanly, but ``CheckResult.reason`` is a free-form string that
+      KS#3 builds via f-string interpolation
+      (``"campaign 42 is missing required negative keywords: BrandX,
+      Competitor Y, sensitive medical phrase"`` at safety.py:651-652).
+      Free-form strings cannot be redacted by a key-based blocklist;
+      the reason is persisted into AuditEvent.action="*.failed" /
+      ``result.error_message`` paths verbatim. Decide between:
+      (a) replace the joined-list with a count
+      (``"... missing 3 required negative keywords"``);
+      (b) hash each phrase before inclusion;
+      (c) accept the leak as policy-bound (operator owns the YAML
+      that supplied the phrases).
+
+- [ ] **Audit JSONL durability — fsync on emit** (from PR M2.3a
+      auditor M-3): ``JsonlSink._append`` calls ``open().close()``
+      which flushes Python's buffer to the OS but does not call
+      ``fsync``. A power loss / SIGKILL between close-return and the
+      OS-buffer flush silently loses the most recent event. Single-
+      operator local use is acceptable today; for compliance /
+      regulatory archival add ``f.flush(); os.fsync(f.fileno())``
+      before the context manager exits, accepting the latency hit
+      (50–200 µs per emit on consumer SSD).
+
+- [ ] **Audit JSONL rotation** (from PR M2.3a hunt list): a long-
+      running agent fills ``audit.jsonl`` forever. Rotation is
+      out-of-scope for the data layer but should land alongside the
+      first deployment that runs more than a week. Either a sidecar
+      ``logrotate`` config or a built-in size-based rotator inside
+      ``JsonlSink``.
 
 - [ ] **M2 mutating methods awaiting `@requires_plan` gating**
       (from PR-B1 auditor HIGH-1; track before claiming "all

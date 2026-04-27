@@ -319,3 +319,109 @@ class TestAuditSinkProtocol:
         async with audit_action(_StubSink(), actor="system", action="boot"):
             pass
         assert [e.action for e in captured] == ["boot.requested", "boot.ok"]
+
+
+# --------------------------------------------------------------------------
+# emit-failure semantics (auditor C-1).
+# --------------------------------------------------------------------------
+
+
+class TestAuditActionEmitFailureSemantics:
+    """The audit emit MUST NOT mask the wrapped operation's outcome.
+
+    Disk-full (or any sink-side I/O error) loses the audit record but
+    never propagates to the caller — the operator must see the
+    business-logic exception, not a confusing "audit_action raised
+    OSError" with the original buried under __context__.
+    """
+
+    @pytest.mark.asyncio
+    async def test_emit_failure_on_ok_path_does_not_propagate(self) -> None:
+        # Wrapped block succeeded → operation is done → caller MUST NOT
+        # see an exception even if the .ok event can't be persisted.
+
+        class _BrokenOnOkSink:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            async def emit(self, event: AuditEvent) -> None:
+                self.calls.append(event.action)
+                if event.action.endswith(".ok"):
+                    raise RuntimeError("disk full on ok")
+
+        sink = _BrokenOnOkSink()
+        # No exception should escape audit_action even though .ok emit raises.
+        async with audit_action(sink, actor="agent", action="set_campaign_budget") as ctx:
+            ctx.set_result({"status": "applied"})
+
+        assert sink.calls == [
+            "set_campaign_budget.requested",
+            "set_campaign_budget.ok",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_emit_failure_on_failed_path_does_not_mask_original(self) -> None:
+        # Wrapped block raised RuntimeError("api failed"); the .failed
+        # emit then fails too. The caller MUST see the api-failed
+        # exception — not the disk-full one.
+
+        class _BrokenOnFailedSink:
+            async def emit(self, event: AuditEvent) -> None:
+                if event.action.endswith(".failed"):
+                    raise OSError("disk full on failed")
+
+        with pytest.raises(RuntimeError, match="api failed"):
+            async with audit_action(
+                _BrokenOnFailedSink(), actor="agent", action="set_campaign_budget"
+            ):
+                raise RuntimeError("api failed")
+
+    @pytest.mark.asyncio
+    async def test_emit_failure_on_requested_path_propagates(self) -> None:
+        # The .requested event is the precondition for any audit
+        # contract. If it fails, the wrapped block has not yet run —
+        # propagating the exception is correct (no money was spent).
+
+        class _BrokenOnRequestedSink:
+            async def emit(self, event: AuditEvent) -> None:
+                raise OSError("disk full on requested")
+
+        wrapped_ran = False
+        with pytest.raises(OSError, match="disk full on requested"):
+            async with audit_action(
+                _BrokenOnRequestedSink(), actor="agent", action="set_campaign_budget"
+            ):
+                wrapped_ran = True
+
+        assert wrapped_ran is False
+
+
+class TestAuditEventTimezoneStrict:
+    def test_naive_datetime_rejected(self) -> None:
+        # Auditor M-1: the audit log must be sortable / comparable
+        # across timezones. Pydantic ``AwareDatetime`` rejects naive
+        # values — this test pins the constraint.
+        from datetime import datetime as _dt
+
+        with pytest.raises(ValidationError):
+            AuditEvent(
+                ts=_dt(2026, 4, 27, 12, 0),  # no tzinfo
+                actor="agent",
+                action="x",
+            )
+
+
+class TestPrivateKeyMissingForKS3:
+    def test_redact_drops_ks3_missing_list(self) -> None:
+        # Auditor M-2: KS#3 (negative-keyword floor) populates
+        # ``CheckResult.details["missing"]`` with operator-supplied
+        # negative keyword phrases. Operators may configure brand /
+        # competitor / sensitive terms; redactor must drop the key.
+        redacted = redact_for_audit(
+            {
+                "missing": ["BrandX", "Competitor Y", "sensitive medical phrase"],
+                "campaign_id": 42,
+            }
+        )
+        assert "missing" not in redacted
+        assert redacted["campaign_id"] == 42

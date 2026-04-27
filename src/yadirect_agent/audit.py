@@ -43,9 +43,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+import structlog
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 __all__ = [
+    "Actor",
     "AuditEvent",
     "AuditSink",
     "JsonlSink",
@@ -96,7 +98,9 @@ class AuditEvent(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    ts: datetime
+    # ``AwareDatetime`` rejects naive datetimes — the audit log must
+    # be sortable / comparable across timezones (auditor M-1).
+    ts: AwareDatetime
     actor: Actor
     action: str = Field(..., min_length=1)
     trace_id: str | None = None
@@ -123,10 +127,18 @@ class AuditSink(Protocol):
 
 
 # Privacy: keys we MUST strip from any ``args`` / ``result`` dict
-# before persisting. Today's only entry is KS#7's raw user-search-query
-# sample; expand as new checks land. Same blocklist the tools-layer
-# response redactor uses (PR #25 second-pass auditor MEDIUM).
-_PRIVATE_KEYS: frozenset[str] = frozenset({"new_queries_sample"})
+# before persisting. Today's entries:
+# - ``new_queries_sample``: KS#7 (query drift) raw user search query
+#   sample. Same blocklist the tools-layer response redactor uses
+#   (PR #25 second-pass auditor MEDIUM).
+# - ``missing``: KS#3 (negative-keyword floor) operator-supplied
+#   negative keyword phrases that a campaign lacks. Operators may
+#   configure brand / competitor / sensitive terms in this list
+#   (auditor M-2). NB: KS#3 also embeds the full list inside its
+#   ``CheckResult.reason`` string via f-string interpolation — the
+#   redactor cannot strip it from a free-form string. Tracked in
+#   docs/BACKLOG.md as a follow-up against safety.py.
+_PRIVATE_KEYS: frozenset[str] = frozenset({"new_queries_sample", "missing"})
 
 
 def redact_for_audit(value: Any) -> Any:
@@ -180,6 +192,16 @@ class JsonlSink:
         # ``emit`` calls from the same process append cleanly. Cross-
         # process safety is out of scope (single-operator JSONL design,
         # see docs/BACKLOG.md "apply-plan concurrency / file-lock").
+        #
+        # Durability note (auditor M-3): ``open(...).close()`` flushes
+        # the Python-level buffer to the OS, but does NOT call
+        # ``fsync``. A power loss / SIGKILL between close-return and
+        # the OS buffer flush silently loses the most recent event. For
+        # a single-operator local audit log this is acceptable; if the
+        # log ever needs durability guarantees (compliance, regulatory
+        # archival) the fix is two lines: ``f.flush(); os.fsync(f.fileno())``
+        # before the context manager exits, accepting the latency hit.
+        # Tracked in docs/BACKLOG.md as a follow-up.
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -259,14 +281,21 @@ async def audit_action(
         resource=resource,
         args=dict(args or {}),
     )
+    # ``.requested`` emit happens BEFORE the wrapped block runs. If it
+    # raises, the wrapped block never executes and the exception
+    # propagates as-is — that's acceptable: no money was spent because
+    # nothing happened yet, and the operator gets the I/O error directly.
     await sink.emit(requested)
 
     try:
         yield ctx
     except Exception as exc:
         # Build .failed event preserving any partial result the caller
-        # already populated, then surface exception metadata. Re-raise
-        # the original exception so the caller's stack trace is intact.
+        # already populated, then surface exception metadata. The audit
+        # emit MUST NOT mask the original business-logic exception:
+        # if disk-full happens here, the operator needs the underlying
+        # API failure (or whatever raised inside the ``with`` block),
+        # not the I/O error from the audit sink. Auditor C-1.
         result_payload: dict[str, Any] = dict(ctx._result or {})
         result_payload["error_type"] = type(exc).__name__
         result_payload["error_message"] = str(exc)
@@ -279,7 +308,19 @@ async def audit_action(
             args=dict(args or {}),
             result=result_payload,
         )
-        await sink.emit(failed)
+        try:
+            await sink.emit(failed)
+        except Exception:
+            # Audit-write failure on the failure path — log as warning
+            # but do NOT propagate; the original exception is the one
+            # the operator must see. The .failed record is lost, but
+            # the .requested record is on disk so the gap is visible
+            # ("requested with no terminal event").
+            structlog.get_logger(__name__).warning(
+                "audit_emit_failed_in_failure_path",
+                action=f"{action}.failed",
+                error_type=type(exc).__name__,
+            )
         raise
 
     ok = AuditEvent(
@@ -292,4 +333,16 @@ async def audit_action(
         result=ctx._result,
         units_spent=ctx._units_spent,
     )
-    await sink.emit(ok)
+    try:
+        await sink.emit(ok)
+    except Exception:
+        # Audit-write failure on the success path — the wrapped
+        # operation already succeeded, so we MUST NOT raise an
+        # exception here that makes the caller think the API call
+        # failed. Same auditor C-1 reasoning: emit failures lose
+        # evidence but never mask outcome. Loss is visible from
+        # the JSONL gap (requested with no terminal event).
+        structlog.get_logger(__name__).warning(
+            "audit_emit_failed_in_success_path",
+            action=f"{action}.ok",
+        )
