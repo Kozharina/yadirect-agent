@@ -23,6 +23,7 @@ reserved for the apply-plan executor's re-entry. Read-only methods
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import structlog
 
@@ -60,6 +61,47 @@ class CampaignSummary:
             type=c.type,
             daily_budget_rub=budget_rub,
         )
+
+
+class PartialActionError(RuntimeError):
+    """Raised when Yandex Direct's bulk-action response contains
+    per-item errors despite the top-level call returning HTTP 200.
+
+    Direct's ``campaigns.suspend`` / ``campaigns.resume`` /
+    ``campaigns.archive`` return an ``ActionResults`` envelope
+    where each element can carry per-item ``Errors``. The top-
+    level error path doesn't fire on partial success — the
+    response says "OK" while two of three campaigns weren't
+    touched. Without this exception the plan would silently
+    transition to ``applied`` while the operator's intent was
+    only partially fulfilled, breaking the bulk plan's
+    "all-or-none" contract. Auditor M2 follow-up MEDIUM.
+    """
+
+    def __init__(self, action: str, failed_items: list[dict[str, Any]]) -> None:
+        super().__init__(f"{action}: {len(failed_items)} of N items failed at the API level")
+        self.action = action
+        self.failed_items = failed_items
+
+
+def _assert_action_results_clean(result: dict[str, Any], results_key: str, action: str) -> None:
+    """Inspect ``result[results_key]`` for per-item ``Errors``.
+
+    If any element carries a non-empty ``Errors`` list, raise
+    ``PartialActionError`` so the caller can transition the plan
+    to ``failed`` rather than silently log success on partial
+    completion.
+
+    Tolerates a missing ``results_key`` (returns clean) — that
+    happens for the empty-id-list case and in fakes that don't
+    yet emit the envelope shape.
+    """
+    items = result.get(results_key, [])
+    if not isinstance(items, list):
+        return
+    failed = [item for item in items if isinstance(item, dict) and item.get("Errors")]
+    if failed:
+        raise PartialActionError(action, failed)
 
 
 async def _build_account_budget_snapshot(
@@ -248,7 +290,12 @@ class CampaignService:
     async def _do_pause(self, campaign_ids: list[int]) -> None:
         self._logger.info("campaigns.pause.request", ids=campaign_ids)
         async with DirectService(self._settings) as api:
-            await api.suspend_campaigns(campaign_ids)
+            result = await api.suspend_campaigns(campaign_ids)
+        # Direct returns HTTP 200 with per-item errors on partial
+        # success; surface those as a service-level failure so the
+        # plan transitions to ``failed`` rather than ``applied``.
+        # Auditor M2 follow-up MEDIUM.
+        _assert_action_results_clean(result, "SuspendResults", "pause_campaigns")
         self._logger.info("campaigns.pause.ok", ids=campaign_ids)
 
     @requires_plan(
@@ -287,7 +334,8 @@ class CampaignService:
     async def _do_resume(self, campaign_ids: list[int]) -> None:
         self._logger.info("campaigns.resume.request", ids=campaign_ids)
         async with DirectService(self._settings) as api:
-            await api.resume_campaigns(campaign_ids)
+            result = await api.resume_campaigns(campaign_ids)
+        _assert_action_results_clean(result, "ResumeResults", "resume_campaigns")
         self._logger.info("campaigns.resume.ok", ids=campaign_ids)
 
     @requires_plan(
@@ -388,7 +436,12 @@ class CampaignService:
         import sys
         from types import FrameType
 
-        frame: FrameType | None = sys._getframe(1)  # caller of set_daily_budget
+        # Start one frame above this helper (i.e. inside the caller
+        # ``pause`` / ``resume`` / ``set_daily_budget``) and walk
+        # outward looking for the @requires_plan decorator's wrapper
+        # frame. The wrapper holds ``_applying_plan_id`` as a local
+        # only on the apply-plan re-entry path.
+        frame: FrameType | None = sys._getframe(1)
         for _ in range(8):
             if frame is None:
                 break

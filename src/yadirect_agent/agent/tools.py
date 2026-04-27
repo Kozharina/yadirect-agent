@@ -220,7 +220,11 @@ class _ListCampaignsInput(BaseModel):
 class _IdListInput(BaseModel):
     model_config = _STRICT
 
-    ids: list[int] = Field(..., description="One or more campaign ids.")
+    ids: list[int] = Field(
+        ...,
+        min_length=1,
+        description="One or more campaign ids.",
+    )
 
 
 class _SetCampaignBudgetInput(BaseModel):
