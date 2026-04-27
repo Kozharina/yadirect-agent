@@ -32,7 +32,7 @@ from ..agent.executor import requires_plan
 from ..agent.pipeline import ReviewContext, SafetyPipeline
 from ..agent.plans import PendingPlansStore
 from ..agent.safety import AccountBudgetSnapshot, BudgetChange, CampaignBudget
-from ..audit import Actor, AuditSink, audit_action
+from ..audit import AuditSink, audit_action, infer_actor_from_frame
 from ..clients.direct import DirectService
 from ..config import Settings
 from ..models.campaigns import Campaign, CampaignState
@@ -313,7 +313,7 @@ class CampaignService:
             await self._do_pause(campaign_ids)
             return
 
-        actor = self._infer_actor()
+        actor = infer_actor_from_frame()
         async with audit_action(
             self._audit_sink,
             actor=actor,
@@ -357,7 +357,7 @@ class CampaignService:
             await self._do_resume(campaign_ids)
             return
 
-        actor = self._infer_actor()
+        actor = infer_actor_from_frame()
         async with audit_action(
             self._audit_sink,
             actor=actor,
@@ -419,7 +419,7 @@ class CampaignService:
         # bypass (the decorator strips ``_applying_plan_id`` before
         # invoking us; presence of ``_apply_plan_caller`` signals the
         # bypass path). We look at the inspect frame for it.
-        actor = self._infer_actor()
+        actor = infer_actor_from_frame()
 
         if self._audit_sink is None:
             await self._do_set_daily_budget(campaign_id, budget_rub)
@@ -450,46 +450,3 @@ class CampaignService:
         async with DirectService(self._settings) as api:
             await api.update_campaign_budget(campaign_id, budget_rub)
         self._logger.info("campaigns.budget.ok", campaign_id=campaign_id)
-
-    def _infer_actor(self) -> Actor:
-        """Walk the caller frames to find the @requires_plan ``wrapper``
-        with ``_applying_plan_id`` set — that's the only frame the
-        decorator's bypass branch produces, and its presence means the
-        operator drove this call via apply-plan.
-
-        Auditor HIGH: the previous version checked ANY frame's locals
-        for ``_applying_plan_id``, which made the actor classification
-        sensitive to local-name collisions in middleware / orchestration
-        / test code. Pinning the match to ``frame.f_code.co_name ==
-        "wrapper"`` ensures only the canonical decorator frame qualifies.
-
-        Frame inspection is ugly but the alternative is plumbing an
-        ``actor`` argument from the executor through the decorator into
-        the wrapped method, which fights the decorator's
-        signature-transparency contract. The walk is bounded
-        (we look ~8 frames up and stop) so unrelated frames don't
-        affect the verdict.
-        """
-        import sys
-        from types import FrameType
-
-        # Start one frame above this helper (i.e. inside the caller
-        # ``pause`` / ``resume`` / ``set_daily_budget``) and walk
-        # outward looking for the @requires_plan decorator's wrapper
-        # frame. The wrapper holds ``_applying_plan_id`` as a local
-        # only on the apply-plan re-entry path.
-        frame: FrameType | None = sys._getframe(1)
-        for _ in range(8):
-            if frame is None:
-                break
-            # Match only the decorator's wrapper closure — name is
-            # set by ``functools.wraps(fn)`` in ``requires_plan`` to
-            # ``"wrapper"`` before ``__wrapped__`` rewrites it. The
-            # closure body holds ``_applying_plan_id`` as a local.
-            if (
-                frame.f_code.co_name == "wrapper"
-                and frame.f_locals.get("_applying_plan_id") is not None
-            ):
-                return "human"
-            frame = frame.f_back
-        return "agent"
