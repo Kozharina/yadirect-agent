@@ -153,6 +153,82 @@ class ReportingService:
             cr_pct=_compute_cr_pct(clicks, conversions),
         )
 
+    async def account_overview(
+        self,
+        *,
+        date_range: DateRange,
+        goal_id: int | None = None,
+    ) -> list[CampaignPerformance]:
+        """All campaigns with traffic in the window, one row each.
+
+        Powers M15.5's rule-based account health check — without
+        this, the agent can't surface "campaigns burning money
+        without converting" or rank campaigns by efficiency.
+
+        Groups by ``ym:ad:directCampaignID`` (numeric, the join key
+        — by-name would conflate same-named promo cycles).
+
+        No filter is applied; the caller gets every campaign that
+        had at least one visit in the window. Brand-new or paused
+        campaigns with zero traffic in the window simply won't appear.
+
+        Rows with malformed dimensions (missing id, non-int id) are
+        skipped rather than crashing the whole overview — defensive
+        against unexpected wire shapes. Logged via structlog at
+        warning level so the operator can see when Metrika returns
+        unexpected data, but the agent loop is not interrupted.
+        """
+        counter_id = self._require_counter_id()
+
+        metrics = [_METRIC_VISITS, _METRIC_DIRECT_COST]
+        if goal_id is not None:
+            metrics.append(f"ym:s:goal{goal_id}conversions")
+
+        async with MetrikaService(self._settings) as mc:
+            rows = await mc.get_report(
+                counter_id=counter_id,
+                metrics=metrics,
+                dimensions=["ym:ad:directCampaignID"],
+                date_range=date_range,
+                filters=None,
+            )
+
+        results: list[CampaignPerformance] = []
+        for row in rows:
+            if not row.dimensions:
+                continue
+            dim = row.dimensions[0]
+            raw_id = dim.get("id")
+            # Metrika sometimes returns id as int, sometimes as
+            # numeric string — accept both, reject anything else.
+            campaign_id: int
+            if isinstance(raw_id, int) and not isinstance(raw_id, bool):
+                campaign_id = raw_id
+            elif isinstance(raw_id, str) and raw_id.isdigit():
+                campaign_id = int(raw_id)
+            else:
+                continue
+            campaign_name = str(dim.get("name") or f"campaign_{campaign_id}")
+
+            m = row.metrics
+            clicks = int(m[0]) if len(m) > 0 else 0
+            cost_rub = float(m[1]) if len(m) > 1 else 0.0
+            conversions = int(m[2]) if len(m) > 2 and goal_id is not None else 0
+
+            results.append(
+                CampaignPerformance(
+                    campaign_id=campaign_id,
+                    campaign_name=campaign_name,
+                    date_range=date_range,
+                    clicks=clicks,
+                    cost_rub=cost_rub,
+                    conversions=conversions,
+                    cpa_rub=_compute_cpa(cost_rub, conversions),
+                    cr_pct=_compute_cr_pct(clicks, conversions),
+                ),
+            )
+        return results
+
 
 # Re-export so monkeypatch in tests can target a stable name.
 __all__ = ["MetrikaService", "ReportingService"]
