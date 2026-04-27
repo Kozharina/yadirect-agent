@@ -20,37 +20,118 @@
 
 ## Active queue
 
-Ordered — top is what I take next.
+Ordered by **user journey phase** (see
+[`docs/OPERATING.md`](./OPERATING.md) → "User journey" and
+[`docs/TECHNICAL_SPEC.md`](./TECHNICAL_SPEC.md) → "Путь пользователя").
+The product target is **a media-buyer-replacement agent for Anna**
+(non-developer account owner). M0–M3 done; M15 is the gate — without
+it, nothing else matters because Anna can't get past install.
 
-### 🔥 Before M2 (safety)
+### 🚪 Phase 0 + Phase 1 (Discovery + Shadow) — release 0.2.0
 
+**This is the top of the queue.** Until M15 ships, the product is
+demo-only, technically; it cannot be handed to a non-developer.
 
-### 🛡️ M2 — safety layer (one PR per kill-switch)
+- [ ] **M15 — Frictionless onboarding** (§M15): PyPI release,
+      `install-into-claude-desktop`, standard OAuth flow with
+      localhost callback + keyring, conversational MCP onboarding,
+      `--no-llm` rule-based mode, built-in scheduler
+      (LaunchAgent/systemd/Task Scheduler). Acceptance:
+      time-to-first-value ≤ 10 min on a clean machine, **without
+      Anthropic key**. Smoke-tested in CI.
+- [ ] **M20 — Human-readable rationale** (§M20): `RationaleEvent`
+      model, emission inside `@requires_plan`, persistence to
+      `logs/rationale.jsonl`, `rationale show / why` CLI and
+      `explain_decision` MCP tool. **Required for shadow-week
+      calibration** — without rationale, the user can't compare the
+      agent's proposal to their own thinking.
+- [ ] **M21 — Cost tracking** (§M21, promoted from Ideas): per-call
+      tokens + RUB capture, `agent_monthly_llm_budget_rub` knob,
+      auto-degrade to `--no-llm` when budget exhausted, `cost
+      status` surface. **Required before autonomy** — otherwise LLM
+      spend creeps invisibly and the agent silently dies at
+      month-end.
+- [ ] **M6 (basic) — Metrika reporting** (§M6): `get_goals`,
+      `get_report`, `conversion_by_source` — needed for the
+      Phase-0 first-look "вот что у тебя в кабинете" report and
+      for the rule-based health check (M15.5).
 
-Each one is TDD, with `security-auditor` sub-agent review before merge.
-All seven reference
-[`docs/PRIOR_ART.md`](./PRIOR_ART.md) → "Agentic PPC Campaign Management".
+### 🛡️ Phase 2 (Assist) — release 0.3.0
 
-*(M2 fully shipped — see Done. Next safety work happens
-inside other milestones: M3 MCP `--allow-write` gating builds on
-M2's pipeline; M5 A/B testing service inherits M2 audit; M7
-evals exercise the full safety surface.)*
+Anna is in assist; the agent does reversible work, asks for
+mutating work via tappable approvals.
 
-*(M3 fully shipped — see Done.)*
-
-### 🔎 Semantics, A/B, reporting (later milestones)
-
+- [ ] **M18 — Notifications & approvals** (§M18): Telegram /
+      Slack / email sinks, inline-keyboard Apply/Reject/Why
+      cards, HMAC-signed callback_data, 24h plan timeout,
+      `notify setup telegram` wizard. **Phase 2 is impossible
+      without this** — terminal-only approval is unrealistic
+      for a real user.
+- [ ] **M19 — Rollback / time machine** (§M19): per-run snapshot
+      of dangerous fields (budgets, statuses, strategies, bids,
+      adjustments), `rollback --to=<run_id>` (re-uses safety
+      pipeline — rollback is itself a mutation), conversational
+      `rollback_last_run()` MCP tool, conflict-handling for
+      changes overwritten since the run.
 - [ ] **M4 — real Wordstat** (§M4): provider protocol, Wordstat API
       impl (gated by real access), KeyCollector CSV bridge,
-      embeddings-based clustering, negative-keyword cleaner, upload to
-      ad group respecting Direct's 200-keywords-per-group cap.
-- [ ] **M5 — A/B testing service** (§M5): `AbTest` model, Mann-Whitney
-      U for CPA/ROAS, bootstrap CIs, conclude auto-pauses losers.
-      Reference: `ericosiu/ai-marketing-skills/growth-engine`
-      (in PRIOR_ART).
-- [ ] **M6 — Reporting & alerts** (§M6): Metrika `get_goals`,
-      `get_report`, `conversion_by_source`; `services/reporting.py`;
-      `services/alerts.py`; `alerts.jsonl`.
+      embeddings-based clustering, negative-keyword cleaner, upload
+      respecting Direct's 200-keywords-per-group cap.
+- [ ] **M5 — A/B testing service** (§M5): `AbTest` model,
+      Mann-Whitney U for CPA/ROAS, bootstrap CIs, `conclude`
+      auto-pauses losers. **More useful once M4 lands.**
+- [ ] **M6 (full) — alerts** (§M6.3): `services/alerts.py`,
+      `alerts.jsonl`, threshold rules surfaced via M18.
+- [ ] **M11 — Bid strategies** (§M11): typed strategy models,
+      `set_strategy` under `@requires_plan`, `evaluate` recommender,
+      trigger-based switches with KS#11 churn limit.
+- [ ] **M17 — Competitive intelligence (API only)** (§M17):
+      `auctionperformance.get` (or `reports`-based fallback),
+      position history + competitor pressure, integrated into
+      M20 rationale ("ставка не сработала, потому что доля
+      показов упала с 62% до 41%").
+
+### 🤖 Phase 3 (Autonomy) — release 0.4.0
+
+Anna doesn't open Direct. Silence = success.
+
+- [ ] **M8 — Creatives lifecycle** (§M8): `services/creatives/*` —
+      generator (multi-hook), moderation poll + auto-repair,
+      diversity guard, creative A/B (extends M5), `BusinessProfile`
+      schema, KS#8 compliance check. **Depends on**: M5.
+- [ ] **M9 — Audiences & targeting** (§M9): Audience API client,
+      Metrika segments wrapper, look-alike + retargeting lists,
+      bid-modifier service, KS#9 adjustment ceiling.
+- [ ] **M10 — Budget planning & pacing** (§M10): monthly planner
+      (marginal-elasticity allocation), daily pacing job, forecast
+      with bootstrap CI, KS#10 pacing emergency stop.
+      **Depends on**: M6 full.
+- [ ] **M12 — Stakeholder reporting** (§M12): weekly + monthly
+      Markdown reports, LLM-distilled insights (gated on
+      Anthropic key — degrades to numbers-only without),
+      Jinja templates, CLI + MCP delivery. **Depends on**: M6, M10.
+- [ ] **M13 — Account health monitoring** (§M13): daily health
+      check (rejected ads, lost-impression-share, dead adgroups,
+      CTR drift), auto-repair via M8.2, `doctor account` CLI.
+      **Depends on**: M8.
+- [ ] **M16 — Calendar & seasonality** (§M16): event calendar,
+      pre/post-event budget bumps via apply-plan, anomaly
+      sensitivity profiles per event. Without this, the agent
+      panics on Black Friday.
+
+### 🏢 Optional — agency mode
+
+- [ ] **M14 — Multi-account / agency mode** (§M14): per-client
+      `Settings`, per-client policy file, per-client audit log,
+      `agency status` CLI. **Only ship if** the product becomes
+      an agency tool. Defer until there's a second real client.
+
+### 🧪 Cross-cutting
+
+- [ ] **M7.2 expansion — agent evals dataset**: 10–20 typed tasks
+      driven through `tests/evals/` per-PR. Today there are 3
+      starter evals; needs broader coverage as M4–M21 ship so
+      regressions in agent reasoning surface as red.
 
 ## In progress
 
@@ -536,8 +617,10 @@ turn actually comes.
       `git-cliff`, tied to conventional commits.
 - [ ] `CONTRIBUTING.md` + `CODE_OF_CONDUCT.md` when/if the project
       attracts external contributors.
-- [ ] **Cost tracking** — rubles per tool call, tokens per turn,
-      surfaced on `AgentRun` and written to audit.
+- [x] ~~**Cost tracking**~~ — promoted to **M21** in Active queue
+      (Phase 0+1 release 0.2.0). Tokens-per-turn + RUB cost capture,
+      `agent_monthly_llm_budget_rub` ceiling, auto-degrade to
+      `--no-llm` when budget exhausted.
 - [ ] Project-local sub-agent `yadirect-safety-auditor` — preloaded
       with `PRIOR_ART` + `TECHNICAL_SPEC §M2` + `ARCHITECTURE`,
       reviewed against every safety-layer PR.
@@ -750,7 +833,7 @@ Last 10 items (newest at top). Older items are available via
       ``yadirect-agent mcp serve`` typer subapp with
       ``--allow-write`` flag and env fallback. ``ToolRegistry``
       gains ``__iter__`` for clean walk. Operator runbook
-      ``docs/CLAUDE_DESKTOP.md`` shipped with copy-pasteable
+      ``docs/OPERATING.md`` (then ``CLAUDE_DESKTOP.md``) shipped with copy-pasteable
       Claude Desktop ``mcpServers`` JSON blocks (read-only +
       write modes), full operator workflow, troubleshooting
       table, and rollout-stage promotion sequence. 10 new tests
