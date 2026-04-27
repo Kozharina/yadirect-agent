@@ -671,25 +671,39 @@ def test_apply_plan_routes_resume_campaigns_to_service(
 # --------------------------------------------------------------------------
 
 
-def test_mcp_serve_help_shows_allow_write_flag(
-    runner: CliRunner,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``yadirect-agent mcp serve --help`` mentions ``--allow-write``
-    so an operator running ``--help`` for the first time discovers
-    the gating flag without reading source.
-
-    ``COLUMNS=200`` keeps rich from wrapping the flag name across
-    lines in narrow CI terminals (the default 80-column wrap broke
-    ``--allow-write`` into ``--allow-\\nwrite`` which made the
-    substring assertion flake on Linux CI even though it passed
-    locally).
+def test_mcp_serve_command_documents_allow_write_in_help_text() -> None:
+    """The ``--allow-write`` flag's help text must mention
+    ``MCP_ALLOW_WRITE`` so operators discover the env-var equivalent.
+    Read the typer.Option's ``help=`` field directly via
+    ``get_type_hints(include_extras=True)`` rather than via
+    ``--help`` rendered output — rich + typer interleave ANSI
+    escapes inside the flag name in non-tty CI terminals, which
+    breaks any substring assertion on the rendered text.
     """
-    monkeypatch.setenv("COLUMNS", "200")
+    import inspect
+    import typing
+
+    from yadirect_agent.cli.main import mcp_serve_cmd
+
+    sig = inspect.signature(mcp_serve_cmd)
+    assert "allow_write" in sig.parameters
+    assert mcp_serve_cmd.__doc__ is not None
+
+    hints = typing.get_type_hints(mcp_serve_cmd, include_extras=True)
+    metadata = typing.get_args(hints["allow_write"])[1:]  # skip bool
+    option_helps = [getattr(m, "help", "") or "" for m in metadata if hasattr(m, "help")]
+    combined = " ".join(option_helps)
+    assert "MCP_ALLOW_WRITE" in combined, combined
+
+
+def test_mcp_serve_help_command_exits_cleanly(runner: CliRunner) -> None:
+    """Companion guard: ``yadirect-agent mcp serve --help`` exits
+    cleanly. Together with the help-text doc test above this
+    guarantees operators can discover the flag without needing a
+    rendering-sensitive substring match.
+    """
     result = runner.invoke(app, ["mcp", "serve", "--help"])
     assert result.exit_code == 0
-    assert "--allow-write" in result.output
-    assert "MCP_ALLOW_WRITE" in result.output
 
 
 def test_mcp_serve_invokes_build_mcp_server_with_allow_write_default_false(
