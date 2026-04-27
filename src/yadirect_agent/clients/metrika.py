@@ -69,24 +69,46 @@ class _RetryableStatus(Exception):  # noqa: N818 -- control-flow signal, not an 
         self.response = response
 
 
+# Cap on error-message length pulled from response bodies. A
+# misbehaving proxy can return a multi-megabyte HTML error page; an
+# adversarial / compromised server could deliberately stuff a huge
+# string into ``errors[0].message``. Without a cap, that whole body
+# becomes the exception's ``str()`` value and from there bloats
+# audit JSONL rows, agent error contexts, and any structured log
+# field that records the failure. 500 chars is enough for any
+# legitimate diagnostic, well under any LLM context budget, and
+# leaves a clear truncation marker so the operator knows there was
+# more. (auditor M6 MEDIUM-3.)
+_MAX_ERROR_MESSAGE_LEN = 500
+
+
+def _truncate(text: str) -> str:
+    if len(text) <= _MAX_ERROR_MESSAGE_LEN:
+        return text
+    return text[:_MAX_ERROR_MESSAGE_LEN] + "… [truncated]"
+
+
 def _extract_message(response: httpx.Response) -> str:
-    """Best-effort message extraction from a Metrika error envelope.
+    """Best-effort, length-capped error message from a Metrika response.
 
     Metrika returns ``{"errors": [{"message": "...", "error_type": "..."}]}``
     on errors. We pull the first error's message; if the body isn't JSON
     or the shape is unexpected, fall back to the raw text so the audit
     log still has something useful instead of just a status code.
+
+    Both the structured-message path and the raw-body fallback are
+    truncated to ``_MAX_ERROR_MESSAGE_LEN``.
     """
     try:
         body = response.json()
     except (ValueError, TypeError):
-        return response.text or f"HTTP {response.status_code}"
+        return _truncate(response.text or f"HTTP {response.status_code}")
 
     if isinstance(body, dict) and isinstance(body.get("errors"), list) and body["errors"]:
         first = body["errors"][0]
         if isinstance(first, dict) and "message" in first:
-            return str(first["message"])
-    return response.text or f"HTTP {response.status_code}"
+            return _truncate(str(first["message"]))
+    return _truncate(response.text or f"HTTP {response.status_code}")
 
 
 def _classify_terminal(response: httpx.Response) -> Exception:

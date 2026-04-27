@@ -195,6 +195,50 @@ class TestGetGoals:
             with pytest.raises(ValidationError, match="counter_id"):
                 await svc.get_goals(counter_id=12345)
 
+    @respx.mock
+    async def test_huge_error_body_capped_in_message(
+        self,
+        settings: Settings,
+    ) -> None:
+        # A misbehaving proxy can return a multi-megabyte HTML error
+        # page. Without capping, that whole body ends up as the
+        # exception's str(), and from there bloats every audit JSONL
+        # row that records the failure. (auditor M6 MEDIUM-3.)
+        huge_body = "X" * 100_000
+        respx.get(_GOALS_URL).mock(
+            return_value=httpx.Response(400, text=huge_body),
+        )
+
+        async with MetrikaService(settings) as svc:
+            with pytest.raises(ValidationError) as exc_info:
+                await svc.get_goals(counter_id=12345)
+
+        # Message must be bounded — exact cap is implementation detail
+        # but it must be far smaller than the raw 100k body.
+        assert len(str(exc_info.value)) < 2000
+
+    @respx.mock
+    async def test_huge_structured_message_capped(
+        self,
+        settings: Settings,
+    ) -> None:
+        # Same cap applies when the message comes from the structured
+        # ``errors[0].message`` field — a malicious server could stuff
+        # arbitrary length there too.
+        huge_message = "X" * 100_000
+        respx.get(_GOALS_URL).mock(
+            return_value=httpx.Response(
+                400,
+                json={"errors": [{"message": huge_message}]},
+            ),
+        )
+
+        async with MetrikaService(settings) as svc:
+            with pytest.raises(ValidationError) as exc_info:
+                await svc.get_goals(counter_id=12345)
+
+        assert len(str(exc_info.value)) < 2000
+
 
 class TestGetReport:
     @respx.mock
