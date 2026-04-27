@@ -461,6 +461,45 @@ async def test_build_bid_context_populates_snapshot_from_api_rows(
 
 
 @pytest.mark.asyncio
+async def test_build_bid_context_records_baseline_timestamp(
+    settings: Settings, fake_direct: _FakeDirectService
+) -> None:
+    """The bid context must stamp ``baseline_timestamp`` so the audit
+    sink (M2.3) and the apply-plan re-review path can detect a stale
+    snapshot. KS#4's ``_is_increase`` compares the proposed bid
+    against the snapshot's ``current_*_bid_rub`` — an undated,
+    arbitrarily-old snapshot that survives apply-plan re-review
+    would hide a parallel-operator bid bump and let a second
+    consecutive increase slip past KS#4 unnoticed (auditor
+    M2-bid-snapshot HIGH-2)."""
+    from datetime import UTC, datetime, timedelta
+
+    fake_direct.keywords_to_return = [
+        Keyword.model_validate(
+            {
+                "Id": 42,
+                "AdGroupId": 100,
+                "CampaignId": 7,
+                "Keyword": "k",
+                "Bid": 5_000_000,
+                "Productivity": {"Value": 9},
+            }
+        )
+    ]
+    svc = BiddingService(settings)
+
+    before = datetime.now(UTC)
+    ctx = await _build_bid_context(svc, [BidUpdate(keyword_id=42, new_search_bid_rub=10.0)])
+    after = datetime.now(UTC)
+
+    assert ctx.baseline_timestamp is not None
+    assert ctx.baseline_timestamp.tzinfo is not None  # tz-aware, not naive
+    # Generous bracket — the call is fast but the test must not be
+    # flaky on a busy CI host.
+    assert before - timedelta(seconds=1) <= ctx.baseline_timestamp <= after + timedelta(seconds=1)
+
+
+@pytest.mark.asyncio
 async def test_build_bid_context_skips_rows_with_missing_identifiers(
     settings: Settings, fake_direct: _FakeDirectService
 ) -> None:

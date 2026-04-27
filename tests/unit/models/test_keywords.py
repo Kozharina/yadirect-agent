@@ -112,6 +112,25 @@ def test_keyword_zero_bid_distinct_from_missing_bid() -> None:
     assert kw.current_search_bid_rub == 0.0
 
 
+@pytest.mark.parametrize("field_name", ["Bid", "ContextBid"])
+def test_keyword_rejects_negative_bid(field_name: str) -> None:
+    """Defensive: a negative ``Bid`` / ``ContextBid`` from a malformed
+    or adversarially-shaped API row would land in the safety
+    snapshot as a negative ``current_*_bid_rub`` and poison KS#4's
+    ``_is_increase(new, current)`` comparison — a positive new bid
+    against a negative baseline reads as an increase even when the
+    operator was lowering the bid, blocking legitimate decreases.
+    Equally, KS#2 cap arithmetic loses meaning. Reject at the model
+    boundary so the failure surfaces as a ValidationError on
+    ``get_keywords`` (loud, attributable) rather than a silent
+    safety bypass (auditor M2-bid-snapshot HIGH-1).
+    """
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        Keyword.model_validate({"Id": 1, "AdGroupId": 100, "Keyword": "k", field_name: -1})
+
+
 # --------------------------------------------------------------------------
 # Productivity envelope → integer QS via property.
 # --------------------------------------------------------------------------
@@ -136,11 +155,11 @@ def test_keyword_extracts_quality_score_from_productivity() -> None:
 
 def test_keyword_quality_score_rounds_fractional_value() -> None:
     """Direct's Productivity.Value is documented as float in 0..10;
-    KS#4 takes int. Banker's-rounding via ``round`` is acceptable —
-    QS thresholds are coarse and one-point-off rounding never moves
-    the verdict (4.5 → 4 is below threshold 5; 4.5 → 5 passes).
-    Pin the chosen direction so a future refactor can't flip it
-    silently."""
+    KS#4 takes int. We round half UP (the operator's intuitive
+    direction; matches Direct's own UI rendering of Productivity)
+    rather than relying on Python's banker's rounding, which would
+    silently flip the threshold verdict at exact .5 boundaries
+    (auditor M2-bid-snapshot MEDIUM)."""
     kw = Keyword.model_validate(
         {
             "Id": 1,
@@ -150,6 +169,35 @@ def test_keyword_quality_score_rounds_fractional_value() -> None:
         }
     )
     assert kw.quality_score == 5
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        # Half-up rule pinned at every integer boundary that intersects
+        # a plausible ``min_quality_score_for_bid_increase`` threshold.
+        # A future refactor that swaps in banker's rounding (round-half-
+        # to-even) would silently flip several of these — auditor
+        # MEDIUM finding on this PR.
+        (0.5, 1),
+        (1.5, 2),
+        (4.5, 5),
+        (5.5, 6),
+        (9.5, 10),
+    ],
+)
+def test_keyword_quality_score_rounds_half_up_at_integer_boundaries(
+    value: float, expected: int
+) -> None:
+    kw = Keyword.model_validate(
+        {
+            "Id": 1,
+            "AdGroupId": 100,
+            "Keyword": "k",
+            "Productivity": {"Value": value},
+        }
+    )
+    assert kw.quality_score == expected
 
 
 def test_keyword_quality_score_none_when_productivity_missing() -> None:
