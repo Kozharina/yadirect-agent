@@ -283,3 +283,168 @@ class TestCampaignPerformance:
                     date_range=_WEEK,
                     goal_id=100,
                 )
+
+
+# --------------------------------------------------------------------------
+# account_overview
+# --------------------------------------------------------------------------
+
+
+class TestAccountOverview:
+    async def test_returns_one_perf_per_campaign(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Three campaigns, each as a separate row grouped by
+        # directCampaignID. Each dimension dict carries the campaign
+        # id (int) and name (string).
+        fake = _FakeMetrikaService(
+            report_rows=[
+                ReportRow(
+                    dimensions=[{"id": 42, "name": "brand"}],
+                    metrics=[120.0, 850.5, 5.0],
+                ),
+                ReportRow(
+                    dimensions=[{"id": 51, "name": "non-brand"}],
+                    metrics=[80.0, 2400.0, 0.0],
+                ),
+                ReportRow(
+                    dimensions=[{"id": 73, "name": "retargeting"}],
+                    metrics=[45.0, 350.0, 8.0],
+                ),
+            ],
+        )
+        _patch_metrika(monkeypatch, fake)
+
+        async with ReportingService(_settings_with_counter(settings)) as svc:
+            results = await svc.account_overview(date_range=_WEEK, goal_id=100)
+
+        # All three campaigns produce a performance row.
+        assert len(results) == 3
+        ids = sorted(p.campaign_id for p in results)
+        assert ids == [42, 51, 73]
+
+        # Find the burning campaign (51) explicitly by id and check
+        # the cpa-None contract under cost>0, conversions=0.
+        burning = next(p for p in results if p.campaign_id == 51)
+        assert burning.cost_rub == pytest.approx(2400.0)
+        assert burning.conversions == 0
+        assert burning.cpa_rub is None  # critical: never 0/inf
+        assert burning.cr_pct == pytest.approx(0.0)
+
+    async def test_groups_by_campaign_id_dimension(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Service must request the directCampaignID dimension (numeric
+        # id is the join key — by-name would conflate campaigns sharing
+        # a name, which legitimately happens for promo cycles).
+        fake = _FakeMetrikaService(report_rows=[])
+        _patch_metrika(monkeypatch, fake)
+
+        async with ReportingService(_settings_with_counter(settings)) as svc:
+            await svc.account_overview(date_range=_WEEK, goal_id=100)
+
+        call = fake.report_calls[0]
+        assert "ym:ad:directCampaignID" in call["dimensions"]
+
+    async def test_no_filter_at_account_level(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # account_overview is intentionally unfiltered — we want every
+        # campaign with traffic in the window. Adding a filter here
+        # would silently shrink the report.
+        fake = _FakeMetrikaService(report_rows=[])
+        _patch_metrika(monkeypatch, fake)
+
+        async with ReportingService(_settings_with_counter(settings)) as svc:
+            await svc.account_overview(date_range=_WEEK, goal_id=100)
+
+        call = fake.report_calls[0]
+        assert call["filters"] is None
+
+    async def test_without_goal_id_omits_conversion_metric(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake = _FakeMetrikaService(
+            report_rows=[
+                ReportRow(
+                    dimensions=[{"id": 42, "name": "brand"}],
+                    metrics=[120.0, 850.5],  # no conversions metric
+                ),
+            ],
+        )
+        _patch_metrika(monkeypatch, fake)
+
+        async with ReportingService(_settings_with_counter(settings)) as svc:
+            results = await svc.account_overview(date_range=_WEEK, goal_id=None)
+
+        assert len(results) == 1
+        assert results[0].conversions == 0
+        assert results[0].cpa_rub is None
+        # And the request didn't ask for a goal metric.
+        called_metrics = fake.report_calls[0]["metrics"]
+        assert not any("goal" in m for m in called_metrics)
+
+    async def test_skips_rows_with_malformed_dimensions(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Defensive: if Metrika returns a row missing the campaign id
+        # (shouldn't happen in practice, but the wire is the wire),
+        # skip it rather than crashing the whole overview.
+        fake = _FakeMetrikaService(
+            report_rows=[
+                ReportRow(
+                    dimensions=[{"id": 42, "name": "brand"}],
+                    metrics=[120.0, 850.5, 5.0],
+                ),
+                ReportRow(
+                    dimensions=[{}],  # broken — no id, no name
+                    metrics=[80.0, 2400.0, 0.0],
+                ),
+                ReportRow(
+                    dimensions=[{"id": "not-an-int", "name": "weird"}],
+                    metrics=[45.0, 350.0, 8.0],
+                ),
+            ],
+        )
+        _patch_metrika(monkeypatch, fake)
+
+        async with ReportingService(_settings_with_counter(settings)) as svc:
+            results = await svc.account_overview(date_range=_WEEK, goal_id=100)
+
+        # Only the well-formed row survives; we don't fabricate ids.
+        assert len(results) == 1
+        assert results[0].campaign_id == 42
+
+    async def test_empty_account_returns_empty_list(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake = _FakeMetrikaService(report_rows=[])
+        _patch_metrika(monkeypatch, fake)
+
+        async with ReportingService(_settings_with_counter(settings)) as svc:
+            results = await svc.account_overview(date_range=_WEEK, goal_id=100)
+
+        assert results == []
+
+    async def test_missing_counter_id_raises_config_error(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _patch_metrika(monkeypatch, _FakeMetrikaService())
+
+        async with ReportingService(settings) as svc:  # counter_id stays None
+            with pytest.raises(ConfigError, match="counter"):
+                await svc.account_overview(date_range=_WEEK, goal_id=100)
