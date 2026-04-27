@@ -244,3 +244,82 @@ async def test_apply_through_decorator_persists_confirm_plan(
     assert plan.args["updates"][0]["new_search_bid_rub"] == 10.0
     # DirectService NOT called.
     assert fake_direct.set_keyword_bids_calls == []
+
+
+@pytest.mark.asyncio
+async def test_apply_rollout_stage_shadow_rejects_bid_changes(
+    settings: Settings, fake_direct: _FakeDirectService, tmp_path: Any
+) -> None:
+    """Auditor M2-bidding M-3: a bid change on rollout_stage="shadow"
+    must surface as PlanRejected via the rollout-stage allow-list.
+    Pins the contract that operators on shadow see every bid attempt
+    blocked at plan-creation time.
+    """
+    from yadirect_agent.agent.executor import PlanRejected
+    from yadirect_agent.agent.pipeline import SafetyPipeline
+    from yadirect_agent.agent.plans import PendingPlansStore
+    from yadirect_agent.agent.safety import (
+        BudgetCapPolicy,
+        ConversionIntegrityPolicy,
+        MaxCpcPolicy,
+        Policy,
+        QueryDriftPolicy,
+    )
+
+    policy = Policy(
+        budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=100_000),
+        max_cpc=MaxCpcPolicy(),
+        query_drift=QueryDriftPolicy(),
+        conversion_integrity=ConversionIntegrityPolicy(
+            min_conversions_total=1,
+            min_ratio_vs_baseline=0.5,
+            require_all_baseline_goals_present=True,
+        ),
+        rollout_stage="shadow",  # read-only stage
+    )
+    pipeline = SafetyPipeline(policy)
+    store = PendingPlansStore(tmp_path / "pending_plans.jsonl")
+    sink = _CapturingSink()
+    svc = BiddingService(settings, pipeline=pipeline, store=store, audit_sink=sink)
+
+    with pytest.raises(PlanRejected):
+        await svc.apply([BidUpdate(keyword_id=42, new_search_bid_rub=10.0)])
+
+    # No mutating call reached DirectService.
+    assert fake_direct.set_keyword_bids_calls == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_safety_requires_audit_sink(settings: Settings, tmp_path: Any) -> None:
+    """Auditor M2-bidding C-1: a service constructed with pipeline+store
+    but no audit_sink must refuse the non-bypass path. Otherwise a
+    misconfigured production caller gets gated plans but no audit
+    emission — a silent gap.
+    """
+    from yadirect_agent.agent.pipeline import SafetyPipeline
+    from yadirect_agent.agent.plans import PendingPlansStore
+    from yadirect_agent.agent.safety import (
+        BudgetCapPolicy,
+        ConversionIntegrityPolicy,
+        MaxCpcPolicy,
+        Policy,
+        QueryDriftPolicy,
+    )
+
+    policy = Policy(
+        budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=100_000),
+        max_cpc=MaxCpcPolicy(),
+        query_drift=QueryDriftPolicy(),
+        conversion_integrity=ConversionIntegrityPolicy(
+            min_conversions_total=1,
+            min_ratio_vs_baseline=0.5,
+            require_all_baseline_goals_present=True,
+        ),
+        rollout_stage="autonomy_full",
+    )
+    pipeline = SafetyPipeline(policy)
+    store = PendingPlansStore(tmp_path / "pending_plans.jsonl")
+    svc = BiddingService(settings, pipeline=pipeline, store=store)
+    # No audit_sink. Mutating call without bypass → RuntimeError.
+    with pytest.raises(RuntimeError, match="AuditSink"):
+        await svc.apply([BidUpdate(keyword_id=1, new_search_bid_rub=5.0)])

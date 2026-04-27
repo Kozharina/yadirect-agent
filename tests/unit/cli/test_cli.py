@@ -792,3 +792,78 @@ def test_mcp_serve_respects_env_allow_write_true(
     result = runner.invoke(app, ["mcp", "serve"])
     assert result.exit_code == 0
     assert captured["allow_write"] is True
+
+
+def test_apply_plan_routes_set_keyword_bids_to_service(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Auditor M2-bidding M-2: a stored ``set_keyword_bids`` plan
+    flows through the CLI router → BiddingService.apply
+    (_applying_plan_id) → DirectService. Pins the bulk-args
+    round-trip: ``args["updates"]`` must reach
+    ``BiddingService.apply`` as ``list[BidUpdate]`` with the same
+    keyword ids and bid values.
+    """
+    from datetime import UTC, datetime
+
+    from yadirect_agent.agent.pipeline import (
+        ReviewContext,
+        SafetyDecision,
+        SafetyPipeline,
+        serialize_review_context,
+    )
+    from yadirect_agent.agent.plans import OperationPlan, PendingPlansStore
+    from yadirect_agent.services.bidding import BiddingService, BidUpdate
+
+    plans_path = settings.audit_log_path.parent / "pending_plans.jsonl"
+    plan = OperationPlan(
+        plan_id="plan-bid",
+        created_at=datetime(2026, 4, 27, 12, 0, tzinfo=UTC),
+        action="set_keyword_bids",
+        resource_type="keyword",
+        resource_ids=[1, 2, 3],
+        args={
+            "updates": [
+                {"keyword_id": 1, "new_search_bid_rub": 5.0},
+                {"keyword_id": 2, "new_search_bid_rub": 7.5},
+                {"keyword_id": 3, "new_network_bid_rub": 2.0},
+            ]
+        },
+        preview="set bids on 3 keyword(s)",
+        reason="confirm",
+        review_context=serialize_review_context(ReviewContext()),
+    )
+    PendingPlansStore(plans_path).append(plan)
+
+    def stub_review(self: SafetyPipeline, plan_arg: Any, ctx: Any) -> SafetyDecision:
+        return SafetyDecision(status="allow", reason="ok")
+
+    captured: list[tuple[list[BidUpdate], str | None]] = []
+
+    async def fake_apply(
+        self: BiddingService,
+        updates: list[BidUpdate],
+        *,
+        _applying_plan_id: str | None = None,
+    ) -> None:
+        captured.append((list(updates), _applying_plan_id))
+
+    monkeypatch.setattr(SafetyPipeline, "review", stub_review)
+    monkeypatch.setattr(BiddingService, "apply", fake_apply)
+
+    result = runner.invoke(app, ["apply-plan", "plan-bid"])
+
+    assert result.exit_code == 0, result.output
+    assert len(captured) == 1
+    updates, applying = captured[0]
+    assert applying == "plan-bid"
+    assert [u.keyword_id for u in updates] == [1, 2, 3]
+    assert updates[0].new_search_bid_rub == 5.0
+    assert updates[1].new_search_bid_rub == 7.5
+    assert updates[2].new_network_bid_rub == 2.0
+    final = PendingPlansStore(plans_path).get("plan-bid")
+    assert final is not None
+    assert final.status == "applied"

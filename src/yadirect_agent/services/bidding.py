@@ -120,12 +120,18 @@ class BiddingService:
         self._logger = structlog.get_logger().bind(component="bidding_service")
 
     def _resolve_safety(self) -> tuple[SafetyPipeline, PendingPlansStore]:
-        if self._pipeline is None or self._plans_store is None:
+        # Auditor C-1: audit_sink is also required on the production
+        # path. A caller building BiddingService(settings, pipeline=p,
+        # store=s) without a sink would gate the plan but execute
+        # without audit emission — silent gap. Enforce all three
+        # together.
+        if self._pipeline is None or self._plans_store is None or self._audit_sink is None:
             msg = (
-                "BiddingService was constructed without a SafetyPipeline / "
-                "PendingPlansStore; mutating methods cannot run. Build the "
-                "service via build_default_registry (which wires the shared "
-                "pipeline + store) or pass pipeline=... store=... explicitly."
+                "BiddingService was constructed without a complete safety "
+                "trio (SafetyPipeline / PendingPlansStore / AuditSink); "
+                "mutating methods cannot run. Build via "
+                "build_default_registry (which wires all three) or pass "
+                "pipeline=, store=, audit_sink= explicitly."
             )
             raise RuntimeError(msg)
         return self._pipeline, self._plans_store
@@ -170,6 +176,26 @@ class BiddingService:
             return
 
         if self._audit_sink is None:
+            # Reachable only on the @requires_plan bypass path
+            # (``_applying_plan_id`` was passed) AND the caller
+            # didn't construct with a sink. In production both the
+            # CLI ``apply-plan`` router and the in-process tools
+            # registry build BiddingService with the shared
+            # JsonlSink, so this branch should fire only in tests
+            # that intentionally skip the safety trio. Log a
+            # WARNING so a misconfigured production caller surfaces
+            # in operator-visible logs rather than silently
+            # mutating without an audit record. Auditor C-1.
+            self._logger.warning(
+                "bids.apply.no_audit_sink",
+                count=len(updates),
+                note=(
+                    "audit_sink is None on the apply-plan bypass path; "
+                    "mutation will proceed but no set_keyword_bids.* event "
+                    "will be emitted. Production callers must pass "
+                    "audit_sink=..."
+                ),
+            )
             await self._do_apply(updates)
             return
 

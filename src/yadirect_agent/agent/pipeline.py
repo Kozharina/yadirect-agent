@@ -110,7 +110,9 @@ _ASSIST_ACTIONS: frozenset[str] = _READ_ONLY_ACTIONS | frozenset(
     {
         "pause_campaigns",
         "add_negative_keywords",
-        "set_keyword_bids",  # bounded to ±10% by policy.max_bid_increase_pct
+        # TODO(KS#2 snapshot): bind to ±10% by policy.max_bid_increase_pct
+        # once per-keyword current-bid reader lands. Auditor M2-bidding H-2.
+        "set_keyword_bids",
     }
 )
 

@@ -171,6 +171,30 @@ Accumulated work that isn't blocking but will sting later.
       ``logrotate`` config or a built-in size-based rotator inside
       ``JsonlSink``.
 
+- [ ] **KS#2 / KS#4 must report `skipped` (not `ok`) on empty
+      bid snapshot** (auditor M2-bidding H-1): when
+      ``_build_bid_context`` returns ``AccountBidSnapshot()`` with
+      no keywords, ``MaxCpcCheck.check`` and
+      ``QualityScoreGuardCheck.check`` iterate zero entries and
+      return ``ok``. The pipeline's ``skipped_checks`` ledger
+      stays empty even though no per-keyword constraint actually
+      ran. Operators reading audit output get no signal that
+      these checks ran vacuously. Fix by having both checks
+      return a ``skipped`` result when the requested keyword
+      isn't in the snapshot, and let the pipeline collect them
+      into ``skipped_checks``. Land alongside (or before) the
+      bid-snapshot reader so the signal is meaningful from day
+      one.
+
+- [ ] **Dedup `_infer_actor` frame walk between Campaign / Bidding
+      services** (auditor M2-bidding L-1): the frame-walking
+      helper is duplicated verbatim in
+      ``CampaignService._infer_actor`` and
+      ``BiddingService._infer_actor``. Extract into
+      ``audit.infer_actor_from_frame()`` so a future tightening
+      (replace frame walk with explicit kwarg threading) lands in
+      one place.
+
 - [ ] **Per-keyword AccountBidSnapshot reader for KS#2 / KS#4** —
       ``BiddingService.apply`` is now ``@requires_plan``-gated
       (M2 follow-up), but ``_build_bid_context`` returns an empty
