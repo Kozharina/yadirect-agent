@@ -395,7 +395,13 @@ async def _apply_plan_inner(
     # that don't yet stamp it) applicable. Auditor M2-bid-snapshot /
     # M2-ks3-negatives HIGH-2 follow-up.
     if context.baseline_timestamp is not None:
-        age = (datetime.now(UTC) - context.baseline_timestamp).total_seconds()
+        # Clamp negative age (future timestamp from NTP jitter or a
+        # corrupt / malicious JSONL row) to zero so the staleness
+        # gate cannot be trivially bypassed by writing a far-future
+        # ``baseline_timestamp``: ``(now - future).total_seconds()``
+        # is negative and ``negative > max_age`` is False without
+        # the clamp. Auditor M2-snapshot-age second-pass.
+        age = max(0.0, (datetime.now(UTC) - context.baseline_timestamp).total_seconds())
         max_age = pipeline.policy.max_snapshot_age_seconds
         if age > max_age:
             store.update_status(plan_id, "failed")

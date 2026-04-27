@@ -547,6 +547,64 @@ class TestApplyPlanPreconditions:
         assert final is not None
         assert final.status == "applied"
 
+    async def test_future_baseline_timestamp_does_not_bypass_age_check(
+        self, store: PendingPlansStore
+    ) -> None:
+        """Auditor M2-snapshot-age second-pass: a malicious or
+        corrupt JSONL row with ``baseline_timestamp`` arbitrarily
+        far in the future would otherwise produce a NEGATIVE age
+        (now - future = negative) which trivially passes
+        ``> max_age``, bypassing the staleness check entirely. An
+        attacker who can write to the store could set the timestamp
+        to year 2099 and guarantee no plan ever ages out.
+
+        Pin: a future timestamp clamps to age=0 (treated as "just
+        created"), passes the staleness gate, and the plan executes
+        normally. Small negative values from NTP jitter are
+        absorbed by the same clamp without false-rejecting valid
+        plans.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        from yadirect_agent.agent.pipeline import ReviewContext, serialize_review_context
+        from yadirect_agent.agent.plans import OperationPlan
+
+        future_ctx = ReviewContext(
+            budget_snapshot=_snap(),
+            budget_changes=[BudgetChange(campaign_id=1, new_daily_budget_rub=150)],
+            # Year 2099 — well beyond any plausible NTP skew window.
+            baseline_timestamp=datetime.now(UTC) + timedelta(days=365 * 70),
+        )
+        future_plan = OperationPlan(
+            plan_id="future-1",
+            created_at=datetime.now(UTC),
+            action="set_campaign_budget",
+            resource_type="campaign",
+            resource_ids=[1],
+            args={"campaign_id": 1, "new_budget_rub": 200},
+            preview="set budget on campaign 1 to 200 RUB",
+            reason="needs confirm",
+            review_context=serialize_review_context(future_ctx),
+        )
+        store.append(future_plan)
+
+        pipe = _StubPipeline(policy=_StubPolicy(max_snapshot_age_seconds=300))
+        svc = _FakeService(pipe, store)
+
+        # Plan executes normally — clamp protects the gate from
+        # negative-age trivial pass.
+        result = await apply_plan(
+            future_plan.plan_id,
+            store=store,
+            pipeline=pipe,
+            service_router=lambda action, args, _applying_plan_id: _route_set_budget(
+                svc, action, args, _applying_plan_id=_applying_plan_id
+            ),
+        )
+
+        assert result == "ok"
+        assert svc.calls == [{"campaign_id": 1, "new_budget_rub": 200}]
+
     async def test_plan_without_baseline_timestamp_passes_age_check(
         self, store: PendingPlansStore
     ) -> None:
