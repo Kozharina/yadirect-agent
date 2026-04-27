@@ -83,6 +83,15 @@ def _ctx() -> ReviewContext:
     )
 
 
+async def _async_ctx_builder(self: Any, campaign_id: int, new_budget_rub: int) -> ReviewContext:
+    """Async no-op context builder for the fake service in tests.
+
+    Real services (e.g. CampaignService) await on ``list_all()`` here;
+    in tests we just return a pre-built ReviewContext.
+    """
+    return _ctx()
+
+
 class _FakeService:
     """Minimal async service that exposes one decorated method.
 
@@ -106,7 +115,7 @@ class _FakeService:
         preview_builder=lambda self, campaign_id, new_budget_rub: (
             f"set budget on campaign {campaign_id} to {new_budget_rub} RUB"
         ),
-        context_builder=lambda self, campaign_id, new_budget_rub: _ctx(),
+        context_builder=_async_ctx_builder,
         resource_ids_from_args=lambda self, campaign_id, new_budget_rub: [campaign_id],
     )
     async def set_daily_budget(self, campaign_id: int, new_budget_rub: int) -> str:

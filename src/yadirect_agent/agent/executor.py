@@ -144,7 +144,7 @@ def requires_plan(
     action: str,
     resource_type: str,
     preview_builder: Callable[..., str],
-    context_builder: Callable[..., ReviewContext],
+    context_builder: Callable[..., Awaitable[ReviewContext]],
     resource_ids_from_args: Callable[..., list[int]],
 ) -> Callable[[Callable[..., Awaitable[Any]]], Callable[..., Awaitable[Any]]]:
     """Wrap an async service method in the plan→confirm→execute flow.
@@ -161,10 +161,10 @@ def requires_plan(
     - ``preview_builder(self, *args, **kwargs) -> str``: one-line
       human-readable summary for ``plans list``. Keep it specific
       (include ids and values).
-    - ``context_builder(self, *args, **kwargs) -> ReviewContext``: the
-      snapshots + changes the pipeline needs. Sync on purpose —
-      async I/O belongs in the wrapped method, not in the decorator's
-      pre-review pass, to keep the "review" step cheap and repeatable.
+    - ``context_builder(self, *args, **kwargs) -> Awaitable[ReviewContext]``:
+      async — real-world builders read snapshots from the Direct API
+      (e.g. ``CampaignService.list_all()``) and that's an `await` away.
+      Tests pass an ``async def`` returning a pre-built context.
     - ``resource_ids_from_args(self, *args, **kwargs) -> list[int]``:
       primary ids touched by this call. Used by the CLI/audit for
       cross-referencing.
@@ -190,7 +190,7 @@ def requires_plan(
                 return await fn(self, *args, **kwargs)
 
             pipeline, store = self._resolve_safety()
-            context = context_builder(self, *args, **kwargs)
+            context = await context_builder(self, *args, **kwargs)
 
             # Build a provisional plan. ``reason`` is filled from the
             # decision below before persistence.
