@@ -54,14 +54,7 @@ evals exercise the full safety surface.)*
 
 ## In progress
 
-- [ ] **Per-campaign negative keywords reader for KS#3**
-      (branch ``feat/m2-ks3-negatives-reader``) — extends
-      ``Campaign`` model + ``DirectService.get_campaigns`` to read
-      campaign-level negative keywords, populates
-      ``CampaignBudget.negative_keywords`` in the resume context
-      builder so KS#3 actually fires when an operator configures
-      ``required_negative_keywords``. Same load-bearing prereq
-      pattern as the just-shipped per-keyword bid reader.
+*(empty — nothing checked out right now)*
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
@@ -79,23 +72,40 @@ the PR merges or is abandoned.
 Accumulated work that isn't blocking but will sting later.
 
 - [ ] **`max_snapshot_age_seconds` policy enforcement at apply-plan
-      re-review** (auditor M2-bid-snapshot HIGH-2 follow-up): the
-      bid-context reader now stamps ``ReviewContext.baseline_timestamp``,
-      but ``apply_plan`` does not yet read it. Operator-driven
-      ``apply-plan <id>`` minutes / hours / days after the plan was
-      created re-reviews against an arbitrarily stale snapshot. KS#4's
-      ``_is_increase`` compares the proposed bid against the snapshot's
-      current bid — a parallel-operator bid bump between plan creation
-      and apply execution would be invisible to the guard, opening a
-      window for a second consecutive increase on the same keyword.
+      re-review** (auditor M2-bid-snapshot HIGH-2 follow-up + auditor
+      M2-ks3-negatives HIGH-2 follow-up): both bid and budget context
+      builders now stamp ``ReviewContext.baseline_timestamp`` (PR #35
+      and the per-campaign negatives PR), but ``apply_plan`` does not
+      yet read it. Operator-driven ``apply-plan <id>`` minutes / hours /
+      days after plan creation re-reviews against an arbitrarily stale
+      snapshot. KS#4's ``_is_increase`` and KS#1's cap arithmetic both
+      compare proposed values against snapshot baselines — a parallel-
+      operator bid bump or budget change between plan creation and
+      apply execution is currently invisible to the guard, opening a
+      window for a second consecutive increase / cap-skirting move.
       Fix: add ``max_snapshot_age_seconds: int`` to ``Policy`` (default
-      300 s); in ``apply_plan``, if the plan's ``review_context.baseline_timestamp``
+      300 s); in ``apply_plan``, if ``review_context.baseline_timestamp``
       is present and older than the policy ceiling, mark the plan
       ``failed`` with a clear stale-snapshot reason and require the
-      operator to re-issue. Apply the same enforcement to
-      ``CampaignService`` context builders (none of them stamp
-      baseline_timestamp today either; the bid reader is just the
-      first to make freshness load-bearing).
+      operator to re-issue. Now that all four context builders stamp
+      the timestamp, this is a single-PR change with no cross-cutting
+      prerequisites.
+
+- [ ] **`DailyBudget` model lacks API field aliases** (latent bug
+      surfaced while writing the KS#3 reader tests): ``DailyBudget``
+      defines ``amount: int`` and ``mode: str`` without ``alias="Amount"``
+      / ``alias="Mode"``, so ``Campaign.model_validate({"DailyBudget":
+      {"Amount": 500_000_000, "Mode": "STANDARD"}})`` fails with
+      ``Field required: amount``. Production code currently routes
+      around it because no test exercises the wire-JSON path through
+      ``DirectService.get_campaigns`` against a real ``DailyBudget``
+      payload; the unit tests construct ``DailyBudget(amount=...)``
+      directly. Real Direct responses will fail to populate
+      ``Campaign.daily_budget`` on the first integration run. Fix:
+      add ``populate_by_name=True`` (already present) plus
+      ``alias="Amount"`` / ``alias="Mode"`` on the two fields. Block
+      this BEFORE the first sandbox round-trip against a campaign
+      that actually has a daily budget.
 
 - [ ] **`AccountBidSnapshot.find` O(n²) at large bulk sizes** (auditor
       M2-bid-snapshot second-pass NEW LOW): now that the bid snapshot
@@ -248,19 +258,6 @@ Accumulated work that isn't blocking but will sting later.
       ``audit.infer_actor_from_frame()`` so a future tightening
       (replace frame walk with explicit kwarg threading) lands in
       one place.
-
-- [ ] **Pull per-campaign negative keywords for KS#3** — the
-      pause/resume context builders currently leave
-      ``CampaignBudget.negative_keywords`` empty because we don't
-      yet read per-campaign negatives from the Direct API. Default
-      ``Policy.required_negative_keywords`` is empty so KS#3 is a
-      no-op out of the box; once the operator configures required
-      negatives in YAML, **every resume will be blocked** because
-      KS#3 sees zero negatives on every campaign. Fix: extend
-      ``DirectService`` with a per-campaign negatives fetch (Direct
-      API's ``get_keywords`` with negative-set filter) and call it
-      from ``_build_resume_context``. Block on this BEFORE the
-      first operator configures ``required_negative_keywords``.
 
 - [ ] **Snapshot freshness at apply-plan time (archived-campaign
       gap)** (from PR-B1 auditor MEDIUM-3; not blocking M2.3): the
@@ -591,6 +588,36 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2 follow-up — Per-campaign negative keywords reader for
+      KS#3** — closes the footgun that would have blocked every
+      resume the moment an operator configured
+      ``required_negative_keywords`` in agent_policy.yml.
+      ``Campaign`` model gains ``negative_keywords: list[str]``
+      flattened from the API's ``{"NegativeKeywords": {"Items":
+      [...]}}`` envelope via a ``model_validator(mode="before")``
+      that only fires when the envelope key is explicitly in the
+      input (direct construction left untouched).
+      ``DirectService.get_campaigns`` opts the field into
+      ``FieldNames`` for every caller. ``_build_account_budget_snapshot``
+      bypasses the agent-facing ``CampaignSummary`` flattener and
+      reads ``Campaign`` objects directly from
+      ``DirectService.get_campaigns`` — defence-in-depth privacy
+      split: operator-configured negatives carry commercial intent
+      (competitor names / brand misspells / regulated-product
+      filters) and never reach the agent's ``list_campaigns`` tool
+      response or the CLI ``--json`` output. Pinned with a
+      ``hasattr`` regression test on ``CampaignSummary``. All three
+      campaign context builders (pause / resume / set_daily_budget)
+      now stamp ``ReviewContext.baseline_timestamp`` (auditor HIGH-2;
+      parity with the bid context builder); ``_PRIVATE_DETAIL_KEYS``
+      in ``agent/tools.py`` extended with ``"missing"`` to mirror
+      the audit-sink redaction so KS#3 ``CheckResult.details["missing"]``
+      never reaches the LLM (auditor HIGH-1). Net effect: KS#3
+      blocks resume only when a campaign actually lacks a required
+      phrase, and proceeds to the confirm path when compliant —
+      previously KS#3 would have blocked unconditionally on the
+      first operator who configured the floor. 11 new tests
+      (4 model + 2 client + 5 service + 1 tool); 563 total green.
 - [x] **M2 follow-up — Per-keyword `AccountBidSnapshot` reader
       for KS#2 / KS#4** — closes the gap that left both kill-
       switches deferring on every bid call. ``Keyword`` model gains
