@@ -22,10 +22,14 @@ from __future__ import annotations
 
 from typing import Self
 
+import structlog
+
 from ..clients.metrika import MetrikaService
 from ..config import Settings
 from ..exceptions import ConfigError
 from ..models.metrika import CampaignPerformance, DateRange
+
+_log = structlog.get_logger(component="services.reporting")
 
 # Metrika metric identifiers we use. Centralised so a typo crashes
 # imports rather than silently returning zeros (the agent worst case).
@@ -196,17 +200,42 @@ class ReportingService:
         results: list[CampaignPerformance] = []
         for row in rows:
             if not row.dimensions:
+                _log.warning(
+                    "metrika.row.dimensions_missing",
+                    counter_id=counter_id,
+                    metrics=row.metrics,
+                )
                 continue
             dim = row.dimensions[0]
             raw_id = dim.get("id")
             # Metrika sometimes returns id as int, sometimes as
             # numeric string — accept both, reject anything else.
+            # Bool is filtered explicitly because ``isinstance(True, int)``
+            # is True in Python; we don't want True/False as a campaign id.
+            # For strings, ``int()`` in a try/except is more robust than
+            # ``str.isdigit()`` which accepts non-ASCII digit codepoints
+            # (U+00B2, Arabic-Indic digits, etc.) but then crashes on
+            # the actual ``int()`` call. (auditor M6 MEDIUM-4.)
             campaign_id: int
             if isinstance(raw_id, int) and not isinstance(raw_id, bool):
                 campaign_id = raw_id
-            elif isinstance(raw_id, str) and raw_id.isdigit():
-                campaign_id = int(raw_id)
+            elif isinstance(raw_id, str):
+                try:
+                    campaign_id = int(raw_id)
+                except ValueError:
+                    _log.warning(
+                        "metrika.row.dimension_id_invalid",
+                        raw_id=raw_id,
+                        counter_id=counter_id,
+                    )
+                    continue
             else:
+                _log.warning(
+                    "metrika.row.dimension_id_invalid",
+                    raw_id=raw_id,
+                    raw_id_type=type(raw_id).__name__,
+                    counter_id=counter_id,
+                )
                 continue
             campaign_name = str(dim.get("name") or f"campaign_{campaign_id}")
 

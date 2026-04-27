@@ -16,6 +16,7 @@ from datetime import date
 from typing import Any, Self
 
 import pytest
+from structlog.testing import capture_logs
 
 from yadirect_agent.config import Settings
 from yadirect_agent.exceptions import ConfigError
@@ -399,7 +400,9 @@ class TestAccountOverview:
     ) -> None:
         # Defensive: if Metrika returns a row missing the campaign id
         # (shouldn't happen in practice, but the wire is the wire),
-        # skip it rather than crashing the whole overview.
+        # skip it rather than crashing the whole overview. The skip
+        # must emit a structured warning so silent data loss in the
+        # overview is observable. (auditor M6 HIGH-2.)
         fake = _FakeMetrikaService(
             report_rows=[
                 ReportRow(
@@ -418,10 +421,52 @@ class TestAccountOverview:
         )
         _patch_metrika(monkeypatch, fake)
 
+        with capture_logs() as captured_logs:
+            async with ReportingService(_settings_with_counter(settings)) as svc:
+                results = await svc.account_overview(date_range=_WEEK, goal_id=100)
+
+        # Only the well-formed row survives; we don't fabricate ids.
+        assert len(results) == 1
+        assert results[0].campaign_id == 42
+
+        # Two malformed rows produce two warnings, each with the
+        # specific shape that triggered the skip. Without these the
+        # operator can't tell that account_overview silently dropped
+        # data when Metrika changes wire shape.
+        warnings = [
+            log
+            for log in captured_logs
+            if log["log_level"] == "warning" and log["event"].startswith("metrika.row.dimension")
+        ]
+        assert len(warnings) == 2
+
+    async def test_non_ascii_digit_id_skipped_not_crashed(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Non-ASCII digit characters (U+00B2 superscript-two,
+        # Arabic-Indic digits, etc.) make ``str.isdigit()`` return True
+        # but then ``int()`` raises ValueError. The previous code
+        # would crash the whole overview on such a row; we must skip
+        # gracefully and keep going. (auditor M6 MEDIUM-4.)
+        fake = _FakeMetrikaService(
+            report_rows=[
+                ReportRow(
+                    dimensions=[{"id": "²", "name": "weird-superscript"}],
+                    metrics=[10.0, 100.0, 1.0],
+                ),
+                ReportRow(
+                    dimensions=[{"id": 42, "name": "brand"}],
+                    metrics=[120.0, 850.5, 5.0],
+                ),
+            ],
+        )
+        _patch_metrika(monkeypatch, fake)
+
         async with ReportingService(_settings_with_counter(settings)) as svc:
             results = await svc.account_overview(date_range=_WEEK, goal_id=100)
 
-        # Only the well-formed row survives; we don't fabricate ids.
         assert len(results) == 1
         assert results[0].campaign_id == 42
 

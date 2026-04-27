@@ -34,7 +34,6 @@ from __future__ import annotations
 from typing import Any, Self
 
 import httpx
-import structlog
 from tenacity import (
     AsyncRetrying,
     retry_if_exception_type,
@@ -50,9 +49,6 @@ from ..exceptions import (
     ValidationError,
 )
 from ..models.metrika import DateRange, MetrikaGoal, ReportRow
-
-_log = structlog.get_logger(component="clients.metrika")
-
 
 # Status codes that warrant a retry. 429 is included so we honour
 # Metrika's rate-limit signal; 5xx covers transient server issues.
