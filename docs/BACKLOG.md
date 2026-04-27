@@ -54,7 +54,14 @@ evals exercise the full safety surface.)*
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **Per-campaign negative keywords reader for KS#3**
+      (branch ``feat/m2-ks3-negatives-reader``) — extends
+      ``Campaign`` model + ``DirectService.get_campaigns`` to read
+      campaign-level negative keywords, populates
+      ``CampaignBudget.negative_keywords`` in the resume context
+      builder so KS#3 actually fires when an operator configures
+      ``required_negative_keywords``. Same load-bearing prereq
+      pattern as the just-shipped per-keyword bid reader.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
