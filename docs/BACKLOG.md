@@ -31,35 +31,14 @@ Each one is TDD, with `security-auditor` sub-agent review before merge.
 All seven reference
 [`docs/PRIOR_ART.md`](./PRIOR_ART.md) → "Agentic PPC Campaign Management".
 
-- [ ] **M2.3b: Audit sink wiring** — wire ``audit_action`` (already
-      shipped via M2.3a in audit.py) into ``CampaignService.set_daily_budget``,
-      ``apply_plan`` executor, and ``build_default_registry`` (which
-      now constructs a shared ``JsonlSink`` alongside the
-      pipeline+store). Every mutating call emits
-      ``<action>.requested`` before and ``<action>.ok|.failed`` after.
-      Sink-level redaction strips ``new_queries_sample`` (KS#7) and
-      ``missing`` (KS#3). Privacy walk already done by the M2.3a
-      second-pass auditor — every other ``CheckResult.details`` key
-      across KS#1–7 + pipeline gatekeepers is safe (numeric / id /
-      threshold). Two pre-merge decisions remain:
-
-      1. **``group`` (KS#1) decision** — ``BudgetCapCheck.details``
-         carries ``group: str`` (operator-defined campaign group
-         label). Not PII per se but may encode advertiser names,
-         competitive verticals, or budget-tier strategies. Decide:
-         (a) add to ``_PRIVATE_KEYS`` if labels are commercially
-         sensitive, or (b) accept as safe-as-is and document the
-         posture inline. The choice is operator-policy-bound; pick
-         one in the M2.3b PR.
-
-      2. **KS#3 reason-string interpolation** — see separate
-         BACKLOG item below; pick a remediation option (count /
-         hash / accept) and land it in M2.3b.
-
-      Verify pause/resume + future bidding methods inherit the
-      wrapper before claiming "everything is audited".
 - [ ] **M2.4: Daily-budget hard guard** — pre-op check that summed
-      active-campaign budgets stay ≤ `AGENT_MAX_DAILY_BUDGET_RUB`.
+      active-campaign budgets stay ≤ ``AGENT_MAX_DAILY_BUDGET_RUB``,
+      independently of the policy YAML. Today the YAML cap is the
+      only enforcer; if the operator misconfigures the YAML to a
+      higher cap (typo, copy-paste from another env), the env
+      backstop should still bite. Implement as an additional check
+      inside ``BudgetCapCheck`` that uses ``min(account_cap_rub,
+      settings.agent_max_daily_budget_rub)`` as the effective cap.
 - [ ] **M2.5: Staged rollout** — `rollout_stage` field in policy,
       `yadirect-agent rollout promote` (audit-logged, requires human
       confirmation).
@@ -143,22 +122,6 @@ Accumulated work that isn't blocking but will sting later.
       with the rest of the codebase. Replace with a single
       ``_logger = structlog.get_logger(__name__)`` binding next to
       the other module-level constants.
-
-- [ ] **KS#3 ``CheckResult.reason`` leaks operator-supplied negative
-      keywords** (from PR M2.3a auditor M-2 follow-up): the audit
-      sink's ``redact_for_audit`` strips the ``missing`` details key
-      cleanly, but ``CheckResult.reason`` is a free-form string that
-      KS#3 builds via f-string interpolation
-      (``"campaign 42 is missing required negative keywords: BrandX,
-      Competitor Y, sensitive medical phrase"`` at safety.py:651-652).
-      Free-form strings cannot be redacted by a key-based blocklist;
-      the reason is persisted into AuditEvent.action="*.failed" /
-      ``result.error_message`` paths verbatim. Decide between:
-      (a) replace the joined-list with a count
-      (``"... missing 3 required negative keywords"``);
-      (b) hash each phrase before inclusion;
-      (c) accept the leak as policy-bound (operator owns the YAML
-      that supplied the phrases).
 
 - [ ] **Audit JSONL durability — fsync on emit** (from PR M2.3a
       auditor M-3): ``JsonlSink._append`` calls ``open().close()``
@@ -519,6 +482,24 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2.3b — Audit sink wiring** — closes §M2.3.
+      ``CampaignService.set_daily_budget`` and ``apply_plan`` now
+      emit ``set_campaign_budget.requested|.ok|.failed`` and
+      ``apply_plan.requested|.ok|.failed`` through the shared
+      ``JsonlSink`` constructed in ``build_safety_pair`` (3-tuple
+      now). Actor inferred via bounded frame walk on the service:
+      ``_applying_plan_id`` in any caller frame → ``human``,
+      otherwise ``agent``. ``apply_plan`` always emits actor=
+      ``human``. ``audit_sink`` is opt-in by sink presence; CLI /
+      registry threads through the live JsonlSink, fixtures /
+      tests can omit. KS#1 ``group`` decision: accept-as-is (label
+      is structural identifier for cap-grouping, not advertiser-
+      facing). KS#3 ``reason`` interpolation: replaced join with
+      count (``"missing N required negative keyword(s)"``); the
+      ``details["missing"]`` list keeps the phrases for in-process
+      inspection but the audit sink strips the key. 9 new tests
+      (3 service + 4 executor + 2 happy/backwards-compat); 462
+      total green; mypy + ruff clean.
 - [x] **M2.3a — Audit sink module (data layer)** — first slice of
       §M2.3. ``src/yadirect_agent/audit.py`` ships ``AuditEvent``
       (frozen pydantic, ``extra="forbid"``,
@@ -668,14 +649,3 @@ Last 10 items (newest at top). Older items are available via
       current → warn. 26 new tests (176 safety, 299 total).
       **M2.0 complete** — all 7 kill-switches delivered and
       security-audited. Coverage 91.5%.
-- [x] **M2 Kill-switch #6 — Conversion integrity** —
-      `ConversionIntegrityCheck` is a system-level gatekeeper
-      (no `changes` arg). Signature: `check(baseline, current)`.
-      Three independently-tunable rules: absolute floor, ratio vs
-      baseline, baseline-goals presence. Counter-id mismatch
-      rejected upfront. `GoalConversions.__post_init__` guards
-      negative / bool / non-int counts. 30 new tests (150 safety,
-      273 total). Reviewed by `security-auditor` — 2 code findings
-      (negative-count bypass + counter_id mismatch) closed in-PR;
-      2 design items moved to Tech debt (global-gatekeeper marker
-      for M2.2, warn-in-autonomous-mode policy for M2.2).
