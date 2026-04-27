@@ -38,13 +38,26 @@ All seven reference
       pipeline+store). Every mutating call emits
       ``<action>.requested`` before and ``<action>.ok|.failed`` after.
       Sink-level redaction strips ``new_queries_sample`` (KS#7) and
-      ``missing`` (KS#3); pre-merge privacy review: walk every
-      ``CheckResult.details`` key writer in safety.py, decide for
-      each whether it's PII / brand-sensitive / safe-as-is, and
-      either add to ``_PRIVATE_KEYS`` or document the safe-as-is
-      decision inline. Verify pause/resume + future bidding
-      methods inherit the wrapper before claiming "everything is
-      audited".
+      ``missing`` (KS#3). Privacy walk already done by the M2.3a
+      second-pass auditor — every other ``CheckResult.details`` key
+      across KS#1–7 + pipeline gatekeepers is safe (numeric / id /
+      threshold). Two pre-merge decisions remain:
+
+      1. **``group`` (KS#1) decision** — ``BudgetCapCheck.details``
+         carries ``group: str`` (operator-defined campaign group
+         label). Not PII per se but may encode advertiser names,
+         competitive verticals, or budget-tier strategies. Decide:
+         (a) add to ``_PRIVATE_KEYS`` if labels are commercially
+         sensitive, or (b) accept as safe-as-is and document the
+         posture inline. The choice is operator-policy-bound; pick
+         one in the M2.3b PR.
+
+      2. **KS#3 reason-string interpolation** — see separate
+         BACKLOG item below; pick a remediation option (count /
+         hash / accept) and land it in M2.3b.
+
+      Verify pause/resume + future bidding methods inherit the
+      wrapper before claiming "everything is audited".
 - [ ] **M2.4: Daily-budget hard guard** — pre-op check that summed
       active-campaign budgets stay ≤ `AGENT_MAX_DAILY_BUDGET_RUB`.
 - [ ] **M2.5: Staged rollout** — `rollout_stage` field in policy,
@@ -109,6 +122,27 @@ Accumulated work that isn't blocking but will sting later.
     decision was made on. Alternatively, persist the minimal
     identity (keyword_id → approved ceiling) inside
     `OperationPlan.args` and reconstruct at apply time.
+
+- [ ] **Audit emit guards: narrow `except Exception` to `OSError`**
+      (from PR M2.3a second-pass auditor ADVISORY-1; non-blocking):
+      ``audit_action``'s success / failure-path emit guards swallow
+      every ``Exception``, but the documented intent is "I/O
+      failures don't mask the wrapped operation". A custom sink
+      raising ``ValidationError`` (programmer bug — malformed
+      AuditEvent in a future sink subclass) or ``TypeError`` /
+      ``AttributeError`` (silent runtime error) would be hidden
+      behind a structlog warning. Tighten to ``OSError`` or at
+      minimum re-raise programmer-error classes. Document the gap
+      between intent and implementation in the inline comment.
+
+- [ ] **Audit module: bind ``_logger`` once at module level**
+      (from PR M2.3a second-pass auditor ADVISORY-2; non-blocking
+      stylistic): ``audit_action`` calls
+      ``structlog.get_logger(__name__)`` at each except site rather
+      than at module import. Cheap (proxy object) but inconsistent
+      with the rest of the codebase. Replace with a single
+      ``_logger = structlog.get_logger(__name__)`` binding next to
+      the other module-level constants.
 
 - [ ] **KS#3 ``CheckResult.reason`` leaks operator-supplied negative
       keywords** (from PR M2.3a auditor M-2 follow-up): the audit
