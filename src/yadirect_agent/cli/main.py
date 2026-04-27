@@ -448,6 +448,25 @@ def _build_service_router(
             return await svc.pause(args["campaign_ids"], _applying_plan_id=_applying_plan_id)
         if action == "resume_campaigns":
             return await svc.resume(args["campaign_ids"], _applying_plan_id=_applying_plan_id)
+        if action == "set_keyword_bids":
+            # Reconstruct BidUpdate dataclasses from the persisted
+            # plan args (raw dicts, the apply-plan re-entry path needs
+            # the same shape ``BiddingService.apply`` consumed at plan
+            # creation time).
+            from ..services.bidding import BiddingService, BidUpdate
+
+            bid_svc = BiddingService(
+                settings, pipeline=pipeline, store=store, audit_sink=audit_sink
+            )
+            updates = [
+                BidUpdate(
+                    keyword_id=u["keyword_id"],
+                    new_search_bid_rub=u.get("new_search_bid_rub"),
+                    new_network_bid_rub=u.get("new_network_bid_rub"),
+                )
+                for u in args["updates"]
+            ]
+            return await bid_svc.apply(updates, _applying_plan_id=_applying_plan_id)
         msg = f"unknown action: {action!r}"
         raise ValueError(msg)
 

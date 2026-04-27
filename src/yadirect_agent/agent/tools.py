@@ -480,10 +480,15 @@ def _make_get_keywords_tool(settings: Settings) -> Tool:
     )
 
 
-def _make_set_keyword_bids_tool(settings: Settings) -> Tool:
+def _make_set_keyword_bids_tool(
+    settings: Settings,
+    pipeline: SafetyPipeline,
+    store: PendingPlansStore,
+    audit_sink: AuditSink,
+) -> Tool:
     async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
         inp: _SetKeywordBidsInput = raw  # type: ignore[assignment]
-        svc = BiddingService(settings)
+        svc = BiddingService(settings, pipeline=pipeline, store=store, audit_sink=audit_sink)
         updates = [
             BidUpdate(
                 keyword_id=u.keyword_id,
@@ -492,9 +497,24 @@ def _make_set_keyword_bids_tool(settings: Settings) -> Tool:
             )
             for u in inp.updates
         ]
-        await svc.apply(updates)
+        try:
+            await svc.apply(updates)
+        except PlanRequired as exc:
+            ctx.logger.info(
+                "tool.set_keyword_bids.pending",
+                count=len(updates),
+                plan_id=exc.plan_id,
+            )
+            return _pending_response(exc)
+        except PlanRejected as exc:
+            ctx.logger.info(
+                "tool.set_keyword_bids.rejected",
+                count=len(updates),
+                reason=exc.reason,
+            )
+            return _rejected_response(exc)
         ctx.logger.info("tool.set_keyword_bids.ok", count=len(updates))
-        return {"updated": [u.keyword_id for u in updates]}
+        return {"status": "applied", "updated": [u.keyword_id for u in updates]}
 
     return Tool(
         name="set_keyword_bids",
@@ -502,7 +522,9 @@ def _make_set_keyword_bids_tool(settings: Settings) -> Tool:
             "Apply a batch of bid updates. Accepts per-keyword deltas "
             "(search-net and/or content-net). A single call may raise a bid by "
             "at most +50%. Bids are in rubles; the service converts to "
-            "Direct's micro-currency units."
+            "Direct's micro-currency units. Returns "
+            "{status: 'pending'|'rejected'|'applied', ...}; 'pending' "
+            "carries plan_id and the operator's apply-plan command."
         ),
         input_model=_SetKeywordBidsInput,
         is_write=True,
@@ -716,23 +738,26 @@ def build_safety_pair(
 
 
 # Two flavours of factory live in the registry's default set:
-#   - ``Settings``-only factories (read-only / non-CampaignService tools)
-#   - ``Settings + pipeline + store`` factories (CampaignService-backed tools)
+#   - ``Settings``-only factories (read-only / pure-research tools)
+#   - ``Settings + pipeline + store + audit_sink`` factories (any tool
+#     whose service runs through the safety pipeline — CampaignService
+#     mutations AND BiddingService.apply, the latter wired in as part
+#     of the M2 pause/resume/bid gating follow-up).
 # We dispatch at registry-build time. Listing them in a single tuple keeps
 # the order stable for diffing.
 
-_CampaignFactory = Callable[[Settings, SafetyPipeline, PendingPlansStore, AuditSink], Tool]
+_GatedFactory = Callable[[Settings, SafetyPipeline, PendingPlansStore, AuditSink], Tool]
 _PlainFactory = Callable[[Settings], Tool]
 
-_CAMPAIGN_FACTORIES: list[_CampaignFactory] = [
+_GATED_FACTORIES: list[_GatedFactory] = [
     _make_list_campaigns_tool,
     _make_pause_campaigns_tool,
     _make_resume_campaigns_tool,
     _make_set_campaign_budget_tool,
+    _make_set_keyword_bids_tool,
 ]
 _PLAIN_FACTORIES: list[_PlainFactory] = [
     _make_get_keywords_tool,
-    _make_set_keyword_bids_tool,
     _make_validate_phrases_tool,
 ]
 
@@ -747,7 +772,7 @@ def build_default_registry(settings: Settings) -> ToolRegistry:
     """
     pipeline, store, audit_sink = build_safety_pair(settings)
     reg = ToolRegistry()
-    for cf in _CAMPAIGN_FACTORIES:
+    for cf in _GATED_FACTORIES:
         reg.add(cf(settings, pipeline, store, audit_sink))
     for pf in _PLAIN_FACTORIES:
         reg.add(pf(settings))

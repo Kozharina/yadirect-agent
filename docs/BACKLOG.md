@@ -171,15 +171,25 @@ Accumulated work that isn't blocking but will sting later.
       ``logrotate`` config or a built-in size-based rotator inside
       ``JsonlSink``.
 
-- [ ] **`BiddingService.apply` awaiting `@requires_plan` gating**
-      — last mutating method in CampaignService is gated as of
-      this PR (pause / resume / set_daily_budget all now flow
-      through the safety pipeline). ``BiddingService.apply``
-      (KS#2 max CPC + KS#4 quality score guard) still needs its
-      own decorator + context_builder. Suggested approach: same
-      pattern as ``set_daily_budget`` — context_builder reads
-      current ``AccountBidSnapshot`` via ``get_keywords``, builds
-      list of ``ProposedBidChange`` from input updates.
+- [ ] **Per-keyword AccountBidSnapshot reader for KS#2 / KS#4** —
+      ``BiddingService.apply`` is now ``@requires_plan``-gated
+      (M2 follow-up), but ``_build_bid_context`` returns an empty
+      ``AccountBidSnapshot``. KS#2 (max-CPC) and KS#4 (quality-
+      score guard) silently defer because their per-keyword
+      ``current_search_bid_rub`` / ``quality_score`` fields are
+      missing — that IS their documented "no current bid known →
+      can't prove violation" contract, but it means the
+      protection on this path today is plan→confirm→execute +
+      rollout_stage + audit, not the deeper KS#2/#4 validation.
+      Fix: extend ``models/keywords.Keyword`` to include the
+      Direct API's bid + quality-score fields, extend
+      ``DirectService.get_keywords`` to request them via
+      ``FieldNames``, and have ``_build_bid_context`` populate
+      ``KeywordSnapshot.current_search_bid_rub`` /
+      ``current_network_bid_rub`` / ``quality_score``. Block on
+      this BEFORE any operator configures aggressive
+      ``campaign_max_cpc_rub`` / ``min_quality_score_for_bid_increase``
+      thresholds expecting them to hold.
 
 - [ ] **Pull per-campaign negative keywords for KS#3** — the
       pause/resume context builders currently leave
@@ -523,6 +533,34 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2 follow-up — `BiddingService.apply` gated through
+      @requires_plan; MCP denylist now empty** — closes the last
+      mutating service method. ``BiddingService.apply`` runs
+      through the safety pipeline + audit + rollout-stage gate;
+      every bid change returns ``confirm`` (no
+      ``auto_approve_bid_change`` knob) and the operator must
+      run ``apply-plan`` to actually mutate. ``BidUpdate``
+      converted from frozen dataclass to frozen pydantic
+      ``BaseModel`` so ``OperationPlan.args`` round-trips through
+      JSON for apply-plan replay. New ``_build_bid_context``
+      returns an empty ``AccountBidSnapshot`` — KS#2 / KS#4
+      defer until a per-keyword bid+QS reader lands (BACKLOG'd
+      as a hard prerequisite before tightening max-CPC / min-QS
+      thresholds). Inner API call extracted to ``_do_apply``.
+      ``set_keyword_bids`` removed from MCP denylist —
+      ``_MCP_WRITE_TOOLS_DENYLIST`` is now empty (mechanism
+      preserved + tested via monkeypatch). Tools registry
+      factory split renamed: ``_CAMPAIGN_FACTORIES`` →
+      ``_GATED_FACTORIES`` (CampaignService + BiddingService);
+      ``set_keyword_bids`` moved into the gated set. CLI service
+      router extended with ``set_keyword_bids`` action mapping;
+      ``_make_set_keyword_bids_tool`` handler now catches
+      ``PlanRequired`` / ``PlanRejected`` and returns the
+      structured pending/rejected response shape. After this
+      PR every mutating service method across the project is
+      structurally unbypassable through every entry point
+      (CLI / agent loop / MCP). 8 new tests in test_bidding.py +
+      handler-shape updates; 514 total green.
 - [x] **M3 — MCP server (bootstrap + flag gating + Claude
       Desktop docs)** — closes §M3 entirely. New module
       ``yadirect_agent.mcp.server`` ships ``build_mcp_server`` +
@@ -705,25 +743,3 @@ Last 10 items (newest at top). Older items are available via
       tests (all four decorator paths + five apply_plan paths),
       7 new model + serde tests; 405 total green. Service wiring +
       CLI command land in part 3b.
-- [x] **M2.2 pipeline — SafetyPipeline orchestrator** — second
-      slice of §M2.2. `SafetyPipeline.review(plan, context)`
-      aggregates all 7 kill-switches + §M2.1 gatekeepers into a
-      single `allow | confirm | reject` decision with a skipped-check
-      ledger. Stages: forbidden_operations → rollout_stage allow-list →
-      read-only shortcut → required-snapshot guard → system
-      gatekeepers (KS#6/7) → per-op checks (KS#1/2/3/4/5) → session
-      TOCTOU → approval tier. Required-snapshot guard explicitly
-      rejects mutating actions when the caller did not supply the
-      data the relevant kill-switch needs (prevents the auditor's
-      CRITICAL empty-context bypass). `on_applied(context)` is a
-      separate post-execution callback that records the session
-      TOCTOU state (`max_approved_bid`) so a failed executor does
-      not poison the session cap. Default-confirm posture: the
-      `_AUTO_APPROVABLE_ACTIONS` whitelist (pause/resume/
-      add_negative_keywords) is the ONLY set that auto-allows;
-      every other mutating action returns `confirm` until an
-      explicit auto-approve knob lands. 36 new pipeline tests
-      (forbidden / rollout / read-only / required-snapshot /
-      gatekeepers / per-op / tiers / session / skipped; 386 total).
-      `security-auditor` pre-merge review: CRITICAL + 2 HIGH + 2
-      MEDIUM + 1 LOW all addressed before green tree.

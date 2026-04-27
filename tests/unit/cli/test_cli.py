@@ -387,10 +387,12 @@ def test_apply_plan_unknown_action_exits_3(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Auditor LOW-2: a plan whose ``action`` string isn't in the CLI
-    router (e.g. a future ``set_keyword_bids`` action that hasn't been
-    wired yet) must surface as a clean failure with exit 3, not silently
-    succeed. The plan moves to ``failed`` status so subsequent
-    apply-plan calls see the terminal state.
+    router (e.g. a future action whose service-method gating hasn't
+    landed yet, or a deployment-version mismatch where an older CLI
+    reads a plan written by a newer agent) must surface as a clean
+    failure with exit 3, not silently succeed. The plan moves to
+    ``failed`` status so subsequent apply-plan calls see the
+    terminal state.
     """
     from datetime import UTC, datetime
 
@@ -406,11 +408,11 @@ def test_apply_plan_unknown_action_exits_3(
     plan = OperationPlan(
         plan_id="plan-mystery",
         created_at=datetime(2026, 4, 24, 10, 0, tzinfo=UTC),
-        action="set_keyword_bids",  # not in the router yet
-        resource_type="keyword",
+        action="archive_campaigns",  # not yet wired into the router
+        resource_type="campaign",
         resource_ids=[1],
-        args={"updates": []},
-        preview="bid update",
+        args={"campaign_ids": [1]},
+        preview="archive",
         reason="needs confirm",
         review_context=serialize_review_context(ReviewContext()),
     )

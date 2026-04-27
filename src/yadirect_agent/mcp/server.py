@@ -40,20 +40,14 @@ from ..config import Settings
 
 # Write tools that are NOT yet wrapped with @requires_plan and therefore
 # MUST NOT be exposed over MCP even with --allow-write. Each entry here
-# is a hard scope boundary for the M3 release: agent can read, agent
-# can run gated mutations through pause/resume/set_campaign_budget, but
-# agent CANNOT call ungated write surfaces. Promote a name out of this
-# denylist in the same PR that adds @requires_plan to the underlying
-# service method. Auditor M3 MEDIUM M-2.
-_MCP_WRITE_TOOLS_DENYLIST: frozenset[str] = frozenset(
-    {
-        # ``BiddingService.apply`` is not yet @requires_plan-gated; the
-        # +50% per-call ceiling is a TODO in services/bidding.py. Until
-        # that lands, exposing this tool to a Claude Desktop agent would
-        # let it set arbitrary bids without safety review.
-        "set_keyword_bids",
-    }
-)
+# is a hard scope boundary; promote a name out of this denylist in the
+# same PR that adds @requires_plan to the underlying service method.
+# Auditor M3 MEDIUM M-2.
+#
+# Currently empty: every mutating service method (CampaignService.pause /
+# resume / set_daily_budget / BiddingService.apply) is gated as of the
+# M2 follow-up that closed BiddingService.apply gating.
+_MCP_WRITE_TOOLS_DENYLIST: frozenset[str] = frozenset()
 
 
 @dataclass
