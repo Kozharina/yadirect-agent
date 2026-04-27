@@ -54,7 +54,15 @@ evals exercise the full safety surface.)*
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **Per-keyword `AccountBidSnapshot` reader for KS#2 / KS#4**
+      (branch ``feat/m2-bid-snapshot-reader``) — extends
+      ``models/keywords.Keyword`` with bid + productivity fields,
+      extends ``DirectService.get_keywords`` to read them, and rewires
+      ``BiddingService._build_bid_context`` to return a populated
+      ``AccountBidSnapshot``. Without this, KS#2 (max-CPC) and KS#4
+      (QS guard) defer on every bid call and the protection on the
+      bid path is plan→confirm→execute + rollout_stage + audit only.
+      See Tech debt entry for the full motivation.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
