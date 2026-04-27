@@ -156,6 +156,47 @@ def _redact_details(details: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in details.items() if k not in _PRIVATE_DETAIL_KEYS}
 
 
+def _pending_response(exc: PlanRequired) -> dict[str, Any]:
+    """Structured tool response for the ``confirm`` path.
+
+    The agent relays ``next_step`` to the user verbatim so they
+    know exactly which command to run.
+    """
+
+    return {
+        "status": "pending",
+        "plan_id": exc.plan_id,
+        "preview": exc.preview,
+        "reason": exc.reason,
+        "next_step": (
+            f"Operator approval required. Run `yadirect-agent apply-plan {exc.plan_id}` to confirm."
+        ),
+    }
+
+
+def _rejected_response(exc: PlanRejected) -> dict[str, Any]:
+    """Structured tool response for the ``reject`` path.
+
+    Each blocking ``CheckResult.details`` dict is routed through
+    ``_redact_details`` so privacy-sensitive keys (KS#7 raw user
+    queries, KS#3 negative-keyword phrases) never reach the LLM
+    context.
+    """
+
+    return {
+        "status": "rejected",
+        "reason": exc.reason,
+        "blocking": [
+            {
+                "status": r.status,
+                "reason": r.reason,
+                "details": _redact_details(r.details),
+            }
+            for r in exc.blocking
+        ],
+    }
+
+
 # Every tool input model uses ``extra="forbid"`` as defence-in-depth: a
 # silently-accepted unknown key today would be a wire vector tomorrow if
 # any handler ever forwarded fields into the wrapped service. Concretely
@@ -287,15 +328,24 @@ def _make_pause_campaigns_tool(
     async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
         inp: _IdListInput = raw  # type: ignore[assignment]
         svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=audit_sink)
-        await svc.pause(inp.ids)
+        try:
+            await svc.pause(inp.ids)
+        except PlanRequired as exc:
+            ctx.logger.info("tool.pause_campaigns.pending", ids=inp.ids, plan_id=exc.plan_id)
+            return _pending_response(exc)
+        except PlanRejected as exc:
+            ctx.logger.info("tool.pause_campaigns.rejected", ids=inp.ids, reason=exc.reason)
+            return _rejected_response(exc)
         ctx.logger.info("tool.pause_campaigns.ok", ids=inp.ids)
-        return {"paused": inp.ids}
+        return {"status": "applied", "paused": inp.ids}
 
     return Tool(
         name="pause_campaigns",
         description=(
             "Pause (SUSPEND) one or more campaigns. Fully reversible via "
-            "resume_campaigns. Safe default for 'stop spending on X' requests."
+            "resume_campaigns. Returns {status: 'applied' | 'pending' | "
+            "'rejected', ...}; 'pending' carries plan_id and the operator's "
+            "next step (apply-plan)."
         ),
         input_model=_IdListInput,
         is_write=True,
@@ -312,15 +362,26 @@ def _make_resume_campaigns_tool(
     async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
         inp: _IdListInput = raw  # type: ignore[assignment]
         svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=audit_sink)
-        await svc.resume(inp.ids)
+        try:
+            await svc.resume(inp.ids)
+        except PlanRequired as exc:
+            ctx.logger.info("tool.resume_campaigns.pending", ids=inp.ids, plan_id=exc.plan_id)
+            return _pending_response(exc)
+        except PlanRejected as exc:
+            ctx.logger.info("tool.resume_campaigns.rejected", ids=inp.ids, reason=exc.reason)
+            return _rejected_response(exc)
         ctx.logger.info("tool.resume_campaigns.ok", ids=inp.ids)
-        return {"resumed": inp.ids}
+        return {"status": "applied", "resumed": inp.ids}
 
     return Tool(
         name="resume_campaigns",
         description=(
             "Resume (un-suspend) one or more campaigns. Starts spending again — "
-            "confirm the daily budget before using."
+            "by default returns {status: 'pending', plan_id} requiring "
+            "operator approval via `yadirect-agent apply-plan <id>`. Resume "
+            "is the primary trigger for KS#3 (negative-keyword floor); "
+            "rejected if any campaign lacks the configured required "
+            "negative keywords."
         ),
         input_model=_IdListInput,
         is_write=True,
@@ -340,53 +401,21 @@ def _make_set_campaign_budget_tool(
         try:
             await svc.set_daily_budget(inp.campaign_id, inp.budget_rub)
         except PlanRequired as exc:
-            # Pipeline returned ``confirm`` — operator must run apply-plan.
-            # Surface the plan_id back to the agent so it can include the
-            # next step in its message to the user.
             ctx.logger.info(
                 "tool.set_campaign_budget.pending",
                 campaign_id=inp.campaign_id,
                 budget_rub=inp.budget_rub,
                 plan_id=exc.plan_id,
             )
-            return {
-                "status": "pending",
-                "plan_id": exc.plan_id,
-                "preview": exc.preview,
-                "reason": exc.reason,
-                "next_step": (
-                    f"Operator approval required. Run "
-                    f"`yadirect-agent apply-plan {exc.plan_id}` to confirm."
-                ),
-            }
+            return _pending_response(exc)
         except PlanRejected as exc:
-            # Pipeline returned ``reject`` — surface enough detail for the
-            # agent to explain to the user why it can't proceed without
-            # leaking internal check names verbatim.
             ctx.logger.info(
                 "tool.set_campaign_budget.rejected",
                 campaign_id=inp.campaign_id,
                 budget_rub=inp.budget_rub,
                 reason=exc.reason,
             )
-            return {
-                "status": "rejected",
-                "reason": exc.reason,
-                # ``details`` carries the numerical context (projected
-                # totals, cap thresholds, etc.) the agent needs to
-                # explain *why* to the user. Include them — but route
-                # through ``_redact_details`` first so privacy-sensitive
-                # keys (e.g. KS#7 raw user queries) never reach the
-                # LLM context. Auditor LOW + second-pass MEDIUM.
-                "blocking": [
-                    {
-                        "status": r.status,
-                        "reason": r.reason,
-                        "details": _redact_details(r.details),
-                    }
-                    for r in exc.blocking
-                ],
-            }
+            return _rejected_response(exc)
         ctx.logger.info(
             "tool.set_campaign_budget.ok",
             campaign_id=inp.campaign_id,
