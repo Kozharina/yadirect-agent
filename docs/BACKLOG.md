@@ -108,6 +108,19 @@ Accumulated work that isn't blocking but will sting later.
     identity (keyword_id → approved ceiling) inside
     `OperationPlan.args` and reconstruct at apply time.
 
+- [ ] **`apply-plan` concurrency / file-lock** (from PR-A auditor
+      LOW; deferred, not blocking part 3b merge): two concurrent
+      `apply_plan(<same_id>)` calls would both pass the
+      `status != pending` check (the JSONL store reads before either
+      writes), both re-review, both execute, both write `applied`.
+      Today this is acceptable: yadirect-agent is a single-operator
+      tool and the JSONL is local. When we ship a multi-operator
+      deployment (or apply-plan starts running inside a daemon
+      alongside an interactive CLI), wrap the
+      `get → status check → service_router → update_status` sequence
+      in `apply_plan` with `fcntl.flock` on the JSONL path. Re-evaluate
+      severity then.
+
 - [ ] **M2.2 pipeline must-haves** (from M2.1 auditor review; block
       M2.2 merge, not just landing):
   - **`rollout_stage` enforcement** — today the field is stored but

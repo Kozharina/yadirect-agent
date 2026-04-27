@@ -223,29 +223,40 @@ def _bound_args_dict(
 ) -> dict[str, Any]:
     """Serialise the method's positional + keyword args into a dict.
 
-    Uses ``inspect.signature`` so the dict keys match the method's
-    parameter names (e.g. ``{"campaign_id": 1, "new_budget_rub": 200}``),
-    not positional indices. The apply-plan executor later passes this
-    dict back through a router that maps it to the same method.
+    Uses ``inspect.Signature.bind`` so:
+    - The dict keys match the method's parameter names (e.g.
+      ``{"campaign_id": 1, "new_budget_rub": 200}``).
+    - Excess positional arguments raise ``TypeError`` instead of
+      being silently dropped (auditor H-1).
+    - ``*args`` tuples are preserved as tuples (auditor H-1).
+    - Defaulted parameters omitted by the caller are filled in
+      via ``apply_defaults()`` so the on-disk plan reflects the
+      *exact* call shape and apply-plan replays it identically
+      across deployments where a default may have changed
+      (auditor M-2).
 
-    ``self`` is already stripped by the caller (positional args come
-    in after self is bound to the instance method).
+    ``self`` is stripped — positional args come in after the
+    instance method bound it. The bypass kwarg ``_applying_plan_id``
+    is filtered before binding so it never reaches the wrapped
+    function's signature.
     """
     import inspect
 
     sig = inspect.signature(fn)
     # Drop the ``self`` param from the signature — the decorator
-    # already handled it separately. Likewise skip the bypass kwarg.
+    # handles it separately, and ``args``/``kwargs`` here do not
+    # contain it.
     params = [p for p in sig.parameters.values() if p.name != "self"]
-    bound: dict[str, Any] = {}
-    for idx, arg in enumerate(args):
-        if idx < len(params):
-            bound[params[idx].name] = arg
-    for k, v in kwargs.items():
-        if k == "_applying_plan_id":
-            continue
-        bound[k] = v
-    return bound
+    new_sig = sig.replace(parameters=params)
+
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k != "_applying_plan_id"}
+
+    # ``bind`` raises TypeError on arity / unknown-kwarg mismatch —
+    # we want that surface immediately rather than producing a
+    # plan that can't be faithfully replayed later.
+    bound = new_sig.bind(*args, **filtered_kwargs)
+    bound.apply_defaults()
+    return dict(bound.arguments)
 
 
 # --------------------------------------------------------------------------
@@ -316,10 +327,33 @@ async def apply_plan(
     try:
         result = await service_router(plan.action, plan.args, _applying_plan_id=plan_id)
     except Exception:
-        # Executor failed — do NOT record session state.
+        # Executor failed — do NOT record session state, and DO NOT
+        # mark the plan applied. ``failed`` is terminal; subsequent
+        # apply-plan attempts will surface InvalidPlanStateError.
         store.update_status(plan_id, "failed")
         raise
 
-    pipeline.on_applied(context)
+    # CRITICAL ordering (auditor C-1): the API call has succeeded —
+    # money has been spent. We MUST mark the plan ``applied`` before
+    # any further work that could raise, so that a crash here cannot
+    # leave the plan in ``pending`` and let a second ``apply-plan``
+    # double-spend. ``on_applied`` runs second; if it raises, the
+    # session TOCTOU register loses one entry (defendable degradation
+    # — the next plan goes through normal pipeline checks) but the
+    # store correctly reflects that the API write happened.
     store.update_status(plan_id, "applied")
+    try:
+        pipeline.on_applied(context)
+    except Exception:
+        # Don't shadow the executor's success: log via stdlib (the
+        # session register update is best-effort once the API write
+        # has succeeded). Re-raising would mislead the caller into
+        # thinking the underlying operation failed.
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "pipeline.on_applied raised after successful apply for plan %s; "
+            "store marked applied; session TOCTOU register may be stale",
+            plan_id,
+        )
     return result

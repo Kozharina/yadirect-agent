@@ -393,3 +393,190 @@ class TestApplyPlanPreconditions:
                 pipeline=pipe,
                 service_router=lambda *a, **kw: None,  # type: ignore[arg-type]
             )
+
+    async def test_failed_plan_cannot_be_applied(self, store: PendingPlansStore) -> None:
+        # Auditor M-1: ``failed`` is a terminal status added in this PR.
+        # Re-applying a failed plan must raise — operators triage and
+        # propose a fresh plan; no silent retry through the same record.
+        pipe = _StubPipeline()
+        plan_id = await _seed_pending_plan(store, pipe)
+        store.update_status(plan_id, "failed")
+
+        with pytest.raises(InvalidPlanStateError):
+            await apply_plan(
+                plan_id,
+                store=store,
+                pipeline=pipe,
+                service_router=lambda *a, **kw: None,  # type: ignore[arg-type]
+            )
+
+    async def test_plan_with_no_review_context_cannot_be_applied(
+        self, store: PendingPlansStore
+    ) -> None:
+        # Auditor H-2: a plan inserted directly into the store without
+        # going through @requires_plan (e.g. legacy migration data) has
+        # review_context=None. apply_plan must reject explicitly with
+        # InvalidPlanStateError — not let it fall through to a confusing
+        # AttributeError on deserialize_review_context(None).
+        from datetime import UTC, datetime
+
+        from yadirect_agent.agent.plans import OperationPlan
+
+        legacy_plan = OperationPlan(
+            plan_id="legacy_no_ctx",
+            created_at=datetime.now(UTC),
+            action="set_campaign_budget",
+            resource_type="campaign",
+            resource_ids=[1],
+            args={"campaign_id": 1, "new_budget_rub": 200},
+            preview="legacy plan without review_context",
+            reason="seeded by hand",
+            # review_context deliberately omitted (defaults to None).
+        )
+        store.append(legacy_plan)
+
+        pipe = _StubPipeline()
+        with pytest.raises(InvalidPlanStateError, match="review_context"):
+            await apply_plan(
+                legacy_plan.plan_id,
+                store=store,
+                pipeline=pipe,
+                service_router=lambda *a, **kw: None,  # type: ignore[arg-type]
+            )
+
+
+# --------------------------------------------------------------------------
+# on_applied invariants (auditor C-1).
+# --------------------------------------------------------------------------
+
+
+class TestApplyPlanOnAppliedRobustness:
+    async def test_on_applied_failure_does_not_leave_plan_pending(
+        self, store: PendingPlansStore
+    ) -> None:
+        """Auditor C-1: if pipeline.on_applied raises after a successful
+        API write, the plan MUST already be marked ``applied`` — otherwise
+        a subsequent apply-plan call would re-execute the API and double-spend.
+        """
+        plan_id = await _seed_pending_plan(store, _StubPipeline())
+
+        # Custom pipeline whose on_applied raises.
+        class _FailingOnApplied(_StubPipeline):
+            def on_applied(self, context: ReviewContext) -> None:  # type: ignore[override]
+                self.on_applied_calls.append(context)
+                msg = "TOCTOU register update failed"
+                raise RuntimeError(msg)
+
+        pipe = _FailingOnApplied()
+        pipe.next_decision = SafetyDecision(status="allow", reason="ok")
+        svc = _FakeService(pipe, store)
+
+        # Executor itself succeeds — the failure is in the post-success
+        # session-state hook, not the API call.
+        result = await apply_plan(
+            plan_id,
+            store=store,
+            pipeline=pipe,
+            service_router=lambda action, args, _applying_plan_id: _route_set_budget(
+                svc, action, args, _applying_plan_id=_applying_plan_id
+            ),
+        )
+
+        # The API call returned successfully; apply_plan must surface that.
+        assert result == "ok"
+        # And the plan MUST be applied — not pending — so a retry can't
+        # double-spend.
+        final = store.get(plan_id)
+        assert final is not None
+        assert final.status == "applied"
+
+    async def test_executor_failure_skips_on_applied_and_does_not_apply(
+        self, store: PendingPlansStore
+    ) -> None:
+        """Confirm that the executor-failure ordering is unchanged by the
+        C-1 fix: API failure means status=failed, no on_applied, no applied.
+        """
+        plan_id = await _seed_pending_plan(store, _StubPipeline())
+        pipe = _StubPipeline()
+        pipe.next_decision = SafetyDecision(status="allow", reason="ok")
+
+        async def boom(action: str, args: dict[str, Any], *, _applying_plan_id: str) -> Any:
+            raise RuntimeError("API down")
+
+        with pytest.raises(RuntimeError, match="API down"):
+            await apply_plan(
+                plan_id,
+                store=store,
+                pipeline=pipe,
+                service_router=boom,
+            )
+
+        assert pipe.on_applied_calls == []
+        final = store.get(plan_id)
+        assert final is not None
+        assert final.status == "failed"
+
+
+# --------------------------------------------------------------------------
+# _bound_args_dict — direct unit tests (auditor L-2).
+# --------------------------------------------------------------------------
+
+
+class TestBoundArgsDict:
+    """Direct tests on the private signature-binding helper.
+
+    Indirect coverage via the decorator misses the bind-failure paths
+    auditor H-1 / M-2 surfaced — exercise them here.
+    """
+
+    @staticmethod
+    def _make(fn_args: tuple[Any, ...], fn_kwargs: dict[str, Any], fn: Any) -> dict[str, Any]:
+        from yadirect_agent.agent.executor import _bound_args_dict
+
+        return _bound_args_dict(fn, fn_args, fn_kwargs)
+
+    def test_basic_positional_binds_to_param_names(self) -> None:
+        async def f(self: Any, a: int, b: int) -> None: ...
+
+        assert self._make((1, 2), {}, f) == {"a": 1, "b": 2}
+
+    def test_keyword_binds_to_param_names(self) -> None:
+        async def f(self: Any, a: int, b: int) -> None: ...
+
+        assert self._make((), {"a": 1, "b": 2}, f) == {"a": 1, "b": 2}
+
+    def test_omitted_default_is_filled_in(self) -> None:
+        # Auditor M-2: defaulted params must be captured at call time so
+        # a deployment with a changed default replays the original intent.
+        async def f(self: Any, a: int, b: int = 99) -> None: ...
+
+        assert self._make((1,), {}, f) == {"a": 1, "b": 99}
+
+    def test_overflow_positional_args_raise(self) -> None:
+        # Auditor H-1: silent drop is a faithful-replay hazard. bind()
+        # must surface it as TypeError.
+        async def f(self: Any, a: int) -> None: ...
+
+        with pytest.raises(TypeError):
+            self._make((1, 2, 3), {}, f)
+
+    def test_unknown_kwarg_raises(self) -> None:
+        async def f(self: Any, a: int) -> None: ...
+
+        with pytest.raises(TypeError):
+            self._make((), {"a": 1, "mystery": 2}, f)
+
+    def test_var_positional_preserved_as_tuple(self) -> None:
+        # Auditor H-1: *args must round-trip as a tuple, not be
+        # collapsed to its first element.
+        async def f(self: Any, a: int, *ids: int) -> None: ...
+
+        result = self._make((1, 10, 20, 30), {}, f)
+        assert result == {"a": 1, "ids": (10, 20, 30)}
+
+    def test_applying_plan_id_is_filtered(self) -> None:
+        # The bypass kwarg must never reach the wrapped function's
+        # signature, so it must not appear in plan.args either.
+        async def f(self: Any, a: int) -> None: ...
+
+        assert self._make((), {"a": 1, "_applying_plan_id": "xyz"}, f) == {"a": 1}
