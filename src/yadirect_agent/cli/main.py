@@ -467,14 +467,15 @@ def apply_plan_cmd(
       3  the underlying service call raised
     """
     settings = _bootstrap_settings()
-    store = _plans_store(settings)
-    pipeline, _, audit_sink = build_safety_pair(settings)
-    # Reuse the store path from CLI convention rather than the one
-    # build_safety_pair returned: `_plans_store` already encodes the
-    # contract (next to audit log) and that's what tests / `plans list`
-    # / agent runs all read. The audit_sink IS reused from the helper —
-    # CLI-driven apply emits ``apply_plan.requested`` / ``.ok`` / ``.failed``
-    # into the same JSONL the agent's tools registry writes to.
+    # Use the SAME ``(pipeline, store, audit_sink)`` triple the agent's
+    # tools registry constructs, so apply-plan operates on the exact
+    # store the agent wrote to and emits into the exact JSONL the agent
+    # wrote to. Auditor PR M2.3b MEDIUM: the previous version
+    # constructed two PendingPlansStore instances pointing at the same
+    # path — fine today, but a future in-memory cache / lock on the
+    # store would create a coherence trap. ``build_safety_pair``
+    # already encodes the path convention; trust its return value.
+    pipeline, store, audit_sink = build_safety_pair(settings)
     router = _build_service_router(settings, pipeline, store, audit_sink)
 
     try:

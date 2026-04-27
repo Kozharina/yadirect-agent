@@ -123,6 +123,33 @@ Accumulated work that isn't blocking but will sting later.
       ``_logger = structlog.get_logger(__name__)`` binding next to
       the other module-level constants.
 
+- [ ] **KS#3 missing-phrase visibility for operator triage** (from
+      PR M2.3b auditor LOW): the new count-only ``CheckResult.reason``
+      ("missing N required negative keyword(s)") combined with sink-
+      level ``_PRIVATE_KEYS`` redaction and tool-handler
+      ``_redact_details`` means an operator triaging a KS#3 rejection
+      cannot see which phrases were missing from any post-hoc
+      channel — the live ``CheckResult.details["missing"]`` is
+      in-process only. Decide between: (a) emit phrase list to a
+      structlog DEBUG line keyed by trace_id (operator greps debug
+      log post-incident); (b) hash each phrase with a stable salt
+      and surface hashes (operator matches against hashed lookup of
+      their own policy YAML); (c) accept as-is and document the
+      runbook ("re-run policy check manually with the same
+      snapshot").
+
+- [ ] **Production-path ``audit_sink`` enforcement** (from PR M2.3b
+      auditor advisory): ``CampaignService`` and ``apply_plan`` both
+      accept ``audit_sink: AuditSink | None = None`` for fixture
+      backwards-compat. ``build_default_registry`` and the
+      ``apply-plan`` CLI supply one in production today, but a new
+      CLI command or service constructor could silently bypass
+      audit. Either (a) flip the default to a no-op ``NullSink`` and
+      require explicit opt-out, or (b) add a
+      ``settings.require_audit_sink`` flag that
+      ``_resolve_safety``-style raises if production marker is set
+      without a sink.
+
 - [ ] **Audit JSONL durability — fsync on emit** (from PR M2.3a
       auditor M-3): ``JsonlSink._append`` calls ``open().close()``
       which flushes Python's buffer to the OS but does not call

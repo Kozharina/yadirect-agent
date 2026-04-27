@@ -222,6 +222,12 @@ class CampaignService:
         """
         if budget_rub < 300:
             # Direct's minimum is 300 RUB. Catching early saves a round-trip.
+            # NB: this validation raises BEFORE ``audit_action`` opens, so
+            # no ``set_campaign_budget.*`` event fires. The apply_plan
+            # outer envelope (when called via apply-plan) still emits
+            # ``apply_plan.requested`` + ``apply_plan.failed`` carrying
+            # this ValueError, so operator-visible audit isn't lost on
+            # the apply path. Auditor PR M2.3b LOW.
             msg = f"Daily budget must be >= 300 RUB, got {budget_rub}"
             raise ValueError(msg)
 
@@ -262,25 +268,39 @@ class CampaignService:
         self._logger.info("campaigns.budget.ok", campaign_id=campaign_id)
 
     def _infer_actor(self) -> Actor:
-        """Walk the caller frames to find ``_applying_plan_id`` — when
-        the @requires_plan decorator's bypass branch runs, that kwarg
-        is in the wrapper's local frame; if we find it, the actor is
-        the operator running apply-plan, not the agent.
+        """Walk the caller frames to find the @requires_plan ``wrapper``
+        with ``_applying_plan_id`` set — that's the only frame the
+        decorator's bypass branch produces, and its presence means the
+        operator drove this call via apply-plan.
+
+        Auditor HIGH: the previous version checked ANY frame's locals
+        for ``_applying_plan_id``, which made the actor classification
+        sensitive to local-name collisions in middleware / orchestration
+        / test code. Pinning the match to ``frame.f_code.co_name ==
+        "wrapper"`` ensures only the canonical decorator frame qualifies.
 
         Frame inspection is ugly but the alternative is plumbing an
-        ``actor`` argument all the way from the executor through the
-        decorator into the wrapped method, which fights the decorator's
-        signature-transparency contract. The frame walk is bounded
-        (we look ~5 frames up and stop).
+        ``actor`` argument from the executor through the decorator into
+        the wrapped method, which fights the decorator's
+        signature-transparency contract. The walk is bounded
+        (we look ~8 frames up and stop) so unrelated frames don't
+        affect the verdict.
         """
         import sys
         from types import FrameType
 
         frame: FrameType | None = sys._getframe(1)  # caller of set_daily_budget
-        for _ in range(5):
+        for _ in range(8):
             if frame is None:
                 break
-            if frame.f_locals.get("_applying_plan_id") is not None:
+            # Match only the decorator's wrapper closure — name is
+            # set by ``functools.wraps(fn)`` in ``requires_plan`` to
+            # ``"wrapper"`` before ``__wrapped__`` rewrites it. The
+            # closure body holds ``_applying_plan_id`` as a local.
+            if (
+                frame.f_code.co_name == "wrapper"
+                and frame.f_locals.get("_applying_plan_id") is not None
+            ):
                 return "human"
             frame = frame.f_back
         return "agent"
