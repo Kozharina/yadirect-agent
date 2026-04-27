@@ -138,6 +138,32 @@ class TestCampaignSummary:
         assert summary.state == "UNKNOWN"
         assert summary.status == "UNKNOWN"
 
+    def test_does_not_carry_negative_keywords_to_agent_surface(self) -> None:
+        """Defence-in-depth: ``CampaignSummary`` is the agent-facing
+        view (returned by ``list_campaigns`` tool and CLI ``--json``).
+        Operator-configured negatives are commercial intent — brand
+        misspells, competitor names — and have no business reaching
+        the LLM agent's response. They flow only through the
+        safety-internal path (``_build_account_budget_snapshot`` →
+        ``CampaignBudget.negative_keywords``).
+
+        Pin: a Campaign rich with negatives produces a summary that
+        does NOT expose them. A future refactor that adds the field
+        for convenience would silently leak operator strategy to
+        the LLM."""
+        c = Campaign.model_validate(
+            {
+                "Id": 4,
+                "Name": "c4",
+                "NegativeKeywords": {"Items": ["бесплатно", "отзывы"]},
+            }
+        )
+
+        summary = CampaignSummary.from_model(c)
+
+        # No negative_keywords attribute on the summary at all.
+        assert not hasattr(summary, "negative_keywords")
+
 
 # --------------------------------------------------------------------------
 # list_active / list_all: filter semantics.
@@ -833,3 +859,217 @@ async def test_resume_raises_partial_action_error_on_per_item_errors(
 
     with pytest.raises(PartialActionError):
         await svc.resume([1])
+
+
+# --------------------------------------------------------------------------
+# KS#3 (negative-keyword floor) — end-to-end firing.
+#
+# Pre-PR ``_build_resume_context`` populated ``CampaignBudget.negative_keywords``
+# with an empty frozenset because the Direct API NegativeKeywords envelope
+# wasn't being read. With the model + client + summary changes wired,
+# KS#3 sees real per-campaign negatives and correctly fires only when
+# the campaign is actually missing a required phrase.
+# --------------------------------------------------------------------------
+
+
+def _build_safety_with_required_negatives(
+    tmp_path: Any, required: list[str]
+) -> tuple[Any, Any, _CapturingSink]:
+    """Variant of ``_build_safety_for_test`` with KS#3 configured."""
+    from yadirect_agent.agent.pipeline import SafetyPipeline
+    from yadirect_agent.agent.plans import PendingPlansStore
+    from yadirect_agent.agent.safety import (
+        BudgetCapPolicy,
+        ConversionIntegrityPolicy,
+        MaxCpcPolicy,
+        NegativeKeywordFloorPolicy,
+        Policy,
+        QueryDriftPolicy,
+    )
+
+    policy = Policy(
+        budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=100_000),
+        max_cpc=MaxCpcPolicy(),
+        negative_keyword_floor=NegativeKeywordFloorPolicy(
+            required_negative_keywords=required,
+        ),
+        query_drift=QueryDriftPolicy(),
+        conversion_integrity=ConversionIntegrityPolicy(
+            min_conversions_total=1,
+            min_ratio_vs_baseline=0.5,
+            require_all_baseline_goals_present=True,
+        ),
+        rollout_stage="autonomy_full",
+    )
+    return (
+        SafetyPipeline(policy),
+        PendingPlansStore(tmp_path / "pending_plans.jsonl"),
+        _CapturingSink(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_context_records_baseline_timestamp(
+    settings: Settings, fake_direct: _FakeDirectService, tmp_path: Any
+) -> None:
+    """Auditor M2-ks3-negatives HIGH-2: ``ReviewContext.baseline_timestamp``
+    must be stamped at snapshot-read time so the audit sink and any
+    future apply-plan staleness check have a reference point.
+    Without this, an apply-plan re-review minutes / hours after the
+    plan was created has no signal that the underlying snapshot is
+    stale — same gap closed for the bid context in the previous PR.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from yadirect_agent.services.campaigns import _build_resume_context
+
+    fake_direct._campaigns = [
+        Campaign(
+            Id=1,
+            Name="alpha",
+            State=CampaignState.SUSPENDED,
+            Status=CampaignStatus.ACCEPTED,
+            DailyBudget=DailyBudget(amount=500_000_000, mode="STANDARD"),
+        )
+    ]
+    pipeline, store, sink = _build_safety_for_test(tmp_path)
+    svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
+
+    before = datetime.now(UTC)
+    ctx = await _build_resume_context(svc, [1])
+    after = datetime.now(UTC)
+
+    assert ctx.baseline_timestamp is not None
+    assert ctx.baseline_timestamp.tzinfo is not None  # tz-aware, not naive
+    assert before - timedelta(seconds=1) <= ctx.baseline_timestamp <= after + timedelta(seconds=1)
+
+
+@pytest.mark.asyncio
+async def test_pause_context_records_baseline_timestamp(
+    settings: Settings, fake_direct: _FakeDirectService, tmp_path: Any
+) -> None:
+    """Same freshness signal must apply to pause / set_daily_budget —
+    KS#1 (budget cap) on those paths reads the snapshot's daily
+    budget totals, and a stale snapshot would let a parallel-operator
+    bump slip through the cap arithmetic."""
+    from datetime import UTC, datetime, timedelta
+
+    from yadirect_agent.services.campaigns import _build_pause_context
+
+    fake_direct._campaigns = [
+        Campaign(
+            Id=1,
+            Name="alpha",
+            State=CampaignState.ON,
+            Status=CampaignStatus.ACCEPTED,
+            DailyBudget=DailyBudget(amount=500_000_000, mode="STANDARD"),
+        )
+    ]
+    pipeline, store, sink = _build_safety_for_test(tmp_path)
+    svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
+
+    before = datetime.now(UTC)
+    ctx = await _build_pause_context(svc, [1])
+    after = datetime.now(UTC)
+
+    assert ctx.baseline_timestamp is not None
+    assert before - timedelta(seconds=1) <= ctx.baseline_timestamp <= after + timedelta(seconds=1)
+
+
+@pytest.mark.asyncio
+async def test_set_budget_context_records_baseline_timestamp(
+    settings: Settings, fake_direct: _FakeDirectService, tmp_path: Any
+) -> None:
+    """Same freshness signal must apply to set_daily_budget."""
+    from datetime import UTC, datetime, timedelta
+
+    from yadirect_agent.services.campaigns import _build_set_budget_context
+
+    fake_direct._campaigns = [
+        Campaign(
+            Id=1,
+            Name="alpha",
+            State=CampaignState.ON,
+            Status=CampaignStatus.ACCEPTED,
+            DailyBudget=DailyBudget(amount=500_000_000, mode="STANDARD"),
+        )
+    ]
+    pipeline, store, sink = _build_safety_for_test(tmp_path)
+    svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
+
+    before = datetime.now(UTC)
+    ctx = await _build_set_budget_context(svc, 1, 800)
+    after = datetime.now(UTC)
+
+    assert ctx.baseline_timestamp is not None
+    assert before - timedelta(seconds=1) <= ctx.baseline_timestamp <= after + timedelta(seconds=1)
+
+
+@pytest.mark.asyncio
+async def test_resume_blocks_when_campaign_missing_required_negatives(
+    settings: Settings, fake_direct: _FakeDirectService, tmp_path: Any
+) -> None:
+    """KS#3: an operator-configured ``required_negative_keywords``
+    that is NOT in the campaign's negatives → ``PlanRejected`` at
+    plan-creation time. Before this PR the snapshot's
+    ``negative_keywords`` was always empty so KS#3 blocked on every
+    resume regardless of the actual campaign state. The test pins
+    that resume is only blocked when the gap is real."""
+    from yadirect_agent.agent.executor import PlanRejected
+
+    fake_direct._campaigns = [
+        Campaign(
+            Id=1,
+            Name="alpha",
+            State=CampaignState.SUSPENDED,
+            Status=CampaignStatus.ACCEPTED,
+            DailyBudget=DailyBudget(amount=500_000_000, mode="STANDARD"),
+            # Carries one of the two required phrases — still
+            # missing the other → KS#3 must block.
+            negative_keywords=["отзывы"],
+        )
+    ]
+    pipeline, store, sink = _build_safety_with_required_negatives(
+        tmp_path, required=["бесплатно", "отзывы"]
+    )
+    svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
+
+    with pytest.raises(PlanRejected):
+        await svc.resume([1])
+
+    # No mutation reached the API.
+    assert fake_direct.resume_calls == []
+
+
+@pytest.mark.asyncio
+async def test_resume_proceeds_when_campaign_carries_all_required_negatives(
+    settings: Settings, fake_direct: _FakeDirectService, tmp_path: Any
+) -> None:
+    """Inverse pin: a campaign that carries every required phrase
+    proceeds to the confirm path (``auto_approve_resume=False``) —
+    KS#3 must not fire on a compliant campaign. Before this PR the
+    snapshot was always empty so KS#3 fired on EVERY resume the
+    moment any required negative was configured; this test would
+    have been impossible to pass."""
+    from yadirect_agent.agent.executor import PlanRequired
+
+    fake_direct._campaigns = [
+        Campaign(
+            Id=1,
+            Name="alpha",
+            State=CampaignState.SUSPENDED,
+            Status=CampaignStatus.ACCEPTED,
+            DailyBudget=DailyBudget(amount=500_000_000, mode="STANDARD"),
+            negative_keywords=["бесплатно", "отзывы", "купить"],
+        )
+    ]
+    pipeline, store, sink = _build_safety_with_required_negatives(
+        tmp_path, required=["бесплатно", "отзывы"]
+    )
+    svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
+
+    with pytest.raises(PlanRequired):
+        await svc.resume([1])
+
+    # Plan persisted but DirectService NOT called (confirm tier).
+    assert fake_direct.resume_calls == []

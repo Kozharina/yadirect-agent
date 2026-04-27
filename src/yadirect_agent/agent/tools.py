@@ -156,7 +156,22 @@ class ToolRegistry:
 # second-pass MEDIUM.
 # --------------------------------------------------------------------------
 
-_PRIVATE_DETAIL_KEYS: frozenset[str] = frozenset({"new_queries_sample"})
+_PRIVATE_DETAIL_KEYS: frozenset[str] = frozenset(
+    {
+        # KS#7 (query drift) — raw user search terms reach the agent
+        # via ``new_queries_sample`` in CheckResult.details. Direct
+        # search terms can carry names, addresses, medical phrases.
+        "new_queries_sample",
+        # KS#3 (negative-keyword floor) — the operator-supplied list
+        # of required phrases the campaign lacks. Commercial intent
+        # (competitor names / brand misspells / regulated-product
+        # filters) that has no business reaching the LLM. The audit
+        # sink already strips this via ``audit._PRIVATE_KEYS``;
+        # mirroring it here matches the audit-facing channel to the
+        # agent-facing channel. Auditor M2-ks3-negatives HIGH-1.
+        "missing",
+    }
+)
 
 
 def _redact_details(details: dict[str, Any]) -> dict[str, Any]:

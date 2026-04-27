@@ -60,6 +60,12 @@ class DirectService:
             "EndDate",
             "DailyBudget",
             "ClientInfo",
+            # Per-campaign negatives are needed for KS#3 to compare
+            # ``CampaignBudget.negative_keywords`` against
+            # ``Policy.required_negative_keywords`` at resume time.
+            # Direct returns ``{"Items": [...]}``; the Campaign model
+            # flattens at validation time.
+            "NegativeKeywords",
         ]
 
         result = await self._api.call(

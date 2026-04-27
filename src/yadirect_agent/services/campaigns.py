@@ -23,6 +23,7 @@ reserved for the apply-plan executor's re-entry. Read-only methods
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -39,7 +40,16 @@ from ..models.campaigns import Campaign, CampaignState
 
 @dataclass(frozen=True)
 class CampaignSummary:
-    """Flattened view for agent consumption — no nested micro-currency fiddling."""
+    """Flattened view for agent consumption — no nested micro-currency fiddling.
+
+    Deliberately does NOT carry ``negative_keywords`` — those are
+    operator-configured business intent (brand misspells / competitor
+    names / etc.) and stay on the safety-internal path. The bid
+    snapshot builder reads them via ``DirectService.get_campaigns``
+    directly, not through this summary, so they never reach the
+    agent's ``list_campaigns`` tool response or the CLI ``--json``
+    output.
+    """
 
     id: int
     name: str
@@ -106,26 +116,52 @@ def _assert_action_results_clean(result: dict[str, Any], results_key: str, actio
 
 async def _build_account_budget_snapshot(
     service: CampaignService,
-) -> AccountBudgetSnapshot:
+) -> tuple[AccountBudgetSnapshot, datetime]:
     """Read the current ``AccountBudgetSnapshot`` from Direct.
 
     Shared helper used by every ``CampaignService`` method that
-    needs the account state for KS#1/#3 evaluation. Negative
-    keywords are not populated — see the limitations note in
-    docs/BACKLOG.md "Pull per-campaign negative keywords for KS#3".
+    needs the account state for KS#1 (budget cap) and KS#3
+    (negative-keyword floor) evaluation. Bypasses the
+    agent-facing ``CampaignSummary`` flattener and reads the wire
+    ``Campaign`` model directly so per-campaign negatives flow
+    through to ``CampaignBudget.negative_keywords`` without leaking
+    operator-configured negatives to the agent's ``list_campaigns``
+    tool response (same defence-in-depth pattern as
+    ``_build_bid_context``).
+
+    Returns ``(snapshot, baseline_timestamp)``. The timestamp is
+    captured BEFORE the network call so the apply-plan re-review
+    path can compare against the freshness of the snapshot the
+    operator approved, not against the later moment the executor
+    happens to look. KS#1 / KS#3 evaluations both need a freshness
+    signal — a parallel-operator budget bump or a negative-keyword
+    add between plan creation and apply-plan execution would
+    otherwise be invisible to the guard. Auditor
+    M2-ks3-negatives HIGH-2 (and parity with the bid snapshot
+    builder, M2-bid-snapshot HIGH-2). Policy-driven enforcement
+    (``max_snapshot_age_seconds`` in ``apply_plan``) is queued in
+    BACKLOG.
     """
 
-    summaries = await service.list_all()
-    campaigns = [
-        CampaignBudget(
-            id=s.id,
-            name=s.name,
-            daily_budget_rub=0.0 if s.daily_budget_rub is None else s.daily_budget_rub,
-            state=s.state,
+    baseline_timestamp = datetime.now(UTC)
+    async with DirectService(service._settings) as api:
+        campaigns_raw = await api.get_campaigns()
+
+    campaigns: list[CampaignBudget] = []
+    for c in campaigns_raw:
+        budget_rub: float = 0.0
+        if c.daily_budget is not None:
+            budget_rub = c.daily_budget.amount / 1_000_000
+        campaigns.append(
+            CampaignBudget(
+                id=c.id,
+                name=c.name,
+                daily_budget_rub=budget_rub,
+                state=c.state.value if c.state else "UNKNOWN",
+                negative_keywords=frozenset(c.negative_keywords),
+            )
         )
-        for s in summaries
-    ]
-    return AccountBudgetSnapshot(campaigns=campaigns)
+    return AccountBudgetSnapshot(campaigns=campaigns), baseline_timestamp
 
 
 async def _build_pause_context(service: CampaignService, campaign_ids: list[int]) -> ReviewContext:
@@ -137,12 +173,13 @@ async def _build_pause_context(service: CampaignService, campaign_ids: list[int]
     pipeline's required-snapshot guard passes for the action.
     """
 
-    snapshot = await _build_account_budget_snapshot(service)
+    snapshot, baseline_timestamp = await _build_account_budget_snapshot(service)
     return ReviewContext(
         budget_snapshot=snapshot,
         budget_changes=[
             BudgetChange(campaign_id=cid, new_state="SUSPENDED") for cid in campaign_ids
         ],
+        baseline_timestamp=baseline_timestamp,
     )
 
 
@@ -151,20 +188,19 @@ async def _build_resume_context(service: CampaignService, campaign_ids: list[int
 
     Resume is the primary KS#3 trigger per safety-spec — every
     resumed campaign must satisfy the configured
-    ``required_negative_keywords`` floor. Snapshot's
-    ``negative_keywords`` field is currently always empty (we don't
-    yet read per-campaign negatives from the Direct API). Default
-    policy ships with empty ``required_negative_keywords`` so KS#3
-    is a no-op out of the box; once the operator configures
-    required negatives in YAML, the next agent run will start
-    blocking resume on every campaign until per-campaign negative
-    fetch lands. Tracked in BACKLOG.
+    ``required_negative_keywords`` floor. The snapshot now carries
+    real per-campaign negatives (populated via
+    ``_build_account_budget_snapshot`` → ``DirectService.get_campaigns``
+    with the ``NegativeKeywords`` FieldName) so KS#3 fires only
+    when a campaign actually lacks a required phrase, and proceeds
+    to the confirm path when the campaign is compliant.
     """
 
-    snapshot = await _build_account_budget_snapshot(service)
+    snapshot, baseline_timestamp = await _build_account_budget_snapshot(service)
     return ReviewContext(
         budget_snapshot=snapshot,
         budget_changes=[BudgetChange(campaign_id=cid, new_state="ON") for cid in campaign_ids],
+        baseline_timestamp=baseline_timestamp,
     )
 
 
@@ -176,13 +212,14 @@ async def _build_set_budget_context(
     The single ``BudgetChange`` records the operator's intent so KS#1
     can compare ``proposed_total`` to ``account_daily_budget_cap_rub``.
     """
-    snapshot = await _build_account_budget_snapshot(service)
+    snapshot, baseline_timestamp = await _build_account_budget_snapshot(service)
 
     return ReviewContext(
         budget_snapshot=snapshot,
         budget_changes=[
             BudgetChange(campaign_id=campaign_id, new_daily_budget_rub=budget_rub),
         ],
+        baseline_timestamp=baseline_timestamp,
     )
 
 
