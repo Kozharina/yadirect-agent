@@ -54,7 +54,15 @@ evals exercise the full safety surface.)*
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **Audit emit guards: narrow `except Exception` to `OSError`**
+      (branch ``fix/audit-emit-narrow-os-error``) — auditor M2.3a
+      ADVISORY-1. Currently both emit-guards swallow every
+      ``Exception``, hiding programmer bugs (ValidationError on
+      malformed AuditEvent, TypeError, AttributeError) behind a
+      structlog warning. Tighten the success path to OSError-only
+      so programmer bugs propagate; keep the failure path catching
+      all but log programmer errors loudly while still re-raising
+      the original wrapped-operation exception.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
