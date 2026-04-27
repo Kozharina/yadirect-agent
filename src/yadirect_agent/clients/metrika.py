@@ -48,7 +48,7 @@ from ..exceptions import (
     RateLimitError,
     ValidationError,
 )
-from ..models.metrika import DateRange, MetrikaGoal, ReportRow
+from ..models.metrika import DateRange, MetrikaCounter, MetrikaGoal, ReportRow
 
 # Status codes that warrant a retry. 429 is included so we honour
 # Metrika's rate-limit signal; 5xx covers transient server issues.
@@ -228,12 +228,25 @@ class MetrikaService:
         msg = "unreachable: retrier produced no result"
         raise RuntimeError(msg)  # pragma: no cover
 
-    async def get_counters(self) -> list[dict[str, Any]]:
-        """List counters this token has access to. Used by the doctor command."""
+    async def get_counters(self) -> list[MetrikaCounter]:
+        """List counters this token has access to.
+
+        Used by the doctor command and the M15 onboarding wizard to
+        match the user's website domain against an existing counter
+        rather than asking them to look the id up by hand.
+
+        Validates the response into ``MetrikaCounter`` rather than
+        returning raw ``list[dict]`` so a malicious or malformed
+        response can't inject arbitrary nested structures into
+        downstream consumers. Forward-compat fields are preserved
+        via ``model_extra``. (auditor M6 MEDIUM-6.)
+        """
         response = await self._request("GET", "/management/v1/counters")
         if response.status_code != 200:
             raise _classify_terminal(response)
-        return list(response.json().get("counters", []))
+        body = response.json()
+        raw_counters = body.get("counters", [])
+        return [MetrikaCounter.model_validate(c) for c in raw_counters]
 
     async def get_goals(self, *, counter_id: int) -> list[MetrikaGoal]:
         """List goals defined on the given counter.

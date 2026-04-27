@@ -55,6 +55,24 @@ class MetrikaGoal(BaseModel):
     type: str  # raw string — see MetrikaGoalType for known values
 
 
+class MetrikaCounter(BaseModel):
+    """One counter accessible to the current OAuth token.
+
+    Matches the response shape of GET /management/v1/counters under
+    its ``counters: [...]`` envelope. ``extra="allow"`` for forward
+    compat with new fields Yandex adds over time. We type the small
+    set of fields the doctor command and onboarding wizard actually
+    use; everything else is preserved via ``model_extra``.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: int
+    name: str
+    site: str | None = None
+    status: str | None = None
+
+
 class ReportRow(BaseModel):
     """One row from /stat/v1/data.
 

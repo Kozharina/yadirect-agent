@@ -17,6 +17,7 @@ import pytest
 from yadirect_agent.models.metrika import (
     CampaignPerformance,
     DateRange,
+    MetrikaCounter,
     MetrikaGoal,
     ReportRow,
 )
@@ -122,6 +123,34 @@ class TestMetrikaGoal:
         # extra="allow" exposes unknown fields via __pydantic_extra__
         assert g.model_extra is not None
         assert g.model_extra["default_price"] == 500
+
+
+class TestMetrikaCounter:
+    def test_minimal_construction(self) -> None:
+        c = MetrikaCounter(id=12345, name="my-shop")
+
+        assert c.id == 12345
+        assert c.name == "my-shop"
+        assert c.site is None
+        assert c.status is None
+
+    def test_full_construction_from_wire_shape(self) -> None:
+        c = MetrikaCounter.model_validate(
+            {
+                "id": 12345,
+                "name": "my-shop",
+                "site": "example.com",
+                "status": "Active",
+                "owner_login": "user@yandex.ru",  # forward-compat field
+            },
+        )
+
+        assert c.id == 12345
+        assert c.site == "example.com"
+        assert c.status == "Active"
+        # extra="allow" preserves unknown fields
+        assert c.model_extra is not None
+        assert c.model_extra["owner_login"] == "user@yandex.ru"
 
 
 class TestReportRow:

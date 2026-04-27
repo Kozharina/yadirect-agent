@@ -41,6 +41,7 @@ from yadirect_agent.models.metrika import DateRange
 
 _GOALS_URL = "https://api-metrika.yandex.net/management/v1/counter/12345/goals"
 _REPORT_URL = "https://api-metrika.yandex.net/stat/v1/data"
+_COUNTERS_URL = "https://api-metrika.yandex.net/management/v1/counters"
 
 
 class TestGetGoals:
@@ -238,6 +239,67 @@ class TestGetGoals:
                 await svc.get_goals(counter_id=12345)
 
         assert len(str(exc_info.value)) < 2000
+
+
+class TestGetCounters:
+    @respx.mock
+    async def test_happy_path_returns_typed_counters(
+        self,
+        settings: Settings,
+    ) -> None:
+        respx.get(_COUNTERS_URL).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "counters": [
+                        {
+                            "id": 12345,
+                            "name": "my-shop",
+                            "site": "example.com",
+                            "status": "Active",
+                        },
+                        {"id": 67890, "name": "secondary"},
+                    ],
+                },
+            ),
+        )
+
+        async with MetrikaService(settings) as svc:
+            counters = await svc.get_counters()
+
+        assert len(counters) == 2
+        assert counters[0].id == 12345
+        assert counters[0].name == "my-shop"
+        assert counters[0].site == "example.com"
+        assert counters[1].id == 67890
+        assert counters[1].site is None  # field optional
+
+    @respx.mock
+    async def test_empty_account_returns_empty_list(
+        self,
+        settings: Settings,
+    ) -> None:
+        respx.get(_COUNTERS_URL).mock(
+            return_value=httpx.Response(200, json={"counters": []}),
+        )
+
+        async with MetrikaService(settings) as svc:
+            counters = await svc.get_counters()
+
+        assert counters == []
+
+    @respx.mock
+    async def test_401_raises_auth_error(self, settings: Settings) -> None:
+        respx.get(_COUNTERS_URL).mock(
+            return_value=httpx.Response(
+                401,
+                json={"errors": [{"message": "token invalid"}]},
+            ),
+        )
+
+        async with MetrikaService(settings) as svc:
+            with pytest.raises(AuthError):
+                await svc.get_counters()
 
 
 class TestGetReport:
