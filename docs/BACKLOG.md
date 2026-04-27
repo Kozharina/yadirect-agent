@@ -71,6 +71,40 @@ the PR merges or is abandoned.
 
 Accumulated work that isn't blocking but will sting later.
 
+- [ ] **`max_snapshot_age_seconds` policy enforcement at apply-plan
+      re-review** (auditor M2-bid-snapshot HIGH-2 follow-up): the
+      bid-context reader now stamps ``ReviewContext.baseline_timestamp``,
+      but ``apply_plan`` does not yet read it. Operator-driven
+      ``apply-plan <id>`` minutes / hours / days after the plan was
+      created re-reviews against an arbitrarily stale snapshot. KS#4's
+      ``_is_increase`` compares the proposed bid against the snapshot's
+      current bid — a parallel-operator bid bump between plan creation
+      and apply execution would be invisible to the guard, opening a
+      window for a second consecutive increase on the same keyword.
+      Fix: add ``max_snapshot_age_seconds: int`` to ``Policy`` (default
+      300 s); in ``apply_plan``, if the plan's ``review_context.baseline_timestamp``
+      is present and older than the policy ceiling, mark the plan
+      ``failed`` with a clear stale-snapshot reason and require the
+      operator to re-issue. Apply the same enforcement to
+      ``CampaignService`` context builders (none of them stamp
+      baseline_timestamp today either; the bid reader is just the
+      first to make freshness load-bearing).
+
+- [ ] **Audit redaction for live bid values in CheckResult.details**
+      (auditor M2-bid-snapshot LOW): ``QualityScoreGuardCheck`` and
+      ``MaxCpcCheck`` emit ``current_rub``, ``proposed_rub`` and
+      ``cap_rub`` into ``CheckResult.details``. These flow through
+      ``SafetyDecision.blocking_checks`` → ``PlanRejected.blocking``
+      → audit log (M2.3) and agent tool responses. Bid values on
+      competitor brand keywords or niche product keywords are
+      commercially sensitive; exposing them to the LLM agent
+      violates minimum-information-exposure. Fix: extend
+      ``audit._PRIVATE_KEYS`` with ``current_rub`` / ``proposed_rub``
+      / ``cap_rub``, OR introduce a ``details_for_audit`` /
+      ``details_for_agent`` split in ``CheckResult`` so the operator-
+      facing audit retains the values for triage while the
+      LLM-facing tool response strips them.
+
 - [ ] **M2.2 part 3 executor must-haves** (from SafetyPipeline
       second-pass auditor review; block apply-plan merge):
   - **Executor must call `SafetyPipeline.on_applied(context)`
