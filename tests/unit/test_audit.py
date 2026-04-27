@@ -455,7 +455,12 @@ class TestInferActorFromFrame:
 
         def wrapper() -> str:
             _applying_plan_id = "test-plan"
-            return infer_actor_from_frame()
+            actor = infer_actor_from_frame()
+            # Sentinel read so CodeQL ``py/unused-local-variable``
+            # sees the local as used. The frame walker reads it
+            # via ``frame.f_locals``, which is invisible to lint.
+            assert _applying_plan_id == "test-plan"
+            return actor
 
         assert wrapper() == "human"
 
@@ -482,7 +487,10 @@ class TestInferActorFromFrame:
 
         def some_other_function() -> str:
             _applying_plan_id = "test-plan"
-            return infer_actor_from_frame()
+            actor = infer_actor_from_frame()
+            # Sentinel read — see test_returns_human_when_wrapper_has_applying_plan_id.
+            assert _applying_plan_id == "test-plan"
+            return actor
 
         assert some_other_function() == "agent"
 
@@ -494,7 +502,10 @@ class TestInferActorFromFrame:
 
         def wrapper() -> str:
             _applying_plan_id = "test-plan"
-            return level_1()
+            actor = level_1()
+            # Sentinel read — see test_returns_human_when_wrapper_has_applying_plan_id.
+            assert _applying_plan_id == "test-plan"
+            return actor
 
         def level_1() -> str:
             return level_2()
