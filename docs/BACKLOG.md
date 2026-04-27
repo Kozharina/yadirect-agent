@@ -121,6 +121,26 @@ Accumulated work that isn't blocking but will sting later.
       in `apply_plan` with `fcntl.flock` on the JSONL path. Re-evaluate
       severity then.
 
+- [ ] **Plan-store I/O failure masking** (from PR-A second-pass
+      auditor LOW NF-2; not blocking part 3b): if the JSONL append
+      inside `apply_plan`'s `update_status("failed")` itself raises
+      (disk full, file deleted), the new `OSError` masks the
+      original executor failure. Same risk on `update_status("applied")`
+      — a write failure leaves the plan in `pending` while the API
+      call has succeeded, opening a double-spend window on retry.
+      Fix: wrap both `update_status` calls in their own try/except,
+      log the original exception at error level via structlog, then
+      re-raise with `from original_exc` to preserve causality.
+
+- [ ] **Executor logger should be structlog, not stdlib `logging`**
+      (from PR-A second-pass auditor LOW NF-3; not blocking part 3b):
+      the `on_applied`-failure recovery path in `apply_plan` uses
+      `logging.getLogger(__name__).exception(...)` while the rest of
+      the agent package uses `structlog`. Stdlib `logging` bypasses
+      the contextvars binding (trace_id and friends), so the
+      operator searching by trace_id after a stale TOCTOU register
+      finds nothing. Replace with `structlog.get_logger(__name__)`.
+
 - [ ] **M2.2 pipeline must-haves** (from M2.1 auditor review; block
       M2.2 merge, not just landing):
   - **`rollout_stage` enforcement** — today the field is stored but

@@ -490,32 +490,6 @@ class TestApplyPlanOnAppliedRobustness:
         assert final is not None
         assert final.status == "applied"
 
-    async def test_executor_failure_skips_on_applied_and_does_not_apply(
-        self, store: PendingPlansStore
-    ) -> None:
-        """Confirm that the executor-failure ordering is unchanged by the
-        C-1 fix: API failure means status=failed, no on_applied, no applied.
-        """
-        plan_id = await _seed_pending_plan(store, _StubPipeline())
-        pipe = _StubPipeline()
-        pipe.next_decision = SafetyDecision(status="allow", reason="ok")
-
-        async def boom(action: str, args: dict[str, Any], *, _applying_plan_id: str) -> Any:
-            raise RuntimeError("API down")
-
-        with pytest.raises(RuntimeError, match="API down"):
-            await apply_plan(
-                plan_id,
-                store=store,
-                pipeline=pipe,
-                service_router=boom,
-            )
-
-        assert pipe.on_applied_calls == []
-        final = store.get(plan_id)
-        assert final is not None
-        assert final.status == "failed"
-
 
 # --------------------------------------------------------------------------
 # _bound_args_dict — direct unit tests (auditor L-2).

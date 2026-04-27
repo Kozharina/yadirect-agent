@@ -28,13 +28,25 @@ Flow (``apply_plan`` path — operator confirming a pending plan):
                 allow/confirm: service_router(action, args, _applying_plan_id=id)
                               → decorator bypass (sees _applying_plan_id)
                               → wrapped method runs
-             → success: pipeline.on_applied(ctx); store pending→applied
+             → success: store pending→applied; pipeline.on_applied(ctx)
+                        (best-effort — see below)
              → exception: store pending→failed; DO NOT call on_applied
                           (propagate error to operator)
 
-The ``on_applied`` contract is a hard invariant — if the executor
-raises, the session TOCTOU register must not record the approved bid.
-Tested explicitly in ``TestApplyPlanExecutorFailure``.
+Ordering of ``store.update_status("applied")`` BEFORE
+``pipeline.on_applied(ctx)`` on the success path is deliberate
+(auditor C-1). The API call has spent real money; the plan record
+must reflect that immediately so a crash here cannot leave the plan
+in ``pending`` and let a second ``apply-plan`` double-spend.
+``on_applied`` is best-effort post-success — if it raises, the
+session TOCTOU register loses one entry (defendable degradation:
+the next plan goes through normal pipeline checks) but the store
+correctly reflects the API write.
+
+The ``on_applied`` contract on the failure path is a hard invariant
+— if the executor raises, the session TOCTOU register must not
+record the approved bid. Tested in ``TestApplyPlanExecutorFailure``
+and ``TestApplyPlanOnAppliedRobustness``.
 """
 
 from __future__ import annotations
