@@ -425,3 +425,103 @@ class TestPrivateKeyMissingForKS3:
         )
         assert "missing" not in redacted
         assert redacted["campaign_id"] == 42
+
+
+# --------------------------------------------------------------------------
+# infer_actor_from_frame — shared helper deduped from CampaignService /
+# BiddingService ``_infer_actor`` methods. Both services return ``human``
+# when the @requires_plan decorator's ``wrapper`` closure has
+# ``_applying_plan_id`` set in its locals (apply-plan re-entry path);
+# every other call returns ``agent``. The frame walk is bounded so a
+# deeply-nested test or middleware doesn't wander into unrelated locals.
+# --------------------------------------------------------------------------
+
+
+class TestInferActorFromFrame:
+    def test_returns_agent_when_no_wrapper_frame_above(self) -> None:
+        """Direct call from a vanilla function — no @requires_plan
+        wrapper anywhere up the stack. Default verdict is the
+        agent path."""
+        from yadirect_agent.audit import infer_actor_from_frame
+
+        assert infer_actor_from_frame() == "agent"
+
+    def test_returns_human_when_wrapper_has_applying_plan_id(self) -> None:
+        """Canonical bypass shape: a frame literally named ``wrapper``
+        (the closure name @requires_plan produces) carries
+        ``_applying_plan_id`` as a local. Operator drove the call
+        via apply-plan, so actor is ``human``."""
+        from yadirect_agent.audit import infer_actor_from_frame
+
+        def wrapper() -> str:
+            _applying_plan_id = "test-plan"
+            return infer_actor_from_frame()
+
+        assert wrapper() == "human"
+
+    def test_ignores_wrapper_frame_without_applying_plan_id(self) -> None:
+        """``wrapper``-named frame whose locals do NOT include
+        ``_applying_plan_id`` is the agent path. The decorator's
+        non-bypass branch produces exactly this shape: same
+        wrapper closure, no kwarg threaded through."""
+        from yadirect_agent.audit import infer_actor_from_frame
+
+        def wrapper() -> str:
+            return infer_actor_from_frame()
+
+        assert wrapper() == "agent"
+
+    def test_ignores_applying_plan_id_in_non_wrapper_frames(self) -> None:
+        """Auditor HIGH lesson baked in: matching ``_applying_plan_id``
+        in ANY frame's locals (not just the canonical decorator
+        wrapper) made actor classification sensitive to local-name
+        collisions in middleware / orchestration / test code.
+        Pin: a non-``wrapper`` frame with that local name does
+        NOT flip the verdict."""
+        from yadirect_agent.audit import infer_actor_from_frame
+
+        def some_other_function() -> str:
+            _applying_plan_id = "test-plan"
+            return infer_actor_from_frame()
+
+        assert some_other_function() == "agent"
+
+    def test_walk_is_bounded_at_eight_frames(self) -> None:
+        """A wrapper frame more than 8 stack frames above the call
+        site is not considered. Bounds prevent runaway frame-walks
+        in deeply-nested contexts."""
+        from yadirect_agent.audit import infer_actor_from_frame
+
+        def wrapper() -> str:
+            _applying_plan_id = "test-plan"
+            return level_1()
+
+        def level_1() -> str:
+            return level_2()
+
+        def level_2() -> str:
+            return level_3()
+
+        def level_3() -> str:
+            return level_4()
+
+        def level_4() -> str:
+            return level_5()
+
+        def level_5() -> str:
+            return level_6()
+
+        def level_6() -> str:
+            return level_7()
+
+        def level_7() -> str:
+            return level_8()
+
+        def level_8() -> str:
+            # 9 frames between the wrapper and the call to
+            # infer_actor_from_frame (level_1..level_8 + this one),
+            # so the walk's 8-frame ceiling means the wrapper's
+            # _applying_plan_id is not reached. Verdict: agent.
+            return infer_actor_from_frame()
+
+        assert wrapper() == "agent"
