@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
 from yadirect_agent.agent.executor import (
     InvalidPlanStateError,
     PlanRejected,
@@ -32,7 +33,6 @@ from yadirect_agent.agent.executor import (
     apply_plan,
     requires_plan,
 )
-
 from yadirect_agent.agent.pipeline import ReviewContext, SafetyDecision
 from yadirect_agent.agent.plans import OperationPlan, PendingPlansStore
 from yadirect_agent.agent.safety import (
@@ -185,7 +185,7 @@ class TestRequiresPlanReject:
             next_decision=SafetyDecision(
                 status="reject",
                 reason="exceeds account cap",
-                blocking=[CheckResult(name="budget_cap", status="blocked", reason="x")],
+                blocking_checks=[CheckResult(status="blocked", reason="budget_cap: x")],
             )
         )
         svc = _FakeService(pipe, store)
@@ -194,7 +194,11 @@ class TestRequiresPlanReject:
             await svc.set_daily_budget(1, 200)
 
         assert "cap" in exc.value.reason
-        assert "budget_cap" in exc.value.blocking
+        # blocking is the raw CheckResult list — surfaces reason + details
+        # to the CLI / audit sink without flattening.
+        assert len(exc.value.blocking) == 1
+        assert exc.value.blocking[0].status == "blocked"
+        assert "budget_cap" in (exc.value.blocking[0].reason or "")
         assert svc.calls == []
         assert pipe.on_applied_calls == []
         # Reject does NOT write to the jsonl store — that's audit-sink
@@ -300,7 +304,7 @@ class TestApplyPlanReReviewRejects:
         pipe.next_decision = SafetyDecision(
             status="reject",
             reason="now exceeds cap",
-            blocking=[CheckResult(name="budget_cap", status="blocked", reason="x")],
+            blocking_checks=[CheckResult(status="blocked", reason="budget_cap: x")],
         )
 
         with pytest.raises(PlanRejected):
