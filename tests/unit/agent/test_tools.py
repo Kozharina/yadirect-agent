@@ -738,7 +738,9 @@ async def test_set_keyword_bids_converts_and_forwards(
     assert len(captured) == 1
     assert captured[0][0].keyword_id == 1
     assert captured[0][0].new_search_bid_rub == 10.0
-    assert result == {"updated": [1]}
+    # ``status: applied`` added when set_keyword_bids was wired
+    # through @requires_plan in the M2 follow-up.
+    assert result == {"status": "applied", "updated": [1]}
 
 
 @pytest.mark.asyncio

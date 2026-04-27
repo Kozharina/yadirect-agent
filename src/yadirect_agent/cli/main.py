@@ -448,6 +448,23 @@ def _build_service_router(
             return await svc.pause(args["campaign_ids"], _applying_plan_id=_applying_plan_id)
         if action == "resume_campaigns":
             return await svc.resume(args["campaign_ids"], _applying_plan_id=_applying_plan_id)
+        if action == "set_keyword_bids":
+            # Reconstruct ``BidUpdate`` instances from the persisted
+            # plan args. ``BidUpdate.model_validate`` (rather than a
+            # constructor splat) routes through pydantic so:
+            # - ``extra="forbid"`` raises on schema drift (a future
+            #   field added to BidUpdate but missing from a stored
+            #   plan surfaces as a clean ValidationError);
+            # - field-level constraints (``ge=0`` on bids) re-fire
+            #   on replay even if the writer somehow corrupted them.
+            # Auditor M2-bidding M-1.
+            from ..services.bidding import BiddingService, BidUpdate
+
+            bid_svc = BiddingService(
+                settings, pipeline=pipeline, store=store, audit_sink=audit_sink
+            )
+            updates = [BidUpdate.model_validate(u) for u in args["updates"]]
+            return await bid_svc.apply(updates, _applying_plan_id=_applying_plan_id)
         msg = f"unknown action: {action!r}"
         raise ValueError(msg)
 

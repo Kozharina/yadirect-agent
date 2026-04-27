@@ -21,12 +21,11 @@ _GATED_WRITE_TOOLS = {
     "pause_campaigns",
     "resume_campaigns",
     "set_campaign_budget",
+    # ``set_keyword_bids`` was on the MCP denylist until the M2
+    # follow-up that gated ``BiddingService.apply`` through
+    # ``@requires_plan``. The denylist is now empty.
+    "set_keyword_bids",
 }
-# ``set_keyword_bids`` is on the MCP write-tool denylist until
-# ``BiddingService.apply`` gets ``@requires_plan`` (auditor M3 MEDIUM
-# M-2). Until then the tool is NEVER published over MCP, even with
-# ``--allow-write``.
-_DENYLISTED_WRITE_TOOLS = {"set_keyword_bids"}
 _ALL_EXPOSED_WITH_WRITE = _READ_ONLY_TOOLS | _GATED_WRITE_TOOLS
 
 
@@ -45,7 +44,6 @@ class TestBuildMcpServer:
 
         assert _READ_ONLY_TOOLS.issubset(names)
         assert names.isdisjoint(_GATED_WRITE_TOOLS)
-        assert names.isdisjoint(_DENYLISTED_WRITE_TOOLS)
 
     def test_allow_write_exposes_all_tools(self, settings: Any) -> None:
         """``--allow-write`` (or ``MCP_ALLOW_WRITE=true``) opts in to
@@ -58,12 +56,11 @@ class TestBuildMcpServer:
         handle = build_mcp_server(settings, allow_write=True)
         names = {t.name for t in handle.tools}
 
-        # Read-only + the three gated write tools are exposed.
+        # All seven tools exposed: read-only + four gated write
+        # tools (pause / resume / set_campaign_budget /
+        # set_keyword_bids; the last was un-denylisted when
+        # BiddingService.apply got @requires_plan).
         assert _ALL_EXPOSED_WITH_WRITE.issubset(names)
-        # Auditor M3 M-2: denylisted write tools (currently
-        # set_keyword_bids) are NEVER published, even with
-        # --allow-write, until they get @requires_plan gating.
-        assert names.isdisjoint(_DENYLISTED_WRITE_TOOLS)
 
     def test_tool_input_schemas_match_pydantic_models(self, settings: Any) -> None:
         """Each MCP tool's inputSchema must come from the pydantic
@@ -86,18 +83,32 @@ class TestBuildMcpServer:
         # fields before they ever reach our handler.
         assert scb.inputSchema.get("additionalProperties") is False
 
-    def test_denylisted_write_tool_never_dispatchable_even_with_allow_write(
-        self, settings: Any
+    def test_denylist_mechanism_excludes_listed_tool(
+        self,
+        settings: Any,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Auditor M3 M-2 regression guard: a write tool on the
-        denylist (``set_keyword_bids`` today) MUST refuse to dispatch
-        even when the operator passed ``--allow-write``. The tool is
-        not registered, so ``dispatch`` looks up ``_exposed`` and
-        misses — surfacing as ``ValueError("unknown tool ...")``.
+        """Auditor M3 M-2 regression guard: the denylist mechanism
+        works. The denylist itself is empty after the M2 follow-up
+        that gated ``BiddingService.apply`` (every mutating service
+        method is now structurally unbypassable), but the mechanism
+        must remain enforceable so a future ungated write tool
+        can be added to the denylist without the structure
+        rotting. Patch the denylist to include a real write tool
+        and assert it's excluded.
         """
         import asyncio
 
-        handle = build_mcp_server(settings, allow_write=True)
+        from yadirect_agent.mcp import server as mcp_server
+
+        monkeypatch.setattr(
+            mcp_server,
+            "_MCP_WRITE_TOOLS_DENYLIST",
+            frozenset({"set_keyword_bids"}),
+        )
+        handle = mcp_server.build_mcp_server(settings, allow_write=True)
+        names = {t.name for t in handle.tools}
+        assert "set_keyword_bids" not in names
         with pytest.raises(ValueError, match="unknown tool"):
             asyncio.run(handle.dispatch("set_keyword_bids", {"updates": []}))
 
