@@ -31,7 +31,12 @@ import respx
 
 from yadirect_agent.clients.metrika import MetrikaService
 from yadirect_agent.config import Settings
-from yadirect_agent.exceptions import ApiTransientError, AuthError, ValidationError
+from yadirect_agent.exceptions import (
+    ApiTransientError,
+    AuthError,
+    RateLimitError,
+    ValidationError,
+)
 from yadirect_agent.models.metrika import DateRange
 
 _GOALS_URL = "https://api-metrika.yandex.net/management/v1/counter/12345/goals"
@@ -127,6 +132,42 @@ class TestGetGoals:
             goals = await svc.get_goals(counter_id=12345)
 
         assert goals == []
+
+    @respx.mock
+    async def test_timeout_exhausted_raises_transient_error(
+        self,
+        settings: Settings,
+    ) -> None:
+        # All four attempts time out — must surface as ApiTransientError,
+        # not a raw httpx.TimeoutException. Caller error handlers in the
+        # agent loop catch our typed exceptions only; a leaked transport
+        # error would be classified as a generic tool failure and lose
+        # the retry signal. (security-auditor M6 HIGH-1.)
+        respx.get(_GOALS_URL).mock(side_effect=httpx.TimeoutException("read timed out"))
+
+        async with MetrikaService(settings) as svc:
+            with pytest.raises(ApiTransientError, match="network"):
+                await svc.get_goals(counter_id=12345)
+
+    @respx.mock
+    async def test_429_exhausted_raises_rate_limit_error(
+        self,
+        settings: Settings,
+    ) -> None:
+        # Distinct from 5xx-exhaustion: 429 means "back off", not "server
+        # is sick". The agent loop must see RateLimitError, not
+        # ApiTransientError, to make the right decision. (security-auditor
+        # M6 MEDIUM-5.)
+        respx.get(_GOALS_URL).mock(
+            return_value=httpx.Response(
+                429,
+                json={"errors": [{"message": "rate limit exceeded"}]},
+            ),
+        )
+
+        async with MetrikaService(settings) as svc:
+            with pytest.raises(RateLimitError):
+                await svc.get_goals(counter_id=12345)
 
     @respx.mock
     async def test_authorization_header_uses_metrika_token(self, settings: Settings) -> None:

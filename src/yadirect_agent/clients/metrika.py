@@ -37,7 +37,6 @@ import httpx
 import structlog
 from tenacity import (
     AsyncRetrying,
-    RetryError,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
@@ -190,12 +189,23 @@ class MetrikaService:
             async for attempt in retrier:
                 with attempt:
                     return await _attempt()
-        except RetryError as exc:  # pragma: no cover -- reraise=True bypasses this
-            raise ApiTransientError("retries exhausted") from exc
         except _RetryableStatus as final:
             # Retries exhausted on a retryable HTTP status. Promote to
-            # a typed terminal error using the last response we saw.
+            # a typed terminal error using the last response we saw —
+            # ``_classify_terminal`` returns RateLimitError for 429
+            # (caller backs off) vs ApiTransientError for 5xx (caller
+            # may retry the whole task later).
             raise _classify_terminal(final.response) from None
+        except (httpx.TimeoutException, httpx.TransportError) as final:
+            # Retries exhausted on a network-level failure (timeout,
+            # connection reset, DNS hiccup). With ``reraise=True``
+            # tenacity surfaces the original transport exception, NOT
+            # ``RetryError`` — without this branch the raw httpx
+            # exception leaks past the agent's typed-exception contract
+            # and gets caught by the loop's broad ``except Exception``,
+            # losing the transient-vs-terminal signal.
+            # (security-auditor M6 HIGH-1.)
+            raise ApiTransientError(f"network error after retries: {final}") from final
 
         msg = "unreachable: retrier produced no result"
         raise RuntimeError(msg)  # pragma: no cover
