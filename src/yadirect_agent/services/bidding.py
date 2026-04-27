@@ -34,7 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from ..agent.executor import requires_plan
 from ..agent.pipeline import ReviewContext, SafetyPipeline
 from ..agent.plans import PendingPlansStore
-from ..agent.safety import AccountBidSnapshot, ProposedBidChange
+from ..agent.safety import AccountBidSnapshot, KeywordSnapshot, ProposedBidChange
 from ..audit import Actor, AuditSink, audit_action
 from ..clients.direct import DirectService
 from ..config import Settings
@@ -61,19 +61,26 @@ class BidUpdate(BaseModel):
 async def _build_bid_context(service: BiddingService, updates: list[BidUpdate]) -> ReviewContext:
     """Async context builder for ``apply()``'s ``@requires_plan``.
 
-    Today returns an empty ``AccountBidSnapshot`` — KS#2 (max CPC)
-    and KS#4 (quality-score guard) both defer (skip the check) when
-    the snapshot's per-keyword fields are missing, which is their
-    documented "no current bid known → can't prove violation"
-    contract. Extending ``DirectService.get_keywords`` to read
-    current bids + quality scores is BACKLOG'd; until then the
-    protection on this path is:
+    Reads current per-keyword bids and quality scores from Direct via
+    ``DirectService.get_keywords`` so the safety pipeline can actually
+    enforce KS#2 (max-CPC) and KS#4 (quality-score guard) on every
+    bid call. Pre-snapshot-reader the snapshot was empty, both checks
+    deferred, and the only protection on this path was rollout_stage
+    + plan→confirm→execute + audit.
 
-    - rollout_stage gate (shadow / assist / autonomy_light /
-      autonomy_full ceiling on bid moves),
-    - approval-tier gate (no ``auto_approve_bid_change`` knob ⇒
-      every bid call needs operator apply-plan),
-    - audit emission (``set_keyword_bids.requested|.ok|.failed``).
+    Behaviour:
+
+    - empty ``updates`` → empty snapshot, no API call;
+    - non-empty ``updates`` → one ``get_keywords(keyword_ids=...)``
+      round trip, and a ``KeywordSnapshot`` per row that carries
+      both ``Id`` and ``CampaignId`` (KS#2 looks up by campaign,
+      KS#4 by keyword id; either missing means the row cannot be a
+      meaningful snapshot entry);
+    - rows that survive the identity check populate
+      ``current_search_bid_rub`` / ``current_network_bid_rub`` /
+      ``quality_score`` via the ``Keyword`` model's computed
+      properties (micro-RUB → RUB, ``Productivity.Value`` →
+      clamped int 0..10).
     """
 
     bid_changes = [
@@ -84,8 +91,27 @@ async def _build_bid_context(service: BiddingService, updates: list[BidUpdate]) 
         )
         for u in updates
     ]
+
+    keyword_ids = [u.keyword_id for u in updates]
+    snapshot_entries: list[KeywordSnapshot] = []
+    if keyword_ids:
+        async with DirectService(service._settings) as api:
+            keywords = await api.get_keywords(keyword_ids=keyword_ids)
+        for kw in keywords:
+            if kw.id is None or kw.campaign_id is None:
+                continue
+            snapshot_entries.append(
+                KeywordSnapshot(
+                    keyword_id=kw.id,
+                    campaign_id=kw.campaign_id,
+                    current_search_bid_rub=kw.current_search_bid_rub,
+                    current_network_bid_rub=kw.current_network_bid_rub,
+                    quality_score=kw.quality_score,
+                )
+            )
+
     return ReviewContext(
-        bid_snapshot=AccountBidSnapshot(),
+        bid_snapshot=AccountBidSnapshot(keywords=snapshot_entries),
         bid_changes=bid_changes,
     )
 
