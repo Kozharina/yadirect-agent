@@ -27,6 +27,7 @@ from typing import Any
 import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..audit import AuditSink, JsonlSink
 from ..clients.direct import DirectService
 from ..clients.wordstat import DirectKeywordsResearch
 from ..config import Settings
@@ -250,11 +251,14 @@ class _ValidatePhrasesInput(BaseModel):
 
 
 def _make_list_campaigns_tool(
-    settings: Settings, pipeline: SafetyPipeline, store: PendingPlansStore
+    settings: Settings,
+    pipeline: SafetyPipeline,
+    store: PendingPlansStore,
+    audit_sink: AuditSink,
 ) -> Tool:
     async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
         inp: _ListCampaignsInput = raw  # type: ignore[assignment]
-        svc = CampaignService(settings, pipeline=pipeline, store=store)
+        svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=audit_sink)
         summaries = await svc.list_all() if inp.states is None else await svc.list_active()
         ctx.logger.info("tool.list_campaigns.ok", count=len(summaries))
         return [asdict(s) for s in summaries]
@@ -274,11 +278,14 @@ def _make_list_campaigns_tool(
 
 
 def _make_pause_campaigns_tool(
-    settings: Settings, pipeline: SafetyPipeline, store: PendingPlansStore
+    settings: Settings,
+    pipeline: SafetyPipeline,
+    store: PendingPlansStore,
+    audit_sink: AuditSink,
 ) -> Tool:
     async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
         inp: _IdListInput = raw  # type: ignore[assignment]
-        svc = CampaignService(settings, pipeline=pipeline, store=store)
+        svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=audit_sink)
         await svc.pause(inp.ids)
         ctx.logger.info("tool.pause_campaigns.ok", ids=inp.ids)
         return {"paused": inp.ids}
@@ -296,11 +303,14 @@ def _make_pause_campaigns_tool(
 
 
 def _make_resume_campaigns_tool(
-    settings: Settings, pipeline: SafetyPipeline, store: PendingPlansStore
+    settings: Settings,
+    pipeline: SafetyPipeline,
+    store: PendingPlansStore,
+    audit_sink: AuditSink,
 ) -> Tool:
     async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
         inp: _IdListInput = raw  # type: ignore[assignment]
-        svc = CampaignService(settings, pipeline=pipeline, store=store)
+        svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=audit_sink)
         await svc.resume(inp.ids)
         ctx.logger.info("tool.resume_campaigns.ok", ids=inp.ids)
         return {"resumed": inp.ids}
@@ -318,11 +328,14 @@ def _make_resume_campaigns_tool(
 
 
 def _make_set_campaign_budget_tool(
-    settings: Settings, pipeline: SafetyPipeline, store: PendingPlansStore
+    settings: Settings,
+    pipeline: SafetyPipeline,
+    store: PendingPlansStore,
+    audit_sink: AuditSink,
 ) -> Tool:
     async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
         inp: _SetCampaignBudgetInput = raw  # type: ignore[assignment]
-        svc = CampaignService(settings, pipeline=pipeline, store=store)
+        svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=audit_sink)
         try:
             await svc.set_daily_budget(inp.campaign_id, inp.budget_rub)
         except PlanRequired as exc:
@@ -486,9 +499,11 @@ def _make_validate_phrases_tool(settings: Settings) -> Tool:
 # --------------------------------------------------------------------------
 
 
-def build_safety_pair(settings: Settings) -> tuple[SafetyPipeline, PendingPlansStore]:
-    """Construct the shared ``(SafetyPipeline, PendingPlansStore)`` pair
-    that every CampaignService instance in this registry will consume.
+def build_safety_pair(
+    settings: Settings,
+) -> tuple[SafetyPipeline, PendingPlansStore, JsonlSink]:
+    """Construct the shared ``(SafetyPipeline, PendingPlansStore, JsonlSink)``
+    triple that every CampaignService instance in this registry will consume.
 
     Constructed once per ``build_default_registry`` call so the
     ``SessionState`` (cross-tool TOCTOU register inside the pipeline)
@@ -538,7 +553,8 @@ def build_safety_pair(settings: Settings) -> tuple[SafetyPipeline, PendingPlansS
 
     pipeline = SafetyPipeline(policy)
     store = PendingPlansStore(settings.audit_log_path.parent / "pending_plans.jsonl")
-    return pipeline, store
+    audit_sink = JsonlSink(settings.audit_log_path)
+    return pipeline, store, audit_sink
 
 
 # Two flavours of factory live in the registry's default set:
@@ -547,7 +563,7 @@ def build_safety_pair(settings: Settings) -> tuple[SafetyPipeline, PendingPlansS
 # We dispatch at registry-build time. Listing them in a single tuple keeps
 # the order stable for diffing.
 
-_CampaignFactory = Callable[[Settings, SafetyPipeline, PendingPlansStore], Tool]
+_CampaignFactory = Callable[[Settings, SafetyPipeline, PendingPlansStore, AuditSink], Tool]
 _PlainFactory = Callable[[Settings], Tool]
 
 _CAMPAIGN_FACTORIES: list[_CampaignFactory] = [
@@ -571,10 +587,10 @@ def build_default_registry(settings: Settings) -> ToolRegistry:
     SessionState (cross-tool TOCTOU register) survives across tool
     calls within one agent run.
     """
-    pipeline, store = build_safety_pair(settings)
+    pipeline, store, audit_sink = build_safety_pair(settings)
     reg = ToolRegistry()
     for cf in _CAMPAIGN_FACTORIES:
-        reg.add(cf(settings, pipeline, store))
+        reg.add(cf(settings, pipeline, store, audit_sink))
     for pf in _PLAIN_FACTORIES:
         reg.add(pf(settings))
     return reg

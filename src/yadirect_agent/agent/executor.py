@@ -56,6 +56,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from ..audit import AuditSink, audit_action
 from .pipeline import (
     ReviewContext,
     SafetyPipeline,
@@ -289,6 +290,7 @@ async def apply_plan(
     store: PendingPlansStore,
     pipeline: SafetyPipeline,
     service_router: _ServiceRouter,
+    audit_sink: AuditSink | None = None,
 ) -> Any:
     """Apply a pending operation plan.
 
@@ -309,7 +311,38 @@ async def apply_plan(
        API call that didn't succeed.
     5. On success, ``pipeline.on_applied`` is called exactly once and
        the store moves ``pending → applied``.
+
+    Audit emission (when ``audit_sink`` is configured): emits
+    ``apply_plan.requested`` on entry and ``apply_plan.ok|.failed``
+    on exit, all with ``actor="human"`` and ``resource="plan:<id>"``.
+    The .failed event fires for both re-review reject AND executor
+    raise — operators see the attempt regardless of how it ended.
+    Sink absent → no events emitted (backwards compat).
     """
+
+    if audit_sink is None:
+        return await _apply_plan_inner(plan_id, store, pipeline, service_router)
+
+    async with audit_action(
+        audit_sink,
+        actor="human",
+        action="apply_plan",
+        resource=f"plan:{plan_id}",
+        args={"plan_id": plan_id},
+    ) as ctx:
+        result = await _apply_plan_inner(plan_id, store, pipeline, service_router)
+        ctx.set_result({"status": "applied", "plan_id": plan_id})
+        return result
+
+
+async def _apply_plan_inner(
+    plan_id: str,
+    store: PendingPlansStore,
+    pipeline: SafetyPipeline,
+    service_router: _ServiceRouter,
+) -> Any:
+    """Inner apply-plan body, factored out so ``audit_action`` wraps a
+    single block. No behaviour change vs M2.2."""
 
     plan = store.get(plan_id)
     if plan is None:

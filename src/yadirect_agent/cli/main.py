@@ -417,11 +417,14 @@ def _build_service_router(
     settings: Settings,
     pipeline: Any,
     store: PendingPlansStore,
+    audit_sink: Any,
 ) -> Any:
     """Return an async callable ``(action, args, *, _applying_plan_id) -> Any``
     that ``apply_plan`` will dispatch through. Every service is constructed
-    with the same (pipeline, store) pair; the bypass kwarg keeps the
-    decorator from re-reviewing on re-entry.
+    with the same ``(pipeline, store, audit_sink)`` triple so ``apply-plan``
+    emits the same ``set_campaign_budget.requested|.ok|.failed`` audit
+    line the agent path produces — distinguishable only by the
+    ``actor`` field (``human`` vs ``agent``).
     """
 
     async def router(
@@ -431,7 +434,12 @@ def _build_service_router(
         _applying_plan_id: str,
     ) -> Any:
         if action == "set_campaign_budget":
-            svc = CampaignService(settings, pipeline=pipeline, store=store)
+            svc = CampaignService(
+                settings,
+                pipeline=pipeline,
+                store=store,
+                audit_sink=audit_sink,
+            )
             return await svc.set_daily_budget(
                 **args,
                 _applying_plan_id=_applying_plan_id,
@@ -460,12 +468,14 @@ def apply_plan_cmd(
     """
     settings = _bootstrap_settings()
     store = _plans_store(settings)
-    pipeline, _ = build_safety_pair(settings)
+    pipeline, _, audit_sink = build_safety_pair(settings)
     # Reuse the store path from CLI convention rather than the one
     # build_safety_pair returned: `_plans_store` already encodes the
     # contract (next to audit log) and that's what tests / `plans list`
-    # / agent runs all read.
-    router = _build_service_router(settings, pipeline, store)
+    # / agent runs all read. The audit_sink IS reused from the helper —
+    # CLI-driven apply emits ``apply_plan.requested`` / ``.ok`` / ``.failed``
+    # into the same JSONL the agent's tools registry writes to.
+    router = _build_service_router(settings, pipeline, store, audit_sink)
 
     try:
         asyncio.run(
@@ -474,6 +484,7 @@ def apply_plan_cmd(
                 store=store,
                 pipeline=pipeline,
                 service_router=router,
+                audit_sink=audit_sink,
             )
         )
     # Every interpolated value below is routed through ``_rich_escape`` so a
