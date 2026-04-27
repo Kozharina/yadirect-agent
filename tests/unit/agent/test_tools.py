@@ -262,6 +262,47 @@ class TestEnvBackstop:
         pipeline, _, _ = build_safety_pair(settings)
         assert pipeline.policy.budget_cap.account_daily_budget_cap_rub == 7_500
 
+    def test_settings_rejects_negative_env_cap(self) -> None:
+        """Auditor M-1: a negative ``AGENT_MAX_DAILY_BUDGET_RUB``
+        used to silently propagate through ``min(yaml, env)`` into a
+        negative Policy cap that KS#1 then interpreted as "always
+        exceeded" — agent frozen with a misleading "cap exceeded"
+        error from boot. The Settings field now has ``Field(ge=1)``
+        so the typo trap fails fast at parse time.
+        """
+        from pydantic import SecretStr, ValidationError
+
+        from yadirect_agent.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(
+                yandex_direct_token=SecretStr("x"),
+                yandex_metrika_token=SecretStr("x"),
+                anthropic_api_key=SecretStr("x"),
+                anthropic_model="claude-opus-4-7",
+                agent_max_daily_budget_rub=-1,
+            )
+
+    def test_settings_rejects_zero_env_cap(self) -> None:
+        """The "freeze the agent" use case is correctly expressed via
+        ``rollout_stage="shadow"`` in the policy YAML, not via a
+        budget cap of zero (which produces a generic "cap exceeded"
+        rejection on every mutation, indistinguishable from a real
+        cap violation). ``ge=1`` rejects the anti-pattern.
+        """
+        from pydantic import SecretStr, ValidationError
+
+        from yadirect_agent.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(
+                yandex_direct_token=SecretStr("x"),
+                yandex_metrika_token=SecretStr("x"),
+                anthropic_api_key=SecretStr("x"),
+                anthropic_model="claude-opus-4-7",
+                agent_max_daily_budget_rub=0,
+            )
+
     def test_env_backstop_logged_when_tightening(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -296,10 +337,14 @@ class TestEnvBackstop:
         )
 
         warnings: list[tuple[str, dict[str, Any]]] = []
+        infos: list[tuple[str, dict[str, Any]]] = []
 
         class _StubLogger:
             def warning(self, event: str, **kwargs: Any) -> None:
                 warnings.append((event, kwargs))
+
+            def info(self, event: str, **kwargs: Any) -> None:
+                infos.append((event, kwargs))
 
         monkeypatch.setattr(tools_mod.structlog, "get_logger", lambda *args, **kw: _StubLogger())
 

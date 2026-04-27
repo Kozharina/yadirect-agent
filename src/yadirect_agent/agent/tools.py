@@ -508,17 +508,47 @@ def _apply_env_backstop(policy: Policy, settings: Settings) -> Policy:
     YAML) or a deep-copied ``Policy`` with a new
     ``budget_cap.account_daily_budget_cap_rub``.
 
-    Logs a structured ``env_backstop`` warning whenever it actually
-    tightens — silent tightening would be a "why is the agent
-    rejecting valid budgets" debugging trap.
+    Boot-time only: applied once at ``build_safety_pair`` time and
+    captured into the ``SafetyPipeline``. Changing the env at
+    runtime requires a process restart to take effect. This is
+    intentional — boot-time application avoids race conditions on a
+    per-request cap and is consistent with how Settings itself is
+    loaded once at entry-point.
+
+    Always logs an INFO line ``budget_cap_resolved`` so operators
+    have a "what cap is the agent using right now" line in startup
+    logs even when YAML wins; additionally emits a WARNING-level
+    ``env_backstop_tightening_account_cap`` whenever the env actually
+    tightens (auditor M2.4 LOW L1).
+
+    NB: bid changes reach KS#2 (per-keyword max-CPC), not KS#1's
+    daily-budget projection. A higher bid burns the budget faster
+    but does not raise the daily ceiling, so the env-backstop here
+    only affects budget-change / resume / archive paths through
+    KS#1 — which is the spec's "any operation that may raise daily
+    spend" set in practice (auditor M2.4 LOW L3).
+
+    NB: in the no-YAML fallback path (see ``build_safety_pair``),
+    ``yaml_cap`` is itself seeded from ``env_cap``, so this function
+    is a structural no-op there — both inputs to ``min`` are equal
+    by construction. Auditor M2.4 LOW L2.
     """
     yaml_cap = policy.budget_cap.account_daily_budget_cap_rub
     env_cap = settings.agent_max_daily_budget_rub
     effective = min(yaml_cap, env_cap)
+
+    log = structlog.get_logger(__name__)
+    log.info(
+        "budget_cap_resolved",
+        yaml_cap_rub=yaml_cap,
+        env_cap_rub=env_cap,
+        effective_cap_rub=effective,
+    )
+
     if effective == yaml_cap:
         return policy
 
-    structlog.get_logger(__name__).warning(
+    log.warning(
         "env_backstop_tightening_account_cap",
         yaml_cap_rub=yaml_cap,
         env_cap_rub=env_cap,
