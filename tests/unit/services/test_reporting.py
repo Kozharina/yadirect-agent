@@ -122,8 +122,7 @@ class TestCampaignPerformance:
         assert perf.cost_rub == pytest.approx(850.5)
         assert perf.conversions == 5
         assert perf.cpa_rub == pytest.approx(170.1)
-        assert perf.cr_pct == pytest.approx(120 * 100 / 120, rel=1e-3)  # 100% (debug)
-        # actual: cr_pct = conversions / clicks * 100 = 5/120 * 100 = 4.166...
+        # cr_pct = conversions / clicks * 100 = 5/120 * 100 = 4.166...
         assert perf.cr_pct == pytest.approx(5 / 120 * 100, rel=1e-3)
 
     async def test_happy_path_without_goal_carries_none_conversions(
