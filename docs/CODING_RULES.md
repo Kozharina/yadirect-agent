@@ -141,3 +141,31 @@ module import. `Settings()` and `configure_logging()` run from entry points.
 If you're about to spend the account's money, stop and reconsider. Would
 a human agency with this task pause first? Then the bot should, too.
 </the_cardinal_rule>
+
+## <known_pitfalls>
+Cross-cutting traps that bit us once and will bite again. Each entry is
+two lines: the symptom and the fix.
+
+- **Rich + typer wrap `--help` output with ANSI escapes.** Substring
+  asserts on `runner.invoke(--help).output` break in CI. Read flag docs
+  via `typing.get_type_hints(include_extras=True)`, not via the rendered
+  help string.
+- **`BidUpdate` is pydantic, not a frozen dataclass.** Frozen dataclasses
+  crash `model_dump_json` for plan persistence. Stay on `BaseModel` for
+  anything that flows through the plan store.
+- **`pydantic.BaseModel.model_copy(update=...)` does NOT re-validate.**
+  Don't rely on it to enforce field constraints. Push the constraint up
+  to the source of truth — `Field(ge=...)` on the originating model is
+  the right enforcement layer.
+- **mypy version skew between in-venv and the pre-commit mirror.** The
+  same code surfaces different error codes. When unavoidable (e.g. the
+  MCP SDK's untyped decorators), confine the divergence to one file with
+  a deliberate, narrow `# type: ignore[...]` comment.
+- **CodeQL false positives.** It flags `...` Protocol bodies as
+  `py/ineffectual-statement` and `pytest.raises` blocks as
+  `py/unreachable-statement`. Both are false positives — dismiss in the
+  Security tab with the standard reasoning, don't refactor around them.
+- **Direct API returns HTTP 200 for logical errors.** Always inspect the
+  body for an `"error"` key; never trust the status code alone. Already
+  encoded in `clients/base.py`, but new client methods must respect it.
+</known_pitfalls>
