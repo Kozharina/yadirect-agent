@@ -39,7 +39,16 @@ from ..models.campaigns import Campaign, CampaignState
 
 @dataclass(frozen=True)
 class CampaignSummary:
-    """Flattened view for agent consumption — no nested micro-currency fiddling."""
+    """Flattened view for agent consumption — no nested micro-currency fiddling.
+
+    Deliberately does NOT carry ``negative_keywords`` — those are
+    operator-configured business intent (brand misspells / competitor
+    names / etc.) and stay on the safety-internal path. The bid
+    snapshot builder reads them via ``DirectService.get_campaigns``
+    directly, not through this summary, so they never reach the
+    agent's ``list_campaigns`` tool response or the CLI ``--json``
+    output.
+    """
 
     id: int
     name: str
@@ -110,21 +119,33 @@ async def _build_account_budget_snapshot(
     """Read the current ``AccountBudgetSnapshot`` from Direct.
 
     Shared helper used by every ``CampaignService`` method that
-    needs the account state for KS#1/#3 evaluation. Negative
-    keywords are not populated — see the limitations note in
-    docs/BACKLOG.md "Pull per-campaign negative keywords for KS#3".
+    needs the account state for KS#1 (budget cap) and KS#3
+    (negative-keyword floor) evaluation. Bypasses the
+    agent-facing ``CampaignSummary`` flattener and reads the wire
+    ``Campaign`` model directly so per-campaign negatives flow
+    through to ``CampaignBudget.negative_keywords`` without leaking
+    operator-configured negatives to the agent's ``list_campaigns``
+    tool response (same defence-in-depth pattern as
+    ``_build_bid_context``).
     """
 
-    summaries = await service.list_all()
-    campaigns = [
-        CampaignBudget(
-            id=s.id,
-            name=s.name,
-            daily_budget_rub=0.0 if s.daily_budget_rub is None else s.daily_budget_rub,
-            state=s.state,
+    async with DirectService(service._settings) as api:
+        campaigns_raw = await api.get_campaigns()
+
+    campaigns: list[CampaignBudget] = []
+    for c in campaigns_raw:
+        budget_rub: float = 0.0
+        if c.daily_budget is not None:
+            budget_rub = c.daily_budget.amount / 1_000_000
+        campaigns.append(
+            CampaignBudget(
+                id=c.id,
+                name=c.name,
+                daily_budget_rub=budget_rub,
+                state=c.state.value if c.state else "UNKNOWN",
+                negative_keywords=frozenset(c.negative_keywords),
+            )
         )
-        for s in summaries
-    ]
     return AccountBudgetSnapshot(campaigns=campaigns)
 
 

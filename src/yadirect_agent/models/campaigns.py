@@ -63,11 +63,17 @@ class Campaign(BaseModel):
     @classmethod
     def _flatten_negative_keywords(cls, data: Any) -> Any:
         """Pull ``NegativeKeywords.Items`` up to the top-level
-        ``negative_keywords`` field. Runs before field validation so
-        the rest of the model sees a clean flat list."""
-        if not isinstance(data, dict):
+        ``negative_keywords`` field when the API envelope is present.
+
+        Only fires when the ``NegativeKeywords`` key is explicitly in
+        the input — direct construction via ``Campaign(negative_keywords=...)``
+        is left untouched so test fixtures and any future code that
+        builds a Campaign without the API envelope can still set the
+        field directly.
+        """
+        if not isinstance(data, dict) or "NegativeKeywords" not in data:
             return data
-        envelope = data.get("NegativeKeywords")
+        envelope = data["NegativeKeywords"]
         if envelope is None:
             data["negative_keywords"] = []
         elif isinstance(envelope, dict):

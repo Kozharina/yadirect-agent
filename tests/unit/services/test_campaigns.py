@@ -138,11 +138,19 @@ class TestCampaignSummary:
         assert summary.state == "UNKNOWN"
         assert summary.status == "UNKNOWN"
 
-    def test_propagates_negative_keywords_from_model(self) -> None:
-        """``CampaignSummary`` must carry the negatives forward so
-        ``_build_account_budget_snapshot`` can populate
-        ``CampaignBudget.negative_keywords`` for KS#3 evaluation
-        without a second API fetch."""
+    def test_does_not_carry_negative_keywords_to_agent_surface(self) -> None:
+        """Defence-in-depth: ``CampaignSummary`` is the agent-facing
+        view (returned by ``list_campaigns`` tool and CLI ``--json``).
+        Operator-configured negatives are commercial intent — brand
+        misspells, competitor names — and have no business reaching
+        the LLM agent's response. They flow only through the
+        safety-internal path (``_build_account_budget_snapshot`` →
+        ``CampaignBudget.negative_keywords``).
+
+        Pin: a Campaign rich with negatives produces a summary that
+        does NOT expose them. A future refactor that adds the field
+        for convenience would silently leak operator strategy to
+        the LLM."""
         c = Campaign.model_validate(
             {
                 "Id": 4,
@@ -153,17 +161,8 @@ class TestCampaignSummary:
 
         summary = CampaignSummary.from_model(c)
 
-        assert tuple(summary.negative_keywords) == ("бесплатно", "отзывы")
-
-    def test_negative_keywords_default_empty(self) -> None:
-        """Backwards compat: a CampaignSummary built from a row
-        without negatives carries an empty tuple, not ``None`` or
-        crashes."""
-        c = Campaign(Id=5, Name="c5")
-
-        summary = CampaignSummary.from_model(c)
-
-        assert tuple(summary.negative_keywords) == ()
+        # No negative_keywords attribute on the summary at all.
+        assert not hasattr(summary, "negative_keywords")
 
 
 # --------------------------------------------------------------------------
@@ -922,17 +921,15 @@ async def test_resume_blocks_when_campaign_missing_required_negatives(
     from yadirect_agent.agent.executor import PlanRejected
 
     fake_direct._campaigns = [
-        Campaign.model_validate(
-            {
-                "Id": 1,
-                "Name": "alpha",
-                "State": "SUSPENDED",
-                "Status": "ACCEPTED",
-                "DailyBudget": {"Amount": 500_000_000, "Mode": "STANDARD"},
-                # Carries one of the two required phrases — still
-                # missing the other → KS#3 must block.
-                "NegativeKeywords": {"Items": ["отзывы"]},
-            }
+        Campaign(
+            Id=1,
+            Name="alpha",
+            State=CampaignState.SUSPENDED,
+            Status=CampaignStatus.ACCEPTED,
+            DailyBudget=DailyBudget(amount=500_000_000, mode="STANDARD"),
+            # Carries one of the two required phrases — still
+            # missing the other → KS#3 must block.
+            negative_keywords=["отзывы"],
         )
     ]
     pipeline, store, sink = _build_safety_with_required_negatives(
@@ -960,15 +957,13 @@ async def test_resume_proceeds_when_campaign_carries_all_required_negatives(
     from yadirect_agent.agent.executor import PlanRequired
 
     fake_direct._campaigns = [
-        Campaign.model_validate(
-            {
-                "Id": 1,
-                "Name": "alpha",
-                "State": "SUSPENDED",
-                "Status": "ACCEPTED",
-                "DailyBudget": {"Amount": 500_000_000, "Mode": "STANDARD"},
-                "NegativeKeywords": {"Items": ["бесплатно", "отзывы", "купить"]},
-            }
+        Campaign(
+            Id=1,
+            Name="alpha",
+            State=CampaignState.SUSPENDED,
+            Status=CampaignStatus.ACCEPTED,
+            DailyBudget=DailyBudget(amount=500_000_000, mode="STANDARD"),
+            negative_keywords=["бесплатно", "отзывы", "купить"],
         )
     ]
     pipeline, store, sink = _build_safety_with_required_negatives(
