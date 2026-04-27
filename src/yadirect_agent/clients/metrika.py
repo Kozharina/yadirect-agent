@@ -50,7 +50,7 @@ from ..exceptions import (
     RateLimitError,
     ValidationError,
 )
-from ..models.metrika import MetrikaGoal
+from ..models.metrika import DateRange, MetrikaGoal, ReportRow
 
 _log = structlog.get_logger(component="clients.metrika")
 
@@ -232,3 +232,94 @@ class MetrikaService:
         body = response.json()
         raw_goals = body.get("goals", [])
         return [MetrikaGoal.model_validate(g) for g in raw_goals]
+
+    async def get_report(
+        self,
+        *,
+        counter_id: int,
+        metrics: list[str],
+        dimensions: list[str],
+        date_range: DateRange,
+        filters: str | None = None,
+    ) -> list[ReportRow]:
+        """Fetch a stat report.
+
+        Maps GET /stat/v1/data with comma-separated metrics/dimensions
+        and ISO date1/date2.
+
+        ``metrics`` and ``dimensions`` are passed verbatim — the caller
+        composes valid Metrika identifiers (``ym:s:visits``,
+        ``ym:ad:directCost``, ``ym:s:goal<id>conversions``, etc.).
+        We don't enum-validate them here because Metrika has hundreds
+        of metrics and the surface evolves; an invalid one returns 400,
+        which we map to ValidationError.
+
+        ``filters`` is passed through verbatim if non-None (Metrika's
+        own filter language). When None we omit the query parameter
+        entirely — Metrika rejects an empty ``filters=`` value.
+
+        Returns an empty list when the report has no matching data.
+
+        Raises:
+            AuthError: token invalid or lacks scope.
+            ValidationError: invalid metric / dimension / filter, or
+                date range out of allowed bounds.
+            ApiTransientError: 5xx with retries exhausted.
+            RateLimitError: 429 with retries exhausted.
+        """
+        date1, date2 = date_range.to_metrika_strings()
+        params: dict[str, Any] = {
+            "ids": str(counter_id),
+            "metrics": ",".join(metrics),
+            "dimensions": ",".join(dimensions),
+            "date1": date1,
+            "date2": date2,
+        }
+        if filters is not None:
+            params["filters"] = filters
+
+        response = await self._request("GET", "/stat/v1/data", params=params)
+        if response.status_code != 200:
+            raise _classify_terminal(response)
+        body = response.json()
+        rows = body.get("data", [])
+        return [ReportRow.model_validate(r) for r in rows]
+
+    async def get_conversion_by_source(
+        self,
+        *,
+        counter_id: int,
+        goal_id: int,
+        date_range: DateRange,
+    ) -> dict[str, int]:
+        """Conversions for one goal, broken down by traffic source.
+
+        Specialised wrapper around ``get_report`` that:
+        - asks for ``ym:s:goal<goal_id>conversions`` (goal-specific,
+          NOT total conversions — picking the wrong metric here would
+          silently route budget decisions toward an unrelated goal),
+        - groups by ``ym:s:lastDirectClickSourceName``.
+
+        Returns a ``{source_name: conversion_count}`` mapping.
+        Counts are converted to ``int`` because the Metrika wire format
+        is float (``5.0``) but conversions are inherently integer; we
+        truncate the noise at the boundary so callers don't have to.
+
+        Returns an empty dict when no conversions occurred in the
+        window.
+        """
+        rows = await self.get_report(
+            counter_id=counter_id,
+            metrics=[f"ym:s:goal{goal_id}conversions"],
+            dimensions=["ym:s:lastDirectClickSourceName"],
+            date_range=date_range,
+        )
+        result: dict[str, int] = {}
+        for row in rows:
+            if not row.dimensions or not row.metrics:
+                continue
+            source_name = row.dimensions[0].get("name")
+            if not isinstance(source_name, str):
+                continue
+            result[source_name] = int(row.metrics[0])
+        return result
