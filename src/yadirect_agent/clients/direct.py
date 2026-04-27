@@ -134,13 +134,53 @@ class DirectService:
 
     # ---------------- Keywords ----------------
 
-    async def get_keywords(self, adgroup_ids: list[int], limit: int = 10_000) -> list[Keyword]:
+    async def get_keywords(
+        self,
+        adgroup_ids: list[int] | None = None,
+        *,
+        keyword_ids: list[int] | None = None,
+        limit: int = 10_000,
+    ) -> list[Keyword]:
+        """Read keyword rows including the bid + productivity fields the
+        safety pipeline needs for KS#2 / KS#4.
+
+        Selection: pass ``adgroup_ids`` (legacy callers) or
+        ``keyword_ids`` (BiddingService bid-context reader), or both
+        for an AND filter. At least one is required — an unfiltered
+        ``keywords.get`` would either error or return the whole
+        account, neither of which any caller wants.
+
+        Returned ``Keyword`` rows expose ``current_search_bid_rub``,
+        ``current_network_bid_rub`` and ``quality_score`` via computed
+        properties; downstream code never needs to handle micro-currency
+        or the Productivity envelope itself.
+        """
+        if not adgroup_ids and not keyword_ids:
+            msg = "get_keywords requires adgroup_ids or keyword_ids"
+            raise ValueError(msg)
+
+        selection: dict[str, Any] = {}
+        if adgroup_ids:
+            selection["AdGroupIds"] = adgroup_ids
+        if keyword_ids:
+            selection["Ids"] = keyword_ids
+
         result = await self._api.call(
             "keywords",
             "get",
             {
-                "SelectionCriteria": {"AdGroupIds": adgroup_ids},
-                "FieldNames": ["Id", "AdGroupId", "Keyword", "State", "Status"],
+                "SelectionCriteria": selection,
+                "FieldNames": [
+                    "Id",
+                    "AdGroupId",
+                    "CampaignId",
+                    "Keyword",
+                    "State",
+                    "Status",
+                    "Bid",
+                    "ContextBid",
+                    "Productivity",
+                ],
                 "Page": {"Limit": limit},
             },
         )
