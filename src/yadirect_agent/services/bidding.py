@@ -26,6 +26,7 @@ BACKLOG.
 from __future__ import annotations
 
 import sys
+from datetime import UTC, datetime
 from types import FrameType
 
 import structlog
@@ -94,7 +95,21 @@ async def _build_bid_context(service: BiddingService, updates: list[BidUpdate]) 
 
     keyword_ids = [u.keyword_id for u in updates]
     snapshot_entries: list[KeywordSnapshot] = []
+    baseline_timestamp: datetime | None = None
     if keyword_ids:
+        # Stamp the read time BEFORE the network call so the
+        # apply-plan re-review path can compare against the freshness
+        # of the snapshot the operator approved, not against the
+        # later moment the executor happens to look. KS#4's
+        # _is_increase compares the proposed bid against the
+        # snapshot's current bid — an undated, arbitrarily-old
+        # snapshot that survives apply-plan re-review would hide a
+        # parallel-operator bid bump and let a second consecutive
+        # increase slip past KS#4. Auditor M2-bid-snapshot HIGH-2.
+        # Policy-driven enforcement (max_snapshot_age_seconds) is
+        # tracked in BACKLOG; this commit emits the timestamp so a
+        # later PR can act on it without a second snapshot rewire.
+        baseline_timestamp = datetime.now(UTC)
         async with DirectService(service._settings) as api:
             keywords = await api.get_keywords(keyword_ids=keyword_ids)
         for kw in keywords:
@@ -113,6 +128,7 @@ async def _build_bid_context(service: BiddingService, updates: list[BidUpdate]) 
     return ReviewContext(
         bid_snapshot=AccountBidSnapshot(keywords=snapshot_entries),
         bid_changes=bid_changes,
+        baseline_timestamp=baseline_timestamp,
     )
 
 

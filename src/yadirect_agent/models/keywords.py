@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -40,8 +42,16 @@ class Keyword(BaseModel):
     keyword: str = Field(..., alias="Keyword")
     state: str | None = Field(None, alias="State")
     status: str | None = Field(None, alias="Status")
-    bid_micro: int | None = Field(None, alias="Bid")
-    context_bid_micro: int | None = Field(None, alias="ContextBid")
+    # ``ge=0`` is load-bearing safety, not a sanity guard: a negative
+    # bid would land in ``KeywordSnapshot.current_*_bid_rub`` and
+    # poison KS#4's ``_is_increase(new, current)`` (positive new vs
+    # negative current → reads as an increase even on a decrease) and
+    # KS#2's cap arithmetic. Reject loudly at the model boundary —
+    # the failure surfaces as a ValidationError on ``get_keywords``
+    # rather than silently bypassing the safety pipeline. Auditor
+    # M2-bid-snapshot HIGH-1.
+    bid_micro: int | None = Field(None, alias="Bid", ge=0)
+    context_bid_micro: int | None = Field(None, alias="ContextBid", ge=0)
     productivity: Productivity | None = Field(None, alias="Productivity")
 
     @property
@@ -63,17 +73,30 @@ class Keyword(BaseModel):
 
     @property
     def quality_score(self) -> int | None:
-        """Integer 0..10 from ``Productivity.Value``, rounded to the
-        nearest int. ``None`` when the envelope is absent, the
-        ``Value`` is missing, or the value is outside 0..10 — all
-        three cases become "unknown, defer" at KS#4 rather than
-        crashing ``KeywordSnapshot.__post_init__``'s range guard."""
+        """Integer 0..10 from ``Productivity.Value``, rounded HALF UP.
+
+        ``None`` when the envelope is absent, the ``Value`` is missing,
+        or the value is outside 0..10 — all three cases become
+        "unknown, defer" at KS#4 rather than crashing
+        ``KeywordSnapshot.__post_init__``'s range guard.
+
+        Rounding direction is load-bearing: ``min_quality_score_for_bid_increase``
+        is an integer threshold and Python's built-in ``round`` uses
+        banker's rounding (``round(4.5) == 4``), which would silently
+        flip KS#4's verdict at exact .5 boundaries — a Direct row with
+        ``Productivity.Value == 4.5`` (which Direct's own UI typically
+        renders as 5) would block bid increases under banker's
+        rounding but allow them under the operator's intuitive
+        round-half-up. ``math.floor(value + 0.5)`` matches operator
+        intuition and is pinned in tests/unit/models/test_keywords.py.
+        Auditor M2-bid-snapshot MEDIUM.
+        """
         if self.productivity is None or self.productivity.value is None:
             return None
         value = self.productivity.value
         if not 0 <= value <= 10:
             return None
-        return round(value)
+        return math.floor(value + 0.5)
 
 
 class KeywordBid(BaseModel):
