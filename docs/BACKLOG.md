@@ -31,9 +31,16 @@ Each one is TDD, with `security-auditor` sub-agent review before merge.
 All seven reference
 [`docs/PRIOR_ART.md`](./PRIOR_ART.md) → "Agentic PPC Campaign Management".
 
-- [ ] **M2.3: Audit sink** — `audit.py::AuditEvent`, JSONL async writer,
-      `*.requested` / `*.ok` / `*.failed` emissions in every mutating
-      service method.
+- [ ] **M2.3b: Audit sink wiring** — wire ``audit_action`` (already
+      shipped via M2.3a in audit.py) into ``CampaignService.set_daily_budget``,
+      ``apply_plan`` executor, and ``build_default_registry`` (which
+      now constructs a shared ``JsonlSink`` alongside the
+      pipeline+store). Every mutating call emits
+      ``<action>.requested`` before and ``<action>.ok|.failed`` after.
+      Privacy redaction at sink boundary already strips
+      ``new_queries_sample``; verify pause/resume + future bidding
+      methods inherit the wrapper before claiming "everything is
+      audited".
 - [ ] **M2.4: Daily-budget hard guard** — pre-op check that summed
       active-campaign budgets stay ≤ `AGENT_MAX_DAILY_BUDGET_RUB`.
 - [ ] **M2.5: Staged rollout** — `rollout_stage` field in policy,
@@ -441,6 +448,25 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2.3a — Audit sink module (data layer)** — first slice of
+      §M2.3. ``src/yadirect_agent/audit.py`` ships ``AuditEvent``
+      (frozen pydantic, ``extra="forbid"``,
+      ``actor`` Literal{agent,human,system}), an ``AuditSink``
+      Protocol so a future deployment can swap JSONL for Kafka /
+      Postgres without touching service code, and a default
+      ``JsonlSink`` that ``asyncio.to_thread``-wraps the blocking
+      ``open(..., "a")`` so the agent's event loop never stalls
+      on disk I/O. ``audit_action`` async context manager emits
+      ``<action>.requested`` on entry and ``<action>.ok`` (with
+      ``ctx.set_result()`` + ``ctx.set_units_spent()`` payloads)
+      or ``<action>.failed`` (preserving partial result +
+      appending error_type/error_message + re-raising the
+      original) on exit. Sink-level redaction via
+      ``redact_for_audit`` walks dicts/lists and drops
+      ``_PRIVATE_KEYS = {"new_queries_sample"}`` — same blocklist
+      the tools-layer response redactor uses (PR #25), defence in
+      depth. 16 new tests; 450 total green. Wiring into services
+      lands in M2.3b.
 - [x] **M2.2 part 3b2 — `apply-plan` CLI** — closes M2.2.
       ``yadirect-agent apply-plan <id>`` re-reviews the stored plan
       against its original ReviewContext, dispatches via a service
@@ -582,18 +608,3 @@ Last 10 items (newest at top). Older items are available via
       (negative-count bypass + counter_id mismatch) closed in-PR;
       2 design items moved to Tech debt (global-gatekeeper marker
       for M2.2, warn-in-autonomous-mode policy for M2.2).
-- [x] **M2 Kill-switch #5 — Budget-balance drift** —
-      `BudgetBalanceDriftCheck` refuses plans that shift any
-      campaign's share of active daily budget more than
-      `max_shift_pct_per_day` (default 0.3, `gt=0, le=1`) vs. a
-      baseline snapshot. First kill-switch with a temporal
-      dimension. Reuses `AccountBudgetSnapshot` + `BudgetChange`;
-      projects changes via shared `BudgetCapCheck._project`. IEEE
-      754 boundary handled with `math.isclose(abs_tol=1e-14)`.
-      Empty baseline → `warn` (not `ok`) to surface first-run /
-      missing-backfill cases in M2.3 audit. 22 new tests (120
-      safety, 244 across the suite). Reviewed by `security-auditor`
-      — three findings closed in-PR (tolerance tightened, empty
-      baseline warns, details payload carries baseline_total_rub);
-      one MEDIUM (baseline provenance) + one DESIGN (ceiling
-      warning) escalated to Tech debt.
