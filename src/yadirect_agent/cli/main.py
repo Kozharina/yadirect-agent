@@ -804,7 +804,7 @@ def mcp_serve_cmd(
     """Run the MCP server over stdio. Foreground process.
 
     Designed to be launched by Claude Desktop / Claude Code via the
-    ``mcpServers`` configuration block (see docs/CLAUDE_DESKTOP.md).
+    ``mcpServers`` configuration block (see docs/OPERATING.md).
     Logs go to stderr in JSON; stdout is reserved for the MCP
     protocol stream.
     """

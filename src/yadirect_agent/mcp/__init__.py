@@ -14,5 +14,5 @@ The MCP layer is a thin wrapper:
 - structured tool responses (``{status: ..., ...}``) flow back
   to the LLM verbatim; the MCP runtime serialises them to JSON.
 
-See ``docs/CLAUDE_DESKTOP.md`` for the operator runbook.
+See ``docs/OPERATING.md`` for the operator runbook.
 """
