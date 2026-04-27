@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 from pydantic import ValidationError
+
 from yadirect_agent.audit import (
     AuditEvent,
     JsonlSink,
