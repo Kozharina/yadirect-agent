@@ -138,6 +138,33 @@ class TestCampaignSummary:
         assert summary.state == "UNKNOWN"
         assert summary.status == "UNKNOWN"
 
+    def test_propagates_negative_keywords_from_model(self) -> None:
+        """``CampaignSummary`` must carry the negatives forward so
+        ``_build_account_budget_snapshot`` can populate
+        ``CampaignBudget.negative_keywords`` for KS#3 evaluation
+        without a second API fetch."""
+        c = Campaign.model_validate(
+            {
+                "Id": 4,
+                "Name": "c4",
+                "NegativeKeywords": {"Items": ["бесплатно", "отзывы"]},
+            }
+        )
+
+        summary = CampaignSummary.from_model(c)
+
+        assert tuple(summary.negative_keywords) == ("бесплатно", "отзывы")
+
+    def test_negative_keywords_default_empty(self) -> None:
+        """Backwards compat: a CampaignSummary built from a row
+        without negatives carries an empty tuple, not ``None`` or
+        crashes."""
+        c = Campaign(Id=5, Name="c5")
+
+        summary = CampaignSummary.from_model(c)
+
+        assert tuple(summary.negative_keywords) == ()
+
 
 # --------------------------------------------------------------------------
 # list_active / list_all: filter semantics.
@@ -833,3 +860,124 @@ async def test_resume_raises_partial_action_error_on_per_item_errors(
 
     with pytest.raises(PartialActionError):
         await svc.resume([1])
+
+
+# --------------------------------------------------------------------------
+# KS#3 (negative-keyword floor) — end-to-end firing.
+#
+# Pre-PR ``_build_resume_context`` populated ``CampaignBudget.negative_keywords``
+# with an empty frozenset because the Direct API NegativeKeywords envelope
+# wasn't being read. With the model + client + summary changes wired,
+# KS#3 sees real per-campaign negatives and correctly fires only when
+# the campaign is actually missing a required phrase.
+# --------------------------------------------------------------------------
+
+
+def _build_safety_with_required_negatives(
+    tmp_path: Any, required: list[str]
+) -> tuple[Any, Any, _CapturingSink]:
+    """Variant of ``_build_safety_for_test`` with KS#3 configured."""
+    from yadirect_agent.agent.pipeline import SafetyPipeline
+    from yadirect_agent.agent.plans import PendingPlansStore
+    from yadirect_agent.agent.safety import (
+        BudgetCapPolicy,
+        ConversionIntegrityPolicy,
+        MaxCpcPolicy,
+        NegativeKeywordFloorPolicy,
+        Policy,
+        QueryDriftPolicy,
+    )
+
+    policy = Policy(
+        budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=100_000),
+        max_cpc=MaxCpcPolicy(),
+        negative_keyword_floor=NegativeKeywordFloorPolicy(
+            required_negative_keywords=required,
+        ),
+        query_drift=QueryDriftPolicy(),
+        conversion_integrity=ConversionIntegrityPolicy(
+            min_conversions_total=1,
+            min_ratio_vs_baseline=0.5,
+            require_all_baseline_goals_present=True,
+        ),
+        rollout_stage="autonomy_full",
+    )
+    return (
+        SafetyPipeline(policy),
+        PendingPlansStore(tmp_path / "pending_plans.jsonl"),
+        _CapturingSink(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_blocks_when_campaign_missing_required_negatives(
+    settings: Settings, fake_direct: _FakeDirectService, tmp_path: Any
+) -> None:
+    """KS#3: an operator-configured ``required_negative_keywords``
+    that is NOT in the campaign's negatives → ``PlanRejected`` at
+    plan-creation time. Before this PR the snapshot's
+    ``negative_keywords`` was always empty so KS#3 blocked on every
+    resume regardless of the actual campaign state. The test pins
+    that resume is only blocked when the gap is real."""
+    from yadirect_agent.agent.executor import PlanRejected
+
+    fake_direct._campaigns = [
+        Campaign.model_validate(
+            {
+                "Id": 1,
+                "Name": "alpha",
+                "State": "SUSPENDED",
+                "Status": "ACCEPTED",
+                "DailyBudget": {"Amount": 500_000_000, "Mode": "STANDARD"},
+                # Carries one of the two required phrases — still
+                # missing the other → KS#3 must block.
+                "NegativeKeywords": {"Items": ["отзывы"]},
+            }
+        )
+    ]
+    pipeline, store, sink = _build_safety_with_required_negatives(
+        tmp_path, required=["бесплатно", "отзывы"]
+    )
+    svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
+
+    with pytest.raises(PlanRejected):
+        await svc.resume([1])
+
+    # No mutation reached the API.
+    assert fake_direct.resume_calls == []
+
+
+@pytest.mark.asyncio
+async def test_resume_proceeds_when_campaign_carries_all_required_negatives(
+    settings: Settings, fake_direct: _FakeDirectService, tmp_path: Any
+) -> None:
+    """Inverse pin: a campaign that carries every required phrase
+    proceeds to the confirm path (``auto_approve_resume=False``) —
+    KS#3 must not fire on a compliant campaign. Before this PR the
+    snapshot was always empty so KS#3 fired on EVERY resume the
+    moment any required negative was configured; this test would
+    have been impossible to pass."""
+    from yadirect_agent.agent.executor import PlanRequired
+
+    fake_direct._campaigns = [
+        Campaign.model_validate(
+            {
+                "Id": 1,
+                "Name": "alpha",
+                "State": "SUSPENDED",
+                "Status": "ACCEPTED",
+                "DailyBudget": {"Amount": 500_000_000, "Mode": "STANDARD"},
+                "NegativeKeywords": {"Items": ["бесплатно", "отзывы", "купить"]},
+            }
+        )
+    ]
+    pipeline, store, sink = _build_safety_with_required_negatives(
+        tmp_path, required=["бесплатно", "отзывы"]
+    )
+    svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
+
+    with pytest.raises(PlanRequired):
+        await svc.resume([1])
+
+    # Plan persisted but DirectService NOT called (confirm tier).
+    assert fake_direct.resume_calls == []
