@@ -54,14 +54,7 @@ evals exercise the full safety surface.)*
 
 ## In progress
 
-- [ ] **M7.2 — agent evals framework** (branch
-      ``feat/m7.2-evals-framework``) — first PR: eval runner
-      skeleton + ``EvalResult`` metrics shape + 2-3 starter evals
-      covering safety happy path, reject path, confirm path.
-      ``make evals`` target. Wires up ``FakeAnthropic`` +
-      service fakes for cost-free regression testing of agent
-      reasoning. Subsequent PRs add evals incrementally as M4 /
-      M5 / M6 features land.
+*(empty — nothing checked out right now)*
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
@@ -578,6 +571,23 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M7.2 — agent evals framework (first PR)** — eval runner
+      skeleton + ``EvalResult`` metrics shape + 3 starter evals
+      covering happy path (pause low-CTR campaigns), reject path
+      (budget cap exceeded → ``status="rejected"`` returned to
+      LLM, no API call, no retry loop), confirm path (bid change
+      → ``status="pending"`` with ``next_step`` apply-plan
+      instruction relayed to operator). ``make evals`` target
+      runs only the eval suite verbose; ``make test`` picks them
+      up alongside unit tests since they're cost-free. Wires
+      ``FakeAnthropic`` + a unified ``FakeDirectService`` that
+      covers every API method any tool handler may call;
+      ``patch_direct_service`` helper centralises the
+      monkeypatch-three-import-sites gotcha so eval files stay
+      short. Each eval pins tool sequence + tool-result shape
+      + iteration count + final-text content the operator sees.
+      Subsequent PRs add evals incrementally as M4 / M5 / M6
+      features land. 576 total green; mypy strict; ruff clean.
 - [x] **M2 follow-up — `max_snapshot_age_seconds` enforcement at
       apply-plan** — closes the deferred half of the auditor
       M2-bid-snapshot HIGH-2 (and M2-ks3-negatives HIGH-2)
