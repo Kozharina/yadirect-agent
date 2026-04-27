@@ -39,6 +39,75 @@ _SAFETY_FIELD_NAMES = {
 }
 
 
+_CAMPAIGN_SAFETY_FIELD_NAMES = {
+    "Id",
+    "Name",
+    "State",
+    "Status",
+    "DailyBudget",
+    "NegativeKeywords",
+}
+
+
+# --------------------------------------------------------------------------
+# Campaigns: NegativeKeywords field added for KS#3 (negative-keyword floor).
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_campaigns_requests_negative_keywords_field(
+    settings: Settings, respx_mock: respx.MockRouter
+) -> None:
+    """``_build_resume_context`` populates ``CampaignBudget.negative_keywords``
+    from the snapshot's campaigns. For that pipe to carry real data,
+    the wire request must opt into the ``NegativeKeywords`` FieldName.
+    Without this, the snapshot is empty and KS#3 blocks every resume
+    once an operator configures ``required_negative_keywords``."""
+    route = respx_mock.post("https://api-sandbox.direct.yandex.com/json/v5/campaigns").mock(
+        return_value=httpx.Response(200, json={"result": {"Campaigns": []}})
+    )
+
+    async with DirectService(settings) as svc:
+        await svc.get_campaigns()
+
+    body = json.loads(route.calls[0].request.content.decode())
+    assert set(body["params"]["FieldNames"]) >= _CAMPAIGN_SAFETY_FIELD_NAMES
+
+
+@pytest.mark.asyncio
+async def test_get_campaigns_parses_negative_keywords_envelope(
+    settings: Settings, respx_mock: respx.MockRouter
+) -> None:
+    """End-to-end of the wire-to-model pipe for KS#3: a campaign row
+    carrying the ``NegativeKeywords`` envelope flows through to a
+    flat ``Campaign.negative_keywords`` list."""
+    respx_mock.post("https://api-sandbox.direct.yandex.com/json/v5/campaigns").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "result": {
+                    "Campaigns": [
+                        {
+                            "Id": 7,
+                            "Name": "c1",
+                            "State": "ON",
+                            "Status": "ACCEPTED",
+                            "NegativeKeywords": {"Items": ["бесплатно", "отзывы"]},
+                        }
+                    ]
+                }
+            },
+        )
+    )
+
+    async with DirectService(settings) as svc:
+        campaigns = await svc.get_campaigns()
+
+    [c] = campaigns
+    assert c.id == 7
+    assert c.negative_keywords == ["бесплатно", "отзывы"]
+
+
 # --------------------------------------------------------------------------
 # Request shape — selection + FieldNames.
 # --------------------------------------------------------------------------
