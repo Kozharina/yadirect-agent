@@ -2,7 +2,8 @@
 
 > This file is read by Claude Code at the start of every session. It defines
 > **how I work in this repository** — not what the project does (see
-> `docs/BRIEF.md`) and not the roadmap (see `docs/TECHNICAL_SPEC.md`).
+> [`README.md`](./README.md)) and not the roadmap (see
+> [`docs/TECHNICAL_SPEC.md`](./docs/TECHNICAL_SPEC.md)).
 >
 > If you're a human reading this: you can ignore it; the behaviour it describes
 > is what you'd expect a careful collaborator to do anyway.
@@ -167,21 +168,41 @@ painful to debug at 2 AM with a client asking why their budget got burned
 ## <bootstrapping_a_fresh_session>
 When a new Claude Code session opens in this repo:
 
-1. Read `docs/BRIEF.md` (1 min) — project context.
-2. Read `docs/BACKLOG.md` — what's in *Active queue*, *In progress*,
-   *Blocked*. State aloud what I believe the session's next task is
-   and the one after it; that gives the human a chance to redirect
+1. Read [`README.md`](./README.md) (1 min) — what the product is and what
+   ships today.
+2. Read [`docs/BACKLOG.md`](./docs/BACKLOG.md) — what's in *Active queue*,
+   *In progress*, *Blocked*. State aloud what I believe the session's next
+   task is and the one after it; that gives the human a chance to redirect
    before I sink time into the wrong thing.
 3. Read **this file** — operational rules.
-4. Read `docs/ARCHITECTURE.md` — layer contracts.
-5. Glance at `docs/TECHNICAL_SPEC.md` table of contents to locate the
-   current milestone.
-6. Confirm the plan with the human. If the session's task is absent
-   from the backlog, add it in step 1 of the per-task workflow before
-   writing code.
+4. Read [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) — layer contracts.
+5. Glance at [`docs/TECHNICAL_SPEC.md`](./docs/TECHNICAL_SPEC.md) table of
+   contents to locate the current milestone.
+6. Confirm the plan with the human. If the session's task is absent from the
+   backlog, add it in step 1 of the per-task workflow before writing code.
 
 Total setup: ~3 minutes. Then we're productive.
 
 **If you open a session and I haven't read the backlog**, the one-word
 prompt `backlog` is enough — I'll reread and resync.
 </bootstrapping_a_fresh_session>
+
+## <language_conventions>
+The repo deliberately uses two languages, by audience:
+
+- **English** for everything externally visible or read out of context:
+  source code, identifiers, commit subjects/bodies, log events, error
+  messages, audit JSONL fields, the `README.md`, `SECURITY.md`,
+  `CLAUDE.md`, `docs/ARCHITECTURE.md`, `docs/CODING_RULES.md`,
+  `docs/TESTING.md`, `docs/REVIEW.md`, `docs/OPERATING.md`,
+  `docs/PRIOR_ART.md`. Anything an MCP client, a CI log, or a vulnerability
+  reporter might encounter.
+- **Russian is allowed** in the working planning surfaces:
+  `docs/TECHNICAL_SPEC.md` and `docs/BACKLOG.md`. These are operator-facing
+  and the operator works in Russian. Code-level references inside them
+  (file paths, function names, commit conventions) stay English.
+
+In a single file, pick one and stay consistent. If a section in
+`TECHNICAL_SPEC.md` is half-Russian, half-English, it's a smell — fix it
+when you next touch the section.
+</language_conventions>
