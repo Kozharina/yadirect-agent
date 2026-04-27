@@ -601,3 +601,66 @@ def test_rollout_promote_downgrade_allowed(
     assert state is not None
     assert state.stage == "shadow"
     assert state.previous_stage == "autonomy_full"
+
+
+def test_apply_plan_routes_resume_campaigns_to_service(
+    runner: CliRunner,
+    _patch_bootstrap: None,
+    settings: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: a stored ``resume_campaigns`` plan flows through the
+    CLI router → CampaignService.resume(_applying_plan_id) → DirectService.
+
+    Locks the bulk-args round-trip: ``args={"campaign_ids": [1, 2, 3]}``
+    must arrive at ``svc.resume`` as the same list (no truncation, no
+    re-ordering, no key-name mismatch).
+    """
+    from datetime import UTC, datetime
+
+    from yadirect_agent.agent.pipeline import (
+        ReviewContext,
+        SafetyDecision,
+        SafetyPipeline,
+        serialize_review_context,
+    )
+    from yadirect_agent.agent.plans import OperationPlan, PendingPlansStore
+    from yadirect_agent.services.campaigns import CampaignService
+
+    plans_path = settings.audit_log_path.parent / "pending_plans.jsonl"
+    plan = OperationPlan(
+        plan_id="plan-resume",
+        created_at=datetime(2026, 4, 27, 12, 0, tzinfo=UTC),
+        action="resume_campaigns",
+        resource_type="campaign",
+        resource_ids=[1, 2, 3],
+        args={"campaign_ids": [1, 2, 3]},
+        preview="resume campaigns: [1, 2, 3]",
+        reason="confirm",
+        review_context=serialize_review_context(ReviewContext()),
+    )
+    PendingPlansStore(plans_path).append(plan)
+
+    def stub_review(self: SafetyPipeline, plan_arg: Any, ctx: Any) -> SafetyDecision:
+        return SafetyDecision(status="allow", reason="ok")
+
+    captured: list[tuple[list[int], str | None]] = []
+
+    async def fake_resume(
+        self: CampaignService,
+        campaign_ids: list[int],
+        *,
+        _applying_plan_id: str | None = None,
+    ) -> None:
+        captured.append((list(campaign_ids), _applying_plan_id))
+
+    monkeypatch.setattr(SafetyPipeline, "review", stub_review)
+    monkeypatch.setattr(CampaignService, "resume", fake_resume)
+
+    result = runner.invoke(app, ["apply-plan", "plan-resume"])
+
+    assert result.exit_code == 0, result.output
+    assert captured == [([1, 2, 3], "plan-resume")]
+    final = PendingPlansStore(plans_path).get("plan-resume")
+    assert final is not None
+    assert final.status == "applied"

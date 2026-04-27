@@ -23,6 +23,7 @@ reserved for the apply-plan executor's re-entry. Read-only methods
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import structlog
 
@@ -62,26 +63,59 @@ class CampaignSummary:
         )
 
 
-async def _build_set_budget_context(
-    service: CampaignService, campaign_id: int, budget_rub: int
-) -> ReviewContext:
-    """Async context builder for ``set_daily_budget``'s ``@requires_plan``.
+class PartialActionError(RuntimeError):
+    """Raised when Yandex Direct's bulk-action response contains
+    per-item errors despite the top-level call returning HTTP 200.
 
-    Reads the current account snapshot via ``list_all()`` and converts
-    each ``CampaignSummary`` to a ``CampaignBudget`` for KS#1 (budget
-    cap) and KS#3 (negative-keyword floor). Campaigns whose
-    ``daily_budget_rub`` is ``None`` (no budget set) get ``0.0`` so they
-    contribute nothing to the KS#1 sum but stay in the snapshot's
-    ``campaigns`` list — KS#3 is stateless w.r.t. budget but cares
-    about per-campaign presence.
-
-    The single ``BudgetChange`` records the operator's intent so KS#1
-    can compare ``proposed_total`` to ``account_daily_budget_cap_rub``.
+    Direct's ``campaigns.suspend`` / ``campaigns.resume`` /
+    ``campaigns.archive`` return an ``ActionResults`` envelope
+    where each element can carry per-item ``Errors``. The top-
+    level error path doesn't fire on partial success — the
+    response says "OK" while two of three campaigns weren't
+    touched. Without this exception the plan would silently
+    transition to ``applied`` while the operator's intent was
+    only partially fulfilled, breaking the bulk plan's
+    "all-or-none" contract. Auditor M2 follow-up MEDIUM.
     """
-    # Read snapshot — ``await``s an HTTP round-trip in production;
-    # tests stub via the DirectService monkeypatch fixture.
-    summaries = await service.list_all()
 
+    def __init__(self, action: str, failed_items: list[dict[str, Any]]) -> None:
+        super().__init__(f"{action}: {len(failed_items)} of N items failed at the API level")
+        self.action = action
+        self.failed_items = failed_items
+
+
+def _assert_action_results_clean(result: dict[str, Any], results_key: str, action: str) -> None:
+    """Inspect ``result[results_key]`` for per-item ``Errors``.
+
+    If any element carries a non-empty ``Errors`` list, raise
+    ``PartialActionError`` so the caller can transition the plan
+    to ``failed`` rather than silently log success on partial
+    completion.
+
+    Tolerates a missing ``results_key`` (returns clean) — that
+    happens for the empty-id-list case and in fakes that don't
+    yet emit the envelope shape.
+    """
+    items = result.get(results_key, [])
+    if not isinstance(items, list):
+        return
+    failed = [item for item in items if isinstance(item, dict) and item.get("Errors")]
+    if failed:
+        raise PartialActionError(action, failed)
+
+
+async def _build_account_budget_snapshot(
+    service: CampaignService,
+) -> AccountBudgetSnapshot:
+    """Read the current ``AccountBudgetSnapshot`` from Direct.
+
+    Shared helper used by every ``CampaignService`` method that
+    needs the account state for KS#1/#3 evaluation. Negative
+    keywords are not populated — see the limitations note in
+    docs/BACKLOG.md "Pull per-campaign negative keywords for KS#3".
+    """
+
+    summaries = await service.list_all()
     campaigns = [
         CampaignBudget(
             id=s.id,
@@ -91,7 +125,58 @@ async def _build_set_budget_context(
         )
         for s in summaries
     ]
-    snapshot = AccountBudgetSnapshot(campaigns=campaigns)
+    return AccountBudgetSnapshot(campaigns=campaigns)
+
+
+async def _build_pause_context(service: CampaignService, campaign_ids: list[int]) -> ReviewContext:
+    """Context for ``pause(ids)``: each id transitions to SUSPENDED.
+
+    KS#1 (budget cap) is satisfied trivially — pausing only LOWERS
+    the active total. KS#3 (negative-keyword floor) does not run on
+    pause (only on resume). The snapshot is included anyway so the
+    pipeline's required-snapshot guard passes for the action.
+    """
+
+    snapshot = await _build_account_budget_snapshot(service)
+    return ReviewContext(
+        budget_snapshot=snapshot,
+        budget_changes=[
+            BudgetChange(campaign_id=cid, new_state="SUSPENDED") for cid in campaign_ids
+        ],
+    )
+
+
+async def _build_resume_context(service: CampaignService, campaign_ids: list[int]) -> ReviewContext:
+    """Context for ``resume(ids)``: each id transitions to ON.
+
+    Resume is the primary KS#3 trigger per safety-spec — every
+    resumed campaign must satisfy the configured
+    ``required_negative_keywords`` floor. Snapshot's
+    ``negative_keywords`` field is currently always empty (we don't
+    yet read per-campaign negatives from the Direct API). Default
+    policy ships with empty ``required_negative_keywords`` so KS#3
+    is a no-op out of the box; once the operator configures
+    required negatives in YAML, the next agent run will start
+    blocking resume on every campaign until per-campaign negative
+    fetch lands. Tracked in BACKLOG.
+    """
+
+    snapshot = await _build_account_budget_snapshot(service)
+    return ReviewContext(
+        budget_snapshot=snapshot,
+        budget_changes=[BudgetChange(campaign_id=cid, new_state="ON") for cid in campaign_ids],
+    )
+
+
+async def _build_set_budget_context(
+    service: CampaignService, campaign_id: int, budget_rub: int
+) -> ReviewContext:
+    """Async context builder for ``set_daily_budget``'s ``@requires_plan``.
+
+    The single ``BudgetChange`` records the operator's intent so KS#1
+    can compare ``proposed_total`` to ``account_daily_budget_cap_rub``.
+    """
+    snapshot = await _build_account_budget_snapshot(service)
 
     return ReviewContext(
         budget_snapshot=snapshot,
@@ -169,26 +254,88 @@ class CampaignService:
             campaigns = await api.get_campaigns(limit=limit)
         return [CampaignSummary.from_model(c) for c in campaigns]
 
+    @requires_plan(
+        action="pause_campaigns",
+        resource_type="campaign",
+        preview_builder=lambda self, campaign_ids: f"pause campaigns: {campaign_ids}",
+        context_builder=_build_pause_context,
+        resource_ids_from_args=lambda self, campaign_ids: list(campaign_ids),
+    )
     async def pause(self, campaign_ids: list[int]) -> None:
-        # NB(M2): not yet wired through @requires_plan. Pause is fully
-        # reversible (the agent can always resume) so the spending-risk
-        # is bounded, but the rollout-stage gate, forbidden_operations
-        # check, and the §M2.1 ``auto_approve_pause`` knob are dead
-        # code on this path until decoration lands. Tracked in
-        # docs/BACKLOG.md "M2 mutating methods awaiting @requires_plan".
+        """Suspend one or more campaigns. Bulk operation: a single
+        plan covers the whole list; apply-plan applies all-or-none.
+
+        Wrapped by ``@requires_plan``. With ``Policy.auto_approve_pause=True``
+        (default), the pipeline returns ``allow`` after KS#1 (budget
+        cap, satisfied trivially since pause lowers the active total)
+        and the approval tier — so pause completes in one shot
+        through the agent path. Audit emits
+        ``pause_campaigns.requested|.ok|.failed`` regardless.
+        """
+        if self._audit_sink is None:
+            await self._do_pause(campaign_ids)
+            return
+
+        actor = self._infer_actor()
+        async with audit_action(
+            self._audit_sink,
+            actor=actor,
+            action="pause_campaigns",
+            resource=f"campaigns:{campaign_ids}",
+            args={"campaign_ids": campaign_ids},
+        ) as ctx:
+            await self._do_pause(campaign_ids)
+            ctx.set_result({"status": "applied", "paused": campaign_ids})
+
+    async def _do_pause(self, campaign_ids: list[int]) -> None:
         self._logger.info("campaigns.pause.request", ids=campaign_ids)
         async with DirectService(self._settings) as api:
-            await api.suspend_campaigns(campaign_ids)
+            result = await api.suspend_campaigns(campaign_ids)
+        # Direct returns HTTP 200 with per-item errors on partial
+        # success; surface those as a service-level failure so the
+        # plan transitions to ``failed`` rather than ``applied``.
+        # Auditor M2 follow-up MEDIUM.
+        _assert_action_results_clean(result, "SuspendResults", "pause_campaigns")
         self._logger.info("campaigns.pause.ok", ids=campaign_ids)
 
+    @requires_plan(
+        action="resume_campaigns",
+        resource_type="campaign",
+        preview_builder=lambda self, campaign_ids: f"resume campaigns: {campaign_ids}",
+        context_builder=_build_resume_context,
+        resource_ids_from_args=lambda self, campaign_ids: list(campaign_ids),
+    )
     async def resume(self, campaign_ids: list[int]) -> None:
-        # NB(M2): same status as pause. Resume STARTS spending and is
-        # the primary trigger for KS#3 (negative-keyword floor) per
-        # the safety-spec; not yet @requires_plan-gated. Tracked in
-        # docs/BACKLOG.md "M2 mutating methods awaiting @requires_plan".
+        """Un-suspend one or more campaigns. Bulk; one plan per call.
+
+        Wrapped by ``@requires_plan``. Resume is the primary KS#3
+        trigger per safety-spec — every resumed campaign must
+        satisfy the configured ``required_negative_keywords`` floor.
+        With ``Policy.auto_approve_resume=False`` (default), the
+        pipeline returns ``confirm`` and the operator must run
+        ``yadirect-agent apply-plan <id>`` to actually unsuspend.
+        Audit emits ``resume_campaigns.requested|.ok|.failed``.
+        """
+        if self._audit_sink is None:
+            await self._do_resume(campaign_ids)
+            return
+
+        actor = self._infer_actor()
+        async with audit_action(
+            self._audit_sink,
+            actor=actor,
+            action="resume_campaigns",
+            resource=f"campaigns:{campaign_ids}",
+            args={"campaign_ids": campaign_ids},
+        ) as ctx:
+            await self._do_resume(campaign_ids)
+            ctx.set_result({"status": "applied", "resumed": campaign_ids})
+
+    async def _do_resume(self, campaign_ids: list[int]) -> None:
         self._logger.info("campaigns.resume.request", ids=campaign_ids)
         async with DirectService(self._settings) as api:
-            await api.resume_campaigns(campaign_ids)
+            result = await api.resume_campaigns(campaign_ids)
+        _assert_action_results_clean(result, "ResumeResults", "resume_campaigns")
         self._logger.info("campaigns.resume.ok", ids=campaign_ids)
 
     @requires_plan(
@@ -289,7 +436,12 @@ class CampaignService:
         import sys
         from types import FrameType
 
-        frame: FrameType | None = sys._getframe(1)  # caller of set_daily_budget
+        # Start one frame above this helper (i.e. inside the caller
+        # ``pause`` / ``resume`` / ``set_daily_budget``) and walk
+        # outward looking for the @requires_plan decorator's wrapper
+        # frame. The wrapper holds ``_applying_plan_id`` as a local
+        # only on the apply-plan re-entry path.
+        frame: FrameType | None = sys._getframe(1)
         for _ in range(8):
             if frame is None:
                 break

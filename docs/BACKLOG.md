@@ -178,18 +178,28 @@ Accumulated work that isn't blocking but will sting later.
       ``logrotate`` config or a built-in size-based rotator inside
       ``JsonlSink``.
 
-- [ ] **M2 mutating methods awaiting `@requires_plan` gating**
-      (from PR-B1 auditor HIGH-1; track before claiming "all
-      mutating ops gated"): `CampaignService.pause` and
-      `CampaignService.resume` are wired into the tools registry
-      with the shared `(SafetyPipeline, PendingPlansStore)` pair but
-      do not run their methods through the decorator yet. Pause is
-      reversible (low spending risk) but resume is the primary
-      KS#3 (negative-keyword floor) trigger per safety-spec — the
-      check is dead code on this path until decoration lands. Same
-      story for `BiddingService.apply` (KS#2 / KS#4) once it gets
-      its own `@requires_plan` wiring. Suggested order: resume →
-      bidding → pause (in the order of risk).
+- [ ] **`BiddingService.apply` awaiting `@requires_plan` gating**
+      — last mutating method in CampaignService is gated as of
+      this PR (pause / resume / set_daily_budget all now flow
+      through the safety pipeline). ``BiddingService.apply``
+      (KS#2 max CPC + KS#4 quality score guard) still needs its
+      own decorator + context_builder. Suggested approach: same
+      pattern as ``set_daily_budget`` — context_builder reads
+      current ``AccountBidSnapshot`` via ``get_keywords``, builds
+      list of ``ProposedBidChange`` from input updates.
+
+- [ ] **Pull per-campaign negative keywords for KS#3** — the
+      pause/resume context builders currently leave
+      ``CampaignBudget.negative_keywords`` empty because we don't
+      yet read per-campaign negatives from the Direct API. Default
+      ``Policy.required_negative_keywords`` is empty so KS#3 is a
+      no-op out of the box; once the operator configures required
+      negatives in YAML, **every resume will be blocked** because
+      KS#3 sees zero negatives on every campaign. Fix: extend
+      ``DirectService`` with a per-campaign negatives fetch (Direct
+      API's ``get_keywords`` with negative-set filter) and call it
+      from ``_build_resume_context``. Block on this BEFORE the
+      first operator configures ``required_negative_keywords``.
 
 - [ ] **Snapshot freshness at apply-plan time (archived-campaign
       gap)** (from PR-B1 auditor MEDIUM-3; not blocking M2.3): the
@@ -520,6 +530,27 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2 follow-up — pause / resume gated through @requires_plan**
+      — closes the HIGH-1 finding from PR-B1 second-pass auditor.
+      ``CampaignService.pause`` and ``CampaignService.resume`` now
+      run through the safety pipeline AND emit audit events; the
+      previous version had pipeline+store on the instance but
+      methods didn't consult them, leaving resume (the primary
+      KS#3 trigger) effectively ungated. New ``_build_pause_context``
+      / ``_build_resume_context`` async helpers + extracted shared
+      ``_build_account_budget_snapshot``. Bulk semantics
+      preserved: one plan covers the whole list of ids; apply-plan
+      applies all-or-none. ``set_campaign_budget`` /
+      ``pause_campaigns`` / ``resume_campaigns`` tool handlers
+      share new ``_pending_response`` / ``_rejected_response``
+      helpers (privacy-redacted ``details``). CLI service router
+      extended with ``pause_campaigns`` / ``resume_campaigns``
+      mappings. With default policy, pause auto-completes (single
+      shot via auto_approve_pause=True), resume requires
+      operator approval (auto_approve_resume=False).
+      ``BiddingService.apply`` still queued. 2 new end-to-end
+      tests (pause through allow / resume through confirm) +
+      handler-response shape updates; 497 total green.
 - [x] **M2.5 — Staged rollout (state-file + CLI)** — closes
       §M2 entirely. New module ``yadirect_agent.rollout``
       shipping ``RolloutState`` (frozen pydantic, AwareDatetime,
@@ -687,18 +718,3 @@ Last 10 items (newest at top). Older items are available via
       bug that had been hitting KS PRs as `ruff format --check`
       CI failures on code that passed locally. Bumping ruff is
       now a 3-file operation documented in both config comments.
-- [x] **M2.2 data layer — OperationPlan + PendingPlansStore** —
-      first slice of §M2.2. `OperationPlan` frozen pydantic model
-      (plan_id / created_at / action / resource_type / resource_ids
-      / args / preview / reason / status / trace_id).
-      `PendingPlansStore` is an append-only JSONL: `append`,
-      `list_pending`, `get`, `update_status`. Status updates append
-      a new row rather than rewrite, so the file doubles as a
-      tamper-evident audit trail until M2.3 audit sink ships.
-      Readers collapse-by-id keeping latest. Robust to blank lines
-      and corrupt rows. CLI `yadirect-agent plans list [--all]` and
-      `plans show <id>` render pending/all plans via rich table and
-      per-plan detail view. `generate_plan_id()` gives URL-safe
-      16-hex-char ids. 28 new tests (plans + CLI smoke; 350 total).
-      Orchestrator / @requires_plan decorator / apply-plan
-      executor land in the next PR.

@@ -436,17 +436,18 @@ def _build_service_router(
         *,
         _applying_plan_id: str,
     ) -> Any:
+        svc = CampaignService(
+            settings,
+            pipeline=pipeline,
+            store=store,
+            audit_sink=audit_sink,
+        )
         if action == "set_campaign_budget":
-            svc = CampaignService(
-                settings,
-                pipeline=pipeline,
-                store=store,
-                audit_sink=audit_sink,
-            )
-            return await svc.set_daily_budget(
-                **args,
-                _applying_plan_id=_applying_plan_id,
-            )
+            return await svc.set_daily_budget(**args, _applying_plan_id=_applying_plan_id)
+        if action == "pause_campaigns":
+            return await svc.pause(args["campaign_ids"], _applying_plan_id=_applying_plan_id)
+        if action == "resume_campaigns":
+            return await svc.resume(args["campaign_ids"], _applying_plan_id=_applying_plan_id)
         msg = f"unknown action: {action!r}"
         raise ValueError(msg)
 

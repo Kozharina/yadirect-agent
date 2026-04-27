@@ -195,7 +195,10 @@ async def test_list_all_does_not_filter_states(
 async def test_pause_delegates_to_client_suspend(
     settings: Settings, fake_direct: _FakeDirectService
 ) -> None:
-    await CampaignService(settings).pause([1, 2, 3])
+    # Bypass the @requires_plan decorator; we're only testing the
+    # client-delegation contract (the decorator's behaviour is
+    # exercised separately).
+    await CampaignService(settings).pause([1, 2, 3], _applying_plan_id="test-bypass")
 
     assert fake_direct.suspend_calls == [[1, 2, 3]]
     assert fake_direct.resume_calls == []
@@ -205,7 +208,7 @@ async def test_pause_delegates_to_client_suspend(
 async def test_resume_delegates_to_client_resume(
     settings: Settings, fake_direct: _FakeDirectService
 ) -> None:
-    await CampaignService(settings).resume([7])
+    await CampaignService(settings).resume([7], _applying_plan_id="test-bypass")
 
     assert fake_direct.resume_calls == [[7]]
     assert fake_direct.suspend_calls == []
@@ -617,3 +620,216 @@ async def test_set_daily_budget_through_apply_plan_emits_actor_human(
     assert all(e.actor == "human" for e in inner)
     assert inner[0].action == "set_campaign_budget.requested"
     assert inner[1].action == "set_campaign_budget.ok"
+
+
+# --------------------------------------------------------------------------
+# pause / resume gated through @requires_plan (M2 follow-up).
+# --------------------------------------------------------------------------
+
+
+def _build_safety_for_test(tmp_path: Any) -> tuple[Any, Any, _CapturingSink]:
+    """Helper: minimal safety stack for end-to-end gating tests."""
+    from yadirect_agent.agent.pipeline import SafetyPipeline
+    from yadirect_agent.agent.plans import PendingPlansStore
+    from yadirect_agent.agent.safety import (
+        BudgetCapPolicy,
+        ConversionIntegrityPolicy,
+        MaxCpcPolicy,
+        Policy,
+        QueryDriftPolicy,
+    )
+
+    policy = Policy(
+        budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=100_000),
+        max_cpc=MaxCpcPolicy(),
+        query_drift=QueryDriftPolicy(),
+        conversion_integrity=ConversionIntegrityPolicy(
+            min_conversions_total=1,
+            min_ratio_vs_baseline=0.5,
+            require_all_baseline_goals_present=True,
+        ),
+        rollout_stage="autonomy_full",
+        # auto_approve_pause defaults to True; auto_approve_resume defaults to False.
+    )
+    return (
+        SafetyPipeline(policy),
+        PendingPlansStore(tmp_path / "pending_plans.jsonl"),
+        _CapturingSink(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_pause_through_decorator_passes_allow_path(
+    settings: Settings, fake_direct: _FakeDirectService, tmp_path: Any
+) -> None:
+    """auto_approve_pause=True (default) → pipeline allows → pause
+    completes in one shot AND emits the audit pair. The HIGH gap
+    "pause/resume bypass the safety pipeline" closed: the wrapper
+    runs, KS#1 is consulted (trivially passes since pause lowers
+    spend), and the audit JSONL records actor=agent.
+    """
+    fake_direct._campaigns = [
+        Campaign(
+            id=1,
+            name="alpha",
+            state=CampaignState.ON,
+            status=CampaignStatus.ACCEPTED,
+            type="TEXT_CAMPAIGN",
+            daily_budget=DailyBudget(amount=500_000_000, mode="STANDARD"),
+        )
+    ]
+    pipeline, store, sink = _build_safety_for_test(tmp_path)
+    svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
+
+    # Allow path: no exception.
+    await svc.pause([1])
+
+    assert fake_direct.suspend_calls == [[1]]
+    actions = [e.action for e in sink.events]
+    assert "pause_campaigns.requested" in actions
+    assert "pause_campaigns.ok" in actions
+
+
+@pytest.mark.asyncio
+async def test_resume_through_decorator_persists_confirm_plan(
+    settings: Settings, fake_direct: _FakeDirectService, tmp_path: Any
+) -> None:
+    """auto_approve_resume=False (default) → pipeline returns confirm
+    → resume raises PlanRequired without touching DirectService.
+    Resume is the primary KS#3 trigger per safety-spec, so the
+    gating is mandatory.
+    """
+    from yadirect_agent.agent.executor import PlanRequired
+
+    fake_direct._campaigns = [
+        Campaign(
+            id=1,
+            name="alpha",
+            state=CampaignState.SUSPENDED,
+            status=CampaignStatus.ACCEPTED,
+            type="TEXT_CAMPAIGN",
+            daily_budget=DailyBudget(amount=500_000_000, mode="STANDARD"),
+        )
+    ]
+    pipeline, store, sink = _build_safety_for_test(tmp_path)
+    svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
+
+    with pytest.raises(PlanRequired) as exc:
+        await svc.resume([1])
+
+    # Plan persisted; DirectService NOT called.
+    plan = store.get(exc.value.plan_id)
+    assert plan is not None
+    assert plan.status == "pending"
+    assert plan.action == "resume_campaigns"
+    assert plan.resource_ids == [1]
+    assert plan.args == {"campaign_ids": [1]}
+    assert fake_direct.resume_calls == []
+
+
+# --------------------------------------------------------------------------
+# Partial-success guard (auditor M2 follow-up MEDIUM).
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pause_raises_partial_action_error_on_per_item_errors(
+    settings: Settings,
+    fake_direct: _FakeDirectService,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """Direct returns HTTP 200 with per-item Errors on partial bulk
+    success. Without the guard the plan would silently transition to
+    ``applied`` while one of three campaigns was still running.
+    """
+    from yadirect_agent.services.campaigns import PartialActionError
+
+    fake_direct._campaigns = [
+        Campaign(
+            id=1,
+            name="alpha",
+            state=CampaignState.ON,
+            status=CampaignStatus.ACCEPTED,
+            type="TEXT_CAMPAIGN",
+            daily_budget=DailyBudget(amount=500_000_000, mode="STANDARD"),
+        )
+    ]
+    pipeline, store, sink = _build_safety_for_test(tmp_path)
+
+    async def fake_suspend(self: _FakeDirectService, ids: list[int]) -> dict[str, Any]:
+        # Two ids succeed, one fails — typical partial-success.
+        return {
+            "SuspendResults": [
+                {"Id": 1, "Suspended": 1},
+                {"Id": 2, "Errors": [{"Code": 8000, "Message": "Permission denied"}]},
+                {"Id": 3, "Suspended": 1},
+            ]
+        }
+
+    monkeypatch.setattr(_FakeDirectService, "suspend_campaigns", fake_suspend)
+    svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
+
+    with pytest.raises(PartialActionError):
+        await svc.pause([1, 2, 3])
+
+
+@pytest.mark.asyncio
+async def test_resume_raises_partial_action_error_on_per_item_errors(
+    settings: Settings,
+    fake_direct: _FakeDirectService,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    from yadirect_agent.services.campaigns import PartialActionError
+
+    fake_direct._campaigns = [
+        Campaign(
+            id=1,
+            name="alpha",
+            state=CampaignState.SUSPENDED,
+            status=CampaignStatus.ACCEPTED,
+            type="TEXT_CAMPAIGN",
+            daily_budget=DailyBudget(amount=500_000_000, mode="STANDARD"),
+        )
+    ]
+    # Use auto_approve_resume=True to take the allow path so we hit
+    # the inner _do_resume directly.
+    from yadirect_agent.agent.pipeline import SafetyPipeline
+    from yadirect_agent.agent.plans import PendingPlansStore
+    from yadirect_agent.agent.safety import (
+        BudgetCapPolicy,
+        ConversionIntegrityPolicy,
+        MaxCpcPolicy,
+        Policy,
+        QueryDriftPolicy,
+    )
+
+    policy = Policy(
+        budget_cap=BudgetCapPolicy(account_daily_budget_cap_rub=100_000),
+        max_cpc=MaxCpcPolicy(),
+        query_drift=QueryDriftPolicy(),
+        conversion_integrity=ConversionIntegrityPolicy(
+            min_conversions_total=1,
+            min_ratio_vs_baseline=0.5,
+            require_all_baseline_goals_present=True,
+        ),
+        rollout_stage="autonomy_full",
+        auto_approve_resume=True,  # take allow path for this test
+    )
+    pipeline = SafetyPipeline(policy)
+    store = PendingPlansStore(tmp_path / "pending_plans.jsonl")
+    sink = _CapturingSink()
+
+    async def fake_resume(self: _FakeDirectService, ids: list[int]) -> dict[str, Any]:
+        return {
+            "ResumeResults": [
+                {"Id": 1, "Errors": [{"Code": 8000, "Message": "x"}]},
+            ]
+        }
+
+    monkeypatch.setattr(_FakeDirectService, "resume_campaigns", fake_resume)
+    svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
+
+    with pytest.raises(PartialActionError):
+        await svc.resume([1])

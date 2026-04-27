@@ -506,7 +506,9 @@ async def test_pause_campaigns_delegates_and_echoes_ids(
     result = await tool.handler(inp, tool_context)
 
     assert captured == [[1, 2]]
-    assert result == {"paused": [1, 2]}
+    # Status field added when pause was wired through @requires_plan —
+    # handler now always includes it.
+    assert result == {"status": "applied", "paused": [1, 2]}
 
 
 @pytest.mark.asyncio
@@ -526,7 +528,7 @@ async def test_resume_campaigns_delegates_and_echoes_ids(
     inp = tool.input_model.model_validate({"ids": [7]})
     result = await tool.handler(inp, tool_context)
 
-    assert result == {"resumed": [7]}
+    assert result == {"status": "applied", "resumed": [7]}
 
 
 def test_set_campaign_budget_rejects_below_minimum(settings: Settings) -> None:
