@@ -71,6 +71,53 @@ the PR merges or is abandoned.
 
 Accumulated work that isn't blocking but will sting later.
 
+- [ ] **`max_snapshot_age_seconds` policy enforcement at apply-plan
+      re-review** (auditor M2-bid-snapshot HIGH-2 follow-up): the
+      bid-context reader now stamps ``ReviewContext.baseline_timestamp``,
+      but ``apply_plan`` does not yet read it. Operator-driven
+      ``apply-plan <id>`` minutes / hours / days after the plan was
+      created re-reviews against an arbitrarily stale snapshot. KS#4's
+      ``_is_increase`` compares the proposed bid against the snapshot's
+      current bid — a parallel-operator bid bump between plan creation
+      and apply execution would be invisible to the guard, opening a
+      window for a second consecutive increase on the same keyword.
+      Fix: add ``max_snapshot_age_seconds: int`` to ``Policy`` (default
+      300 s); in ``apply_plan``, if the plan's ``review_context.baseline_timestamp``
+      is present and older than the policy ceiling, mark the plan
+      ``failed`` with a clear stale-snapshot reason and require the
+      operator to re-issue. Apply the same enforcement to
+      ``CampaignService`` context builders (none of them stamp
+      baseline_timestamp today either; the bid reader is just the
+      first to make freshness load-bearing).
+
+- [ ] **`AccountBidSnapshot.find` O(n²) at large bulk sizes** (auditor
+      M2-bid-snapshot second-pass NEW LOW): now that the bid snapshot
+      is populated from a real API call, a single ``apply`` with N
+      keyword updates triggers N linear ``find`` scans over a list of
+      up to N entries. ``Policy.max_bulk_size`` defaults to 50 so the
+      cost is harmless today (50 × 50 = 2 500 comparisons per call).
+      If the bulk ceiling is ever raised — ``max_bulk_size = 500``
+      means 250 000 comparisons — the cost grows unnoticed inside the
+      hot path. Fix: when the snapshot grows past a threshold (say
+      100 entries), build a ``dict[keyword_id, KeywordSnapshot]`` once
+      and look up by id. Lazy: only convert when ``len(keywords) >
+      threshold``. Defer until the bulk ceiling actually moves.
+
+- [ ] **Audit redaction for live bid values in CheckResult.details**
+      (auditor M2-bid-snapshot LOW): ``QualityScoreGuardCheck`` and
+      ``MaxCpcCheck`` emit ``current_rub``, ``proposed_rub`` and
+      ``cap_rub`` into ``CheckResult.details``. These flow through
+      ``SafetyDecision.blocking_checks`` → ``PlanRejected.blocking``
+      → audit log (M2.3) and agent tool responses. Bid values on
+      competitor brand keywords or niche product keywords are
+      commercially sensitive; exposing them to the LLM agent
+      violates minimum-information-exposure. Fix: extend
+      ``audit._PRIVATE_KEYS`` with ``current_rub`` / ``proposed_rub``
+      / ``cap_rub``, OR introduce a ``details_for_audit`` /
+      ``details_for_agent`` split in ``CheckResult`` so the operator-
+      facing audit retains the values for triage while the
+      LLM-facing tool response strips them.
+
 - [ ] **M2.2 part 3 executor must-haves** (from SafetyPipeline
       second-pass auditor review; block apply-plan merge):
   - **Executor must call `SafetyPipeline.on_applied(context)`
@@ -194,26 +241,6 @@ Accumulated work that isn't blocking but will sting later.
       ``audit.infer_actor_from_frame()`` so a future tightening
       (replace frame walk with explicit kwarg threading) lands in
       one place.
-
-- [ ] **Per-keyword AccountBidSnapshot reader for KS#2 / KS#4** —
-      ``BiddingService.apply`` is now ``@requires_plan``-gated
-      (M2 follow-up), but ``_build_bid_context`` returns an empty
-      ``AccountBidSnapshot``. KS#2 (max-CPC) and KS#4 (quality-
-      score guard) silently defer because their per-keyword
-      ``current_search_bid_rub`` / ``quality_score`` fields are
-      missing — that IS their documented "no current bid known →
-      can't prove violation" contract, but it means the
-      protection on this path today is plan→confirm→execute +
-      rollout_stage + audit, not the deeper KS#2/#4 validation.
-      Fix: extend ``models/keywords.Keyword`` to include the
-      Direct API's bid + quality-score fields, extend
-      ``DirectService.get_keywords`` to request them via
-      ``FieldNames``, and have ``_build_bid_context`` populate
-      ``KeywordSnapshot.current_search_bid_rub`` /
-      ``current_network_bid_rub`` / ``quality_score``. Block on
-      this BEFORE any operator configures aggressive
-      ``campaign_max_cpc_rub`` / ``min_quality_score_for_bid_increase``
-      thresholds expecting them to hold.
 
 - [ ] **Pull per-campaign negative keywords for KS#3** — the
       pause/resume context builders currently leave
@@ -557,6 +584,33 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2 follow-up — Per-keyword `AccountBidSnapshot` reader
+      for KS#2 / KS#4** — closes the gap that left both kill-
+      switches deferring on every bid call. ``Keyword`` model gains
+      ``CampaignId``, ``Bid``, ``ContextBid`` and a ``Productivity``
+      envelope, and exposes ``current_search_bid_rub`` /
+      ``current_network_bid_rub`` / ``quality_score`` via computed
+      properties (micro-RUB → RUB at the boundary; rounded int
+      0..10 from ``Productivity.Value`` with out-of-range values
+      falling back to ``None`` so KS#4's "QS=None → defer" branch
+      stays in charge of the unexpected-input case).
+      ``DirectService.get_keywords`` accepts a keyword-only
+      ``keyword_ids`` selection (so the bid-context builder fetches
+      by keyword id rather than running a second adgroup-lookup
+      round trip), broadens ``FieldNames`` to include the new
+      fields for every caller, and refuses calls with no selection
+      at all. ``BiddingService._build_bid_context`` issues exactly
+      one ``get_keywords(keyword_ids=...)`` call and populates a
+      ``KeywordSnapshot`` per row that survives the identity
+      check (``Id`` and ``CampaignId`` both present). Net result:
+      a bid above ``Policy.max_cpc.campaign_max_cpc_rub`` raises
+      ``PlanRejected`` at plan-creation time (KS#2); a bid
+      INCREASE on a keyword whose Productivity-derived QS is
+      below ``min_quality_score_for_bid_increase`` raises the
+      same (KS#4); a DECREASE on a low-QS keyword still passes.
+      Tightening max-CPC / min-QS thresholds in
+      ``agent_policy.yml`` is now meaningful. 25 new tests
+      (13 model + 5 client + 7 service); 542 total green.
 - [x] **M2 follow-up — `BiddingService.apply` gated through
       @requires_plan; MCP denylist now empty** — closes the last
       mutating service method. ``BiddingService.apply`` runs
