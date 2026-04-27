@@ -135,18 +135,6 @@ Accumulated work that isn't blocking but will sting later.
     identity (keyword_id → approved ceiling) inside
     `OperationPlan.args` and reconstruct at apply time.
 
-- [ ] **Audit emit guards: narrow `except Exception` to `OSError`**
-      (from PR M2.3a second-pass auditor ADVISORY-1; non-blocking):
-      ``audit_action``'s success / failure-path emit guards swallow
-      every ``Exception``, but the documented intent is "I/O
-      failures don't mask the wrapped operation". A custom sink
-      raising ``ValidationError`` (programmer bug — malformed
-      AuditEvent in a future sink subclass) or ``TypeError`` /
-      ``AttributeError`` (silent runtime error) would be hidden
-      behind a structlog warning. Tighten to ``OSError`` or at
-      minimum re-raise programmer-error classes. Document the gap
-      between intent and implementation in the inline comment.
-
 - [ ] **Audit module: bind ``_logger`` once at module level**
       (from PR M2.3a second-pass auditor ADVISORY-2; non-blocking
       stylistic): ``audit_action`` calls
@@ -562,6 +550,21 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **Audit emit guards narrowed to OSError** (auditor M2.3a
+      ADVISORY-1). ``audit_action``'s emit-guards now distinguish
+      I/O failures (swallowed, log, preserve outcome) from
+      programmer bugs (surfaced, never silently masked). Success
+      path catches only ``OSError``; programmer errors propagate
+      so the operator sees a broken sink immediately rather than
+      discovering it weeks later via reconciliation. Failure path
+      catches ``OSError`` (warning log) and ``Exception``
+      (error-level log via ``structlog.exception(...)``) but
+      ALWAYS re-raises the original wrapped-operation exception
+      via bare ``raise`` — sink bugs must never replace the
+      caller's API failure as the operator's debugging path. 2 new
+      tests pin programmer-error propagation on the success path
+      and original-exception preservation on the failure path
+      under sink-side TypeError. 586 total green.
 - [x] **`_infer_actor` dedup → `audit.infer_actor_from_frame()`**
       (auditor M2-bidding L-1). Both ``CampaignService`` and
       ``BiddingService`` had a byte-identical 8-frame walker
