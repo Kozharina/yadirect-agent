@@ -31,14 +31,6 @@ Each one is TDD, with `security-auditor` sub-agent review before merge.
 All seven reference
 [`docs/PRIOR_ART.md`](./PRIOR_ART.md) → "Agentic PPC Campaign Management".
 
-- [ ] **M2.4: Daily-budget hard guard** — pre-op check that summed
-      active-campaign budgets stay ≤ ``AGENT_MAX_DAILY_BUDGET_RUB``,
-      independently of the policy YAML. Today the YAML cap is the
-      only enforcer; if the operator misconfigures the YAML to a
-      higher cap (typo, copy-paste from another env), the env
-      backstop should still bite. Implement as an additional check
-      inside ``BudgetCapCheck`` that uses ``min(account_cap_rub,
-      settings.agent_max_daily_budget_rub)`` as the effective cap.
 - [ ] **M2.5: Staged rollout** — `rollout_stage` field in policy,
       `yadirect-agent rollout promote` (audit-logged, requires human
       confirmation).
@@ -509,6 +501,25 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M2.4 — Daily-budget hard guard (env backstop)** — closes
+      §M2.4. ``build_safety_pair`` now applies an env-level
+      backstop on the account budget cap: every Policy is built
+      with ``budget_cap.account_daily_budget_cap_rub =
+      min(yaml_cap, settings.agent_max_daily_budget_rub)``. The
+      env wins when a YAML drift / typo / leaked-from-dev cap
+      would loosen the deployment ceiling — operators set the
+      env at deploy time and trust the file system to honour it.
+      Implementation is a pure helper ``_apply_env_backstop`` that
+      returns the original Policy unchanged when the YAML is
+      already tighter, else a deep-copied Policy. Logs a structlog
+      ``env_backstop_tightening_account_cap`` warning whenever it
+      tightens (yaml/env/effective values included so the operator
+      can debug "why is the agent rejecting valid budgets").
+      Single source of truth: KS#1 BudgetCapCheck stays env-
+      unaware; the env is just one more input into the cap. Three
+      mutating actions covered transitively (budget bump / resume
+      / archive); bid increases correctly do not affect the cap.
+      4 new tests in ``TestEnvBackstop``; 468 total green.
 - [x] **M2.3b — Audit sink wiring** — closes §M2.3.
       ``CampaignService.set_daily_budget`` and ``apply_plan`` now
       emit ``set_campaign_budget.requested|.ok|.failed`` and
@@ -665,14 +676,3 @@ Last 10 items (newest at top). Older items are available via
       `security-auditor` — MEDIUM + 3 LOW + 1 DESIGN all closed
       in-PR; `auto_approve_negative_keywords` default explicitly
       flagged for M2.2 decision.
-- [x] **M2 Kill-switch #7 — Query drift detector** — second
-      system-level gatekeeper. `QueryDriftCheck(baseline, current)`
-      compares normalised query sets, blocks when
-      `|new_queries|/|current|` exceeds `max_new_query_share`
-      (default 0.4). Shared `_normalize_keyword` extended with
-      internal-whitespace collapse (also benefits KS#3; pinned by
-      `test_multi_word_negative_keyword_internal_whitespace_collapses`).
-      Counter-id mismatch rejected upfront; empty baseline /
-      current → warn. 26 new tests (176 safety, 299 total).
-      **M2.0 complete** — all 7 kill-switches delivered and
-      security-audited. Coverage 91.5%.
