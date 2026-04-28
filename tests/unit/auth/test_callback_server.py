@@ -30,13 +30,25 @@ What we pin here:
 from __future__ import annotations
 
 import asyncio
+import socket
 
 import httpx
 import pytest
+
 from yadirect_agent.auth.callback_server import (
     LocalCallbackServer,
     OAuthCallbackError,
 )
+
+
+def _free_port() -> int:
+    """Bind-and-release a free loopback port for tests."""
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+    finally:
+        s.close()
 
 
 async def _drive_callback(url: str) -> httpx.Response:
@@ -61,6 +73,24 @@ class TestLoopbackBinding:
         # leaks that code to anyone on the same network.
         with pytest.raises(ValueError, match="loopback"):
             LocalCallbackServer(expected_state="x", host="0.0.0.0")
+
+    async def test_fixed_port_binds_both_ipv4_and_ipv6_loopback(self) -> None:
+        # Auditor M15.3 MEDIUM-2: ``REDIRECT_URI`` says ``localhost``,
+        # which dual-stack systems resolve to ``::1`` first. A
+        # single-host bind on ``127.0.0.1`` would leave the IPv6
+        # path with "connection refused" once the OS prefers v6.
+        # The dual-stack only triggers on a fixed port (i.e. the
+        # production 8765 path), because ``port=0`` would hand
+        # back independent ephemeral ports per family — different
+        # from what tests / orchestrator expect.
+        port = _free_port()
+        server = LocalCallbackServer(expected_state="x", port=port)
+        async with server:
+            assert server._server is not None
+            bound_families = {sock.family.name for sock in server._server.sockets}
+
+        assert "AF_INET" in bound_families, "IPv4 loopback not bound"
+        assert "AF_INET6" in bound_families, "IPv6 loopback not bound"
 
 
 class TestCallbackCapture:

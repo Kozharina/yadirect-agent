@@ -127,7 +127,16 @@ class LocalCallbackServer:
         self._host = host
         self._port = port
         self._server: asyncio.base_events.Server | None = None
-        self._code_future: asyncio.Future[str] = asyncio.get_event_loop().create_future()
+        # ``get_running_loop`` rather than the deprecated
+        # ``get_event_loop``: we are always constructed inside an
+        # async context (``async with`` or directly under
+        # ``asyncio.run``), and Python 3.12 removed the implicit
+        # loop creation that ``get_event_loop`` used to perform.
+        # Using the running-loop variant raises a clear
+        # ``RuntimeError`` if a future caller ever tries to
+        # construct us synchronously, instead of silently attaching
+        # the future to a different loop. (auditor M15.3 MEDIUM-1.)
+        self._code_future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         self._logger = structlog.get_logger(__name__).bind(component="oauth_callback")
 
     @property
@@ -154,7 +163,20 @@ class LocalCallbackServer:
         await self.stop()
 
     async def start(self) -> None:
-        self._server = await asyncio.start_server(self._handle, self._host, self._port)
+        # Dual-stack the loopback default (``REDIRECT_URI`` says
+        # ``localhost``, which dual-stack macOS / Linux resolve to
+        # ``::1`` first; a single-host IPv4 bind would leave that
+        # path with "connection refused" — auditor M15.3 MEDIUM-2).
+        #
+        # Only when the operator selected a fixed port: ``port=0``
+        # (tests, ephemeral) gets independent ephemeral ports per
+        # family from ``asyncio.start_server`` and the resulting
+        # ``server.port`` would describe only one of them, breaking
+        # the loopback connection from a test driver.
+        bind: str | list[str] = self._host
+        if self._host == "127.0.0.1" and self._port != 0:
+            bind = ["127.0.0.1", "::1"]
+        self._server = await asyncio.start_server(self._handle, bind, self._port)
 
     async def stop(self) -> None:
         if self._server is not None:
