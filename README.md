@@ -48,12 +48,25 @@ Real Wordstat, A/B testing, Metrika reporting and alerts don't yet.
 
 ## Quickstart
 
-Requires Python 3.11+. We use [`uv`](https://github.com/astral-sh/uv).
+Requires Python 3.11+.
+
+**End user** (after the first PyPI release tag — workflow lands in this
+PR, first publish is a separate operator action):
+
+```bash
+pip install yadirect-agent                      # or: pipx install yadirect-agent
+cp /path/to/.env.example .env                   # fill tokens; keep YANDEX_USE_SANDBOX=true
+cp /path/to/agent_policy.example.yml agent_policy.yml
+yadirect-agent --version
+yadirect-agent run "list all campaigns in sandbox"
+```
+
+**Contributor / pre-release** (current path):
 
 ```bash
 git clone git@github.com:Kozharina/yadirect-agent.git
 cd yadirect-agent
-make install                                    # venv + dev deps
+make install                                    # venv + dev deps via uv
 cp .env.example .env                            # fill tokens; keep YANDEX_USE_SANDBOX=true
 cp agent_policy.example.yml agent_policy.yml    # set account_daily_budget_cap_rub
 make check                                      # lint + type + tests must be green

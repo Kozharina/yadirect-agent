@@ -1,0 +1,151 @@
+name: Release
+
+# Triggered when a tag matching v*.*.* is pushed (e.g. v0.1.0).
+# Builds sdist + wheel and publishes to PyPI via Trusted Publishing
+# (OIDC) — no PyPI token stored anywhere in this repo.
+#
+# One-time prerequisite: register this workflow as a Trusted
+# Publisher at pypi.org → "Manage" → "Publishing":
+#   PyPI Project Name:   yadirect-agent
+#   Owner:               Kozharina
+#   Repository name:     yadirect-agent
+#   Workflow name:       release.yml
+#   Environment name:    pypi
+# Until that registration exists, the publish step will fail with
+# a clear "Trusted Publisher not configured" error and the build
+# artefacts remain available on the workflow run for inspection.
+#
+# To cut a release:
+#   1. Bump version in pyproject.toml on main
+#   2. git tag v<version> && git push origin v<version>
+#   3. This workflow runs, builds, publishes, attaches artefacts
+#      to a GitHub release.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# Concurrency lock per tag. ``cancel-in-progress: false`` is
+# deliberate (auditor M15.1 LOW-3): on a duplicate tag push, run
+# #1 publishes to PyPI; run #2 then attempts the same upload and
+# PyPI rejects it with "File already exists" because filenames
+# are deterministic. Workflow run #2 ends red with a clear error,
+# no double-publish, no orphaned half-state. Cancelling run #1
+# mid-flight (the alternative) could leave a PyPI release with
+# no matching GitHub release if cancellation lands between the
+# two upload steps.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Stage 1: build the package on a clean runner. Output the
+  # artefacts so the publish job can pick them up. The build is
+  # deliberately minimal — no tests here; tests run on every PR
+  # via ci.yml. A tag must come from main, which means tests
+  # already passed.
+  #
+  # Repository guard: a fork that pushes a v*.*.* tag would also
+  # trigger this workflow. We refuse to do anything on a fork —
+  # PyPI's Trusted Publisher would reject the OIDC claim anyway,
+  # but consuming the fork's Actions minutes / artefact storage
+  # / running ``python -m build`` against potentially malicious
+  # ``pyproject.toml`` build hooks is also pointless.
+  # (auditor M15.1 MEDIUM-3.)
+  build:
+    if: github.repository == 'Kozharina/yadirect-agent'
+    name: Build sdist and wheel
+    runs-on: ubuntu-latest
+    steps:
+      # Actions pinned to commit SHA (auditor M15.1 MEDIUM-1) so a
+      # malicious tag-move on a third-party action cannot substitute
+      # arbitrary code into the release pipeline. Dependabot's
+      # github-actions group will open PRs to advance these.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Verify tag matches pyproject version
+        run: |
+          # Tag is refs/tags/vX.Y.Z; strip the leading 'v'.
+          # Using $GITHUB_REF (env var, expanded by bash) rather than
+          # ${{ github.ref }} (template, substituted by GitHub Actions
+          # before the shell sees the script) keeps this safe against
+          # tag names containing shell metacharacters.
+          tag_version="${GITHUB_REF#refs/tags/v}"
+          if ! [[ "$tag_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag format invalid: $tag_version"
+            exit 1
+          fi
+          py_version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "Tag version: $tag_version"
+          echo "pyproject.toml version: $py_version"
+          if [ "$tag_version" != "$py_version" ]; then
+            echo "::error::tag $tag_version does not match pyproject.toml version $py_version"
+            exit 1
+          fi
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: List built artefacts
+        run: ls -lah dist/
+
+      - name: Upload build artefacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Stage 2: publish to PyPI via Trusted Publishing. This job has
+  # ``id-token: write`` to mint the OIDC token, ``contents: write``
+  # to attach the artefacts to a GitHub release.
+  publish:
+    if: github.repository == 'Kozharina/yadirect-agent'
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/yadirect-agent
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - name: Download build artefacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: dist
+          path: dist/
+
+      # The action handles OIDC token minting and twine upload
+      # against the configured Trusted Publisher. No PYPI_TOKEN
+      # secret is read.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          packages-dir: dist/
+
+      - name: Create GitHub release with artefacts
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
