@@ -26,8 +26,15 @@ on:
     tags:
       - "v*.*.*"
 
-# Cancel any in-flight release workflow on the same tag if pushed
-# twice — prevents double-publishing accidents.
+# Concurrency lock per tag. ``cancel-in-progress: false`` is
+# deliberate (auditor M15.1 LOW-3): on a duplicate tag push, run
+# #1 publishes to PyPI; run #2 then attempts the same upload and
+# PyPI rejects it with "File already exists" because filenames
+# are deterministic. Workflow run #2 ends red with a clear error,
+# no double-publish, no orphaned half-state. Cancelling run #1
+# mid-flight (the alternative) could leave a PyPI release with
+# no matching GitHub release if cancellation lands between the
+# two upload steps.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -41,14 +48,27 @@ jobs:
   # deliberately minimal — no tests here; tests run on every PR
   # via ci.yml. A tag must come from main, which means tests
   # already passed.
+  #
+  # Repository guard: a fork that pushes a v*.*.* tag would also
+  # trigger this workflow. We refuse to do anything on a fork —
+  # PyPI's Trusted Publisher would reject the OIDC claim anyway,
+  # but consuming the fork's Actions minutes / artefact storage
+  # / running ``python -m build`` against potentially malicious
+  # ``pyproject.toml`` build hooks is also pointless.
+  # (auditor M15.1 MEDIUM-3.)
   build:
+    if: github.repository == 'Kozharina/yadirect-agent'
     name: Build sdist and wheel
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      # Actions pinned to commit SHA (auditor M15.1 MEDIUM-1) so a
+      # malicious tag-move on a third-party action cannot substitute
+      # arbitrary code into the release pipeline. Dependabot's
+      # github-actions group will open PRs to advance these.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: "3.11"
           cache: pip
@@ -57,7 +77,15 @@ jobs:
       - name: Verify tag matches pyproject version
         run: |
           # Tag is refs/tags/vX.Y.Z; strip the leading 'v'.
+          # Using $GITHUB_REF (env var, expanded by bash) rather than
+          # ${{ github.ref }} (template, substituted by GitHub Actions
+          # before the shell sees the script) keeps this safe against
+          # tag names containing shell metacharacters.
           tag_version="${GITHUB_REF#refs/tags/v}"
+          if ! [[ "$tag_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag format invalid: $tag_version"
+            exit 1
+          fi
           py_version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
           echo "Tag version: $tag_version"
           echo "pyproject.toml version: $py_version"
@@ -78,7 +106,7 @@ jobs:
         run: ls -lah dist/
 
       - name: Upload build artefacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dist
           path: dist/
@@ -89,6 +117,7 @@ jobs:
   # ``id-token: write`` to mint the OIDC token, ``contents: write``
   # to attach the artefacts to a GitHub release.
   publish:
+    if: github.repository == 'Kozharina/yadirect-agent'
     name: Publish to PyPI
     needs: build
     runs-on: ubuntu-latest
@@ -101,7 +130,7 @@ jobs:
 
     steps:
       - name: Download build artefacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: dist
           path: dist/
@@ -110,12 +139,12 @@ jobs:
       # against the configured Trusted Publisher. No PYPI_TOKEN
       # secret is read.
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
           packages-dir: dist/
 
       - name: Create GitHub release with artefacts
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           files: dist/*
           generate_release_notes: true

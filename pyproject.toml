@@ -89,7 +89,13 @@ Issues = "https://github.com/Kozharina/yadirect-agent/issues"
 Changelog = "https://github.com/Kozharina/yadirect-agent/blob/main/docs/BACKLOG.md"
 
 [build-system]
-requires = ["hatchling"]
+# Pinned upper bound (auditor M15.1 MEDIUM-2). [build-system].requires
+# is NOT tracked by Dependabot's pip ecosystem scanner, so an unpinned
+# hatchling silently absorbs every new release including potentially
+# regressive or compromised ones. ``>=1.21,<2`` keeps us inside the
+# stable 1.x major while allowing routine bug-fix updates. Bump the
+# floor when we deliberately adopt a newer feature.
+requires = ["hatchling>=1.21,<2"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
