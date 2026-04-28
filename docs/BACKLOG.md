@@ -39,12 +39,26 @@ demo-only, technically; it cannot be handed to a non-developer.
       (LaunchAgent/systemd/Task Scheduler). Acceptance:
       time-to-first-value ≤ 10 min on a clean machine, **without
       Anthropic key**. Smoke-tested in CI.
-- [ ] **M20 — Human-readable rationale** (§M20): `RationaleEvent`
-      model, emission inside `@requires_plan`, persistence to
-      `logs/rationale.jsonl`, `rationale show / why` CLI and
-      `explain_decision` MCP tool. **Required for shadow-week
-      calibration** — without rationale, the user can't compare the
-      agent's proposal to their own thinking.
+- [x] ~~**M20 — Human-readable rationale (slice 1)**~~ — shipped,
+      see Done. Model + store + soft-optional emission +
+      ``yadirect-agent rationale show/list`` CLI.
+- [ ] **M20 — Hard-required emission** (slice 2): flip the
+      ``@requires_plan`` rationale kwarg from soft-optional to
+      hard-required (caller MUST pass ``rationale=``, otherwise the
+      decorator raises). Land after every existing
+      ``@requires_plan`` caller (CampaignService.set_daily_budget,
+      pause/resume, BiddingService.apply) is updated to pass a
+      meaningful Rationale. Without this, shadow-week calibration
+      remains optional rather than guaranteed.
+- [ ] **M20 — `explain_decision` MCP tool** (slice 3): mirror of
+      ``rationale show`` exposed over MCP so a Claude Desktop / Code
+      session can ask "why did you do X?" and get the recorded
+      rationale verbatim, not a fresh confabulation.
+- [ ] **M20 — auto-populated `policy_slack`** (slice 4): every
+      check in the safety pipeline emits its slack (distance to
+      threshold) into ``CheckResult.details``; the decorator pulls
+      these out and merges into ``Rationale.policy_slack``
+      automatically. Today the caller fills it manually.
 - [ ] **M21 — Cost tracking** (§M21, promoted from Ideas): per-call
       tokens + RUB capture, `agent_monthly_llm_budget_rub` knob,
       auto-degrade to `--no-llm` when budget exhausted, `cost
@@ -141,18 +155,7 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-- [ ] **M20 — Human-readable rationale (slice 1)** (§M20, branch
-      `feat/m20-rationale`). First slice of M20: ``Rationale``
-      model + ``RationaleStore`` (JSONL, append-only, indexed by
-      decision_id) + soft-optional emission from
-      ``@requires_plan`` (caller passes ``rationale=...``; if
-      omitted, structlog warning but operation continues — strict
-      ``no rationale → no plan`` enforcement is a follow-up after
-      callers update). New CLI subcommand
-      ``yadirect-agent rationale show|list``. Out of scope:
-      MCP ``explain_decision`` tool, auto-populated
-      ``policy_slack`` from safety pipeline, M20.4 notifications
-      integration.
+*(empty — nothing checked out right now)*
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
@@ -675,6 +678,35 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M20 — Human-readable rationale (slice 1)** (§M20, Phase 0+1,
+      release 0.2.0). Foundation for the rationale layer that makes
+      shadow-week calibration honest. New ``Rationale`` model with
+      ``InputDataPoint`` (timestamped data + source attribution) and
+      ``Alternative`` (rejected option + cause); ``Confidence`` enum
+      (low/medium/high, defaults to medium so callers don't
+      accidentally claim high). Summary capped at 500 chars to enforce
+      one-to-two-sentence discipline. ``RationaleStore`` JSONL
+      append-only sibling to PendingPlansStore — same operational
+      contract: tamper-evident on disk, last-write-wins on read,
+      defensive parsing of corrupt lines, structlog warning emitted
+      once per scan. ``@requires_plan`` decorator gains a soft-optional
+      ``rationale=`` kwarg; ``_resolve_rationale_store`` lookup via
+      ``getattr`` keeps legacy services that landed before M20 working
+      without a Protocol-level break change. Path semantics: persist
+      on allow + confirm, skip on reject (rejection has no decision-
+      to-act-on; audit sink captures it), skip on apply-plan re-entry
+      (rationale already recorded at proposal time, re-emit would
+      duplicate or contradict). ``decision_id`` is overwritten with
+      ``plan.plan_id`` so caller-provided ids cannot diverge from the
+      plan they describe. CLI subapp ``yadirect-agent rationale
+      show <id> [--json] | list [--days N] [--campaign ID]``. Renderer
+      separated into ``cli/rationale.py``, all operator-set free-text
+      fields ``_rich_escape``'d (mirrors M15.5.1 HIGH-1 hardening).
+      45 new unit tests (16 model + 11 store + 13 emission + 9 cli);
+      736 total green. Out of scope: hard-required emission (after
+      all callers update), MCP ``explain_decision`` tool, auto-populated
+      ``policy_slack`` from safety pipeline, notifications/digest
+      integration (M20.4, blocked on M18).
 - [x] **M15.5.1 — Account health check (rule-based, no LLM)**
       (§M15.5, Phase 0+1, release 0.2.0). First user-visible
       product surface that doesn't require an Anthropic API
