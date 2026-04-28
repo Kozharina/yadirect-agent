@@ -240,6 +240,17 @@ class _ListCampaignsInput(BaseModel):
     )
 
 
+_REASON_FIELD_DESCRIPTION = (
+    "REQUIRED: one-to-two-sentence reason for THIS action. Explain WHY, "
+    "not WHAT (the args already cover what). The reason is recorded as "
+    "the rationale summary the operator can read back later "
+    "('why did you do X yesterday?') — be specific and grounded in the "
+    "data you observed. Examples: 'CTR < 0.5% over last 7 days, no "
+    "conversions.' / 'CPA below target for 5 consecutive days, scaling.' "
+    "/ 'Top-converting keyword, raising bid by 10%.'"
+)
+
+
 class _IdListInput(BaseModel):
     model_config = _STRICT
 
@@ -247,6 +258,12 @@ class _IdListInput(BaseModel):
         ...,
         min_length=1,
         description="One or more campaign ids.",
+    )
+    reason: str = Field(
+        ...,
+        min_length=10,
+        max_length=500,
+        description=_REASON_FIELD_DESCRIPTION,
     )
 
 
@@ -258,6 +275,12 @@ class _SetCampaignBudgetInput(BaseModel):
         ...,
         ge=300,
         description="New daily budget in rubles. Minimum 300 RUB (Direct's own floor).",
+    )
+    reason: str = Field(
+        ...,
+        min_length=10,
+        max_length=500,
+        description=_REASON_FIELD_DESCRIPTION,
     )
 
 
@@ -295,6 +318,12 @@ class _SetKeywordBidsInput(BaseModel):
             "Per-keyword bid changes. Ceiling: +50% per single call is enforced "
             "by the bidding service; violations are rejected."
         ),
+    )
+    reason: str = Field(
+        ...,
+        min_length=10,
+        max_length=500,
+        description=_REASON_FIELD_DESCRIPTION,
     )
 
 
