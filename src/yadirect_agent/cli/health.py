@@ -17,6 +17,7 @@ from dataclasses import asdict
 from typing import Any
 
 from rich.console import Console
+from rich.markup import escape as _rich_escape
 from rich.table import Table
 
 from ..models.health import Finding, HealthReport, Severity
@@ -69,15 +70,26 @@ def render_report_text(console: Console, report: HealthReport) -> None:
     for f in sorted_findings:
         colour = _SEVERITY_COLOUR.get(f.severity, "white")
         impact = f"{f.estimated_impact_rub:.0f}" if f.estimated_impact_rub is not None else "—"
-        campaign = (
-            f"{f.campaign_name} (#{f.campaign_id})" if f.campaign_id is not None else "(account)"
-        )
+        # campaign_name and message are operator-set free text from
+        # Direct/Metrika and rule-emitted strings that embed it.
+        # Pass through ``_rich_escape`` so a campaign named e.g.
+        # "[bold red]PWNED[/bold red]" or "[link=...]click[/link]"
+        # cannot inject styling, hyperlinks, or escape sequences,
+        # and a name with an unbalanced bracket can't crash Rich
+        # with MarkupError. The severity / colour wrapper uses a
+        # controlled constant from _SEVERITY_COLOUR so it stays
+        # inside a Rich markup tag — that's intentional. (auditor
+        # M15.5.1 HIGH-1.)
+        if f.campaign_id is not None:
+            campaign = f"{_rich_escape(f.campaign_name or '')} (#{f.campaign_id})"
+        else:
+            campaign = "(account)"
         table.add_row(
             f"[{colour}]{f.severity.value}[/{colour}]",
-            f.rule_id,
+            _rich_escape(f.rule_id),
             campaign,
             impact,
-            f.message,
+            _rich_escape(f.message),
         )
     console.print(table)
 

@@ -110,6 +110,57 @@ class TestRenderReportText:
         assert "1 warning" in out
         assert "8400" in out  # total impact
 
+    def test_rich_markup_in_campaign_name_is_escaped(self) -> None:
+        # Operator-set campaign names are untrusted free text. A name
+        # like "[bold red]PWNED[/bold red]" or "[link=file:///etc/passwd]click[/link]"
+        # MUST NOT be interpreted by Rich as markup, otherwise it
+        # injects styling/links/escape sequences from attacker-controlled
+        # data. Bare "[" without a closing tag would also crash the
+        # renderer with MarkupError. (auditor M15.5.1 HIGH-1.)
+        report = HealthReport(
+            date_range=_WEEK,
+            findings=[
+                _finding(name="[bold red]PWNED[/bold red]"),
+            ],
+        )
+
+        # Must not raise (no MarkupError) and must contain the literal
+        # bracketed text rather than rendered markup.
+        out = _capture(report)
+
+        # The literal "[bold red]" should appear in the output —
+        # if it didn't, Rich consumed it as markup.
+        assert "[bold red]" in out
+
+    def test_rich_markup_in_message_is_escaped(self) -> None:
+        # Same protection for the message column (rule-emitted messages
+        # also embed campaign_name verbatim via f-string).
+        report = HealthReport(
+            date_range=_WEEK,
+            findings=[
+                _finding(
+                    message="campaign '[red]injected[/red]' burned 100 RUB",
+                ),
+            ],
+        )
+
+        out = _capture(report)
+
+        assert "[red]injected[/red]" in out
+
+    def test_unbalanced_markup_does_not_crash(self) -> None:
+        # An unclosed bracket like "[" would raise MarkupError without
+        # escaping — denial-of-service of the health command itself.
+        report = HealthReport(
+            date_range=_WEEK,
+            findings=[_finding(name="campaign-with-[", message="msg-[unclosed")],
+        )
+
+        # Must not raise.
+        out = _capture(report)
+
+        assert "campaign-with-[" in out
+
     def test_account_level_finding_renders_without_campaign(self) -> None:
         # No campaign_id (some future rule fires at account level —
         # billing, policy mismatch, etc.). Must render as "(account)"
