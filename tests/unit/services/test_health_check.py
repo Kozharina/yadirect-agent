@@ -331,7 +331,7 @@ class TestHighCpaRule:
         settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Target 600 RUB; campaign at 1200 = 2× target with enough
+        # Target 600 RUB; campaign at 1200 = 2x target with enough
         # conversions to be statistically meaningful. Must produce a
         # WARNING-severity finding (not HIGH — the campaign is converting,
         # just expensively).
@@ -355,7 +355,7 @@ class TestHighCpaRule:
         assert finding.severity == Severity.WARNING
         assert finding.campaign_id == 51
         assert finding.campaign_name == "non-brand"
-        # Estimated impact = excess cost over target = 10 × (1200 - 600) = 6000
+        # Estimated impact = excess cost over target = 10 * (1200 - 600) = 6000
         assert finding.estimated_impact_rub == pytest.approx(6000.0)
         assert "1200" in finding.message
         assert "600" in finding.message  # the target

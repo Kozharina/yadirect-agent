@@ -34,9 +34,17 @@ from .reporting import ReportingService
 
 
 class _Rule:
-    """Base interface for a single rule. Stateless; safe to instantiate once."""
+    """Base interface for a single rule. Stateless; safe to instantiate once.
+
+    Rules receive the global ``settings`` so they can read account-wide
+    knobs (target CPA, etc.) without HealthCheckService having to pass
+    them through every call.
+    """
 
     rule_id: str = ""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
 
     def check(
         self,
@@ -99,6 +107,80 @@ class BurningCampaignRule(_Rule):
         )
 
 
+class HighCpaRule(_Rule):
+    """Flag campaigns whose CPA exceeds the operator's target.
+
+    Distinct from BurningCampaignRule: this fires on campaigns that
+    ARE converting, just expensively. WARNING severity, because the
+    operator may have business reasons (brand campaigns often run
+    higher CPA than performance campaigns; new product launches
+    often run high while learning).
+
+    Pre-conditions are tighter than the burning rule:
+
+    - ``goal_id`` must be set (no conversions data → CPA is None →
+      cannot compare).
+    - ``Settings.account_target_cpa_rub`` must be set. None means
+      "operator hasn't told us what good looks like"; firing on
+      every campaign because we don't know the target is pure
+      noise — silently skip.
+    - ``perf.cpa_rub`` must NOT be None. Per the M6 contract,
+      None means "undefined" (zero conversions or zero cost),
+      never "infinity". A regression treating None as infinity
+      would silently nuke every burning campaign as high-CPA
+      instead of letting BurningCampaignRule emit the right
+      HIGH finding.
+    - ``perf.conversions`` must meet ``MIN_CONVERSIONS`` so a
+      single conversion at "high CPA" doesn't trip the rule —
+      it might just be variance, not a sustained issue.
+    - ``perf.cpa_rub`` must exceed the target.
+    """
+
+    rule_id = "high_cpa"
+
+    # Statistical-significance gate. With <5 conversions in the
+    # window, "CPA = 1200 RUB" is a single data point or two —
+    # the operator can't act on it without more evidence. This
+    # threshold becomes a Settings.policy knob in a follow-up.
+    MIN_CONVERSIONS: int = 5
+
+    def check(
+        self,
+        perf: CampaignPerformance,
+        *,
+        goal_id: int | None,
+    ) -> Finding | None:
+        if goal_id is None:
+            return None
+        target = self._settings.account_target_cpa_rub
+        if target is None:
+            return None
+        if perf.cpa_rub is None:
+            return None
+        if perf.conversions < self.MIN_CONVERSIONS:
+            return None
+        if perf.cpa_rub <= target:
+            return None
+
+        excess_per_conversion = perf.cpa_rub - target
+        estimated_impact = excess_per_conversion * perf.conversions
+
+        message = (
+            f"campaign '{perf.campaign_name}' CPA "
+            f"{perf.cpa_rub:.0f} RUB is above target "
+            f"{target:.0f} RUB ({perf.conversions} conversions, "
+            f"~{estimated_impact:.0f} RUB excess spend)"
+        )
+        return Finding(
+            rule_id=self.rule_id,
+            severity=Severity.WARNING,
+            campaign_id=perf.campaign_id,
+            campaign_name=perf.campaign_name,
+            message=message,
+            estimated_impact_rub=estimated_impact,
+        )
+
+
 class HealthCheckService:
     """Run a battery of rules over the M6 account_overview output."""
 
@@ -107,7 +189,10 @@ class HealthCheckService:
         # Order matters for the operator's reading: HIGH-severity rules
         # first so the most-actionable findings cluster at the top of
         # the per-campaign output before the CLI re-sorts globally.
-        self._rules: list[_Rule] = [BurningCampaignRule()]
+        self._rules: list[_Rule] = [
+            BurningCampaignRule(settings),
+            HighCpaRule(settings),
+        ]
 
     async def __aenter__(self) -> Self:
         return self
@@ -144,4 +229,9 @@ class HealthCheckService:
 
 
 # Re-export so monkeypatch in tests targets a stable name.
-__all__ = ["BurningCampaignRule", "HealthCheckService", "ReportingService"]
+__all__ = [
+    "BurningCampaignRule",
+    "HealthCheckService",
+    "HighCpaRule",
+    "ReportingService",
+]
