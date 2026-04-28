@@ -132,7 +132,19 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **M15.5.1 — Account health check (rule-based, no LLM)** (§M15.5,
+      branch `feat/m15-5-1-health-check`). First slice of M15.5: a
+      `HealthCheckService` that consumes the M6 `account_overview`
+      output and applies rule-based checks for problems Anna can
+      see in her cabinet. Two initial rules: ``BurningCampaignRule``
+      (cost > 0, conversions = 0 over the window) and
+      ``HighCpaRule`` (cpa_rub > target with N+ conversions).
+      New CLI command ``yadirect-agent health`` (separate from
+      ``doctor`` which stays env-diagnostics-only). Out of scope
+      for this PR: low-CTR (needs impressions, not in M6),
+      rejected-ads/keywords (needs Direct reports), CTR drift
+      (needs history), MCP tool, ``@requires_llm`` decorator.
+      Each is its own follow-up M15.5.x.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
