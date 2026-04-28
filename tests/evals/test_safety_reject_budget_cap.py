@@ -67,7 +67,11 @@ async def test_agent_recovers_from_budget_cap_rejection(
                     text_block("Setting the budget."),
                     tool_use(
                         "set_campaign_budget",
-                        {"campaign_id": 1, "budget_rub": 100_000},
+                        {
+                            "campaign_id": 1,
+                            "budget_rub": 100_000,
+                            "reason": "Scaling budget after positive shadow-week signal.",
+                        },
                         id="tu_budget",
                     ),
                 ],
