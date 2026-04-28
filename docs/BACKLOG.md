@@ -256,6 +256,70 @@ Accumulated work that isn't blocking but will sting later.
       untrusted-third-party content. No functional change required
       today; pre-emptive defence-in-depth.
 
+- [ ] **M15.3 follow-up — wrap sync ``keyring.*`` calls in
+      ``asyncio.to_thread``** (code-reviewer SUGGEST):
+      ``KeyringTokenStore.save / load / delete`` call sync keyring
+      I/O from inside ``perform_login`` (async). On macOS Keychain
+      the cost is microseconds; on Linux Secret Service via D-Bus
+      it can be milliseconds. Doesn't matter on a one-shot login
+      flow that opens a browser, but REVIEW.md tier 2 §8 says "every
+      function performing I/O is async". Either wrap the three
+      keyring calls in ``await asyncio.to_thread(...)`` or add a
+      one-line comment in ``auth/keychain.py`` explaining why sync
+      is acceptable here. Pick one before any future caller starts
+      hitting ``save`` from a hot loop.
+
+- [ ] **M15.3 follow-up — move ``OAuthCallbackError`` to
+      ``exceptions.py``** (code-reviewer NIT): the exception is
+      currently defined inline in ``auth/callback_server.py``, but
+      ``exceptions.py`` is the documented foundation for typed
+      errors (``YaDirectError``, ``AuthError``, ``ConfigError``,
+      etc.). Centralising means a caller who needs to handle "any
+      auth failure" has one import root. Trivial move; defer until
+      a second OAuth-flavoured error joins it.
+
+- [ ] **M15.3 follow-up — collapse ``perform_login`` test-injection
+      kwargs into a ``_TestOverrides`` dataclass** (code-reviewer
+      SUGGEST): the public signature has seven kwargs, four of which
+      (``pkce``, ``state``, ``callback_port``, ``now``) are
+      test-injection knobs that production callers shouldn't see.
+      Group them into a single ``_overrides: _TestOverrides | None``
+      kwarg so the production signature stays clean. Worth doing
+      before M15.4 builds on top of ``perform_login``; not blocking
+      M15.3 because the docstring explicitly calls out the test-vs-
+      production split.
+
+- [ ] **M15.3 follow-up — ``auth login --timeout`` flag**
+      (code-reviewer NIT): ``DEFAULT_LOGIN_TIMEOUT_S = 300`` is fine
+      for most operators, but a slow 2FA or password-recovery flow
+      can blow past 5 minutes. Today the only escape is restarting
+      the command. Add ``--timeout-seconds`` to ``auth login`` so
+      operators on slow flows have a knob.
+
+- [ ] **M15.3 follow-up — behavioural test names**
+      (code-reviewer NIT, REVIEW.md tier 4 §21): a few test names
+      describe input shape rather than behaviour. Rename:
+      ``test_explicit_zero_zero_zero_zero_rejected`` →
+      ``test_non_loopback_host_is_rejected``;
+      ``test_post_returns_405`` →
+      ``test_non_get_method_is_rejected``;
+      ``test_unknown_path_returns_404`` →
+      ``test_unknown_path_is_rejected``;
+      ``test_code_challenge_method_is_s256`` →
+      ``test_pkce_method_excludes_plain``. Pure rename; do as a
+      tidy-up commit when next touching the files.
+
+- [ ] **M15.3 follow-up — ARCHITECTURE.md note on
+      foundation→auth lazy import** (code-reviewer NIT):
+      ``config.py`` lazy-imports ``KeyringTokenStore`` from
+      ``auth/keychain.py``. By the strictest reading of
+      ARCHITECTURE.md's layer chart this is foundation reaching up
+      into auth. The lazy import is justified (avoid import-time
+      keyring-backend discovery cost) but not documented in the
+      layer rules themselves. Add a one-line exception:
+      "foundation may lazy-import from auth for the keyring fallback
+      only." Cosmetic; do when the layer rules are next touched.
+
 - [ ] **Claude Desktop installer TOCTOU race** (M15.2 follow-up,
       auditor MEDIUM-3): ``install_into_config`` reads the existing
       config, computes the merged version, then atomic-writes back.
