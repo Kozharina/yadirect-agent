@@ -25,6 +25,7 @@ import base64
 import hashlib
 import secrets
 from dataclasses import dataclass
+from urllib.parse import urlencode
 
 # --- Module-level constants ---
 
@@ -86,6 +87,45 @@ def generate_pkce_pair() -> PKCEPair:
     return PKCEPair(verifier=verifier, challenge=challenge)
 
 
+# --- Authorization URL ---
+
+
+def build_authorization_url(*, state: str, code_challenge: str) -> str:
+    """Build the URL that opens the Yandex OAuth consent page.
+
+    ``state`` is the CSRF defence — a fresh random value per login
+    that the local callback server verifies against the value Yandex
+    echoes back. ``code_challenge`` is the PKCE half tied to the
+    verifier the caller keeps in memory until token exchange.
+
+    Both arguments are validated as non-empty: an empty state silently
+    disables CSRF protection (any callback URL would match), and an
+    empty challenge silently disables PKCE (the token endpoint would
+    accept any verifier or none). We refuse at the builder rather
+    than letting either unsafe request go out.
+    """
+    if not state:
+        msg = "state must be a non-empty random string (CSRF defence)"
+        raise ValueError(msg)
+    if not code_challenge:
+        msg = "code_challenge must be non-empty (PKCE protection)"
+        raise ValueError(msg)
+
+    params = {
+        "response_type": "code",
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        # Space-separated per OAuth 2.0 §3.3. Yandex silently truncates
+        # comma-separated scopes to the first entry — a regression here
+        # would leave the agent half-blind without a clear signal.
+        "scope": " ".join(SCOPES),
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": CODE_CHALLENGE_METHOD,
+    }
+    return f"{AUTH_URL}?{urlencode(params)}"
+
+
 __all__ = [
     "AUTH_URL",
     "CLIENT_ID",
@@ -94,5 +134,6 @@ __all__ = [
     "SCOPES",
     "TOKEN_URL",
     "PKCEPair",
+    "build_authorization_url",
     "generate_pkce_pair",
 ]
