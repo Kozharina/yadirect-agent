@@ -25,7 +25,15 @@ import base64
 import hashlib
 import secrets
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any
 from urllib.parse import urlencode
+
+import httpx
+from pydantic import SecretStr
+
+from ..exceptions import ApiTransientError, AuthError
+from ..models.auth import TokenSet
 
 # --- Module-level constants ---
 
@@ -126,6 +134,141 @@ def build_authorization_url(*, state: str, code_challenge: str) -> str:
     return f"{AUTH_URL}?{urlencode(params)}"
 
 
+# --- Token exchange ---
+
+
+# Auth-server status codes that indicate a logical OAuth error
+# rather than a transport problem. RFC 6749 §5.2 maps these to the
+# ``error_description`` body — we surface that to the operator so
+# the CLI can print a useful message rather than "HTTP 400".
+_OAUTH_ERROR_STATUSES: frozenset[int] = frozenset({400, 401, 403})
+
+# Per-call timeout for the Yandex OAuth endpoint. 30s is enough for
+# Yandex's worst observed latency on token exchange while staying
+# below pytest's per-test 10s timeout under normal mocked conditions.
+_DEFAULT_OAUTH_TIMEOUT_S: float = 30.0
+
+
+async def _do_oauth_request(payload: dict[str, str]) -> httpx.Response:
+    """Issue the form-encoded POST to the Yandex token endpoint.
+
+    Wrapped in its own helper so ``exchange_code_for_token`` and
+    ``refresh_access_token`` share the transport-error mapping
+    without a class. The httpx-side timeout (``_DEFAULT_OAUTH_TIMEOUT_S``)
+    is passed via the client constructor; an ASYNC109 ``timeout=``
+    parameter on the public function would just shadow the same
+    knob without adding anything.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_DEFAULT_OAUTH_TIMEOUT_S) as client:
+            return await client.post(TOKEN_URL, data=payload)
+    except httpx.TimeoutException as exc:
+        msg = f"timeout calling Yandex OAuth token endpoint: {exc}"
+        raise ApiTransientError(msg) from exc
+    except httpx.TransportError as exc:
+        msg = f"transport error against Yandex OAuth: {exc}"
+        raise ApiTransientError(msg) from exc
+
+
+def _raise_for_oauth_error(response: httpx.Response) -> None:
+    """Map Yandex OAuth status + body to AuthError / ApiTransientError.
+
+    Splits the auth-vs-transient decision: 4xx (the operator must
+    redo ``auth login``) becomes ``AuthError``; everything else
+    non-2xx surfaces as ``ApiTransientError`` so the CLI can suggest
+    a retry rather than a fix.
+    """
+    if response.status_code == 200:
+        return
+    if response.status_code in _OAUTH_ERROR_STATUSES:
+        try:
+            payload: dict[str, Any] = response.json()
+        except ValueError:
+            payload = {}
+        error = str(payload.get("error", "oauth_error"))
+        description = payload.get("error_description")
+        message = f"OAuth error: {error}"
+        if description:
+            message += f" — {description}"
+        raise AuthError(message, code=response.status_code)
+    msg = f"Yandex OAuth token endpoint returned HTTP {response.status_code}"
+    raise ApiTransientError(msg, code=response.status_code)
+
+
+def _parse_token_payload(payload: dict[str, Any], *, obtained_at: datetime) -> TokenSet:
+    """Construct a TokenSet from the parsed JSON body.
+
+    Errors here are server-side regressions or our parser drifting
+    from Yandex's actual response shape. We surface them as
+    ``ApiTransientError`` so the operator can retry, while keeping
+    the original cause for debug logs via ``raise from``.
+    """
+    try:
+        access = payload["access_token"]
+        refresh = payload["refresh_token"]
+        expires_in = int(payload["expires_in"])
+    except (KeyError, TypeError, ValueError) as exc:
+        msg = f"malformed token response from Yandex OAuth: {exc}"
+        raise ApiTransientError(msg) from exc
+
+    scope_value = payload.get("scope")
+    if scope_value:
+        # Yandex echoes the GRANTED scope set when it differs from
+        # what we requested (user denied a checkbox). Use it
+        # verbatim so the agent later does not 403 trying to write
+        # to a denied surface.
+        scope: tuple[str, ...] = tuple(str(scope_value).split())
+    else:
+        scope = SCOPES
+
+    expires_at = obtained_at + timedelta(seconds=expires_in)
+    return TokenSet(
+        access_token=SecretStr(access),
+        refresh_token=SecretStr(refresh),
+        token_type=str(payload.get("token_type", "bearer")),
+        scope=scope,
+        obtained_at=obtained_at,
+        expires_at=expires_at,
+    )
+
+
+async def exchange_code_for_token(
+    *,
+    code: str,
+    code_verifier: str,
+    now: datetime | None = None,
+) -> TokenSet:
+    """Exchange an authorization code for a TokenSet.
+
+    Called once per ``auth login``: the local callback server hands
+    us the ``code`` Yandex sent to our ``REDIRECT_URI``, and the
+    ``code_verifier`` that pairs with the ``code_challenge`` we sent
+    at authorize time. The verifier proves to Yandex that we are the
+    same client that started the flow — which is what makes the
+    public-client + loopback-redirect combination secure.
+
+    Not auto-retried: a consumed authorization code cannot be
+    replayed. On transient failure, the CLI surfaces "try again" to
+    the operator; on auth failure, "redo login".
+    """
+    obtained_at = now if now is not None else datetime.now(UTC)
+    payload = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "code_verifier": code_verifier,
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+    }
+    response = await _do_oauth_request(payload)
+    _raise_for_oauth_error(response)
+    try:
+        body: dict[str, Any] = response.json()
+    except ValueError as exc:
+        msg = f"non-JSON response from Yandex OAuth: {response.text[:200]!r}"
+        raise ApiTransientError(msg) from exc
+    return _parse_token_payload(body, obtained_at=obtained_at)
+
+
 __all__ = [
     "AUTH_URL",
     "CLIENT_ID",
@@ -135,5 +278,6 @@ __all__ = [
     "TOKEN_URL",
     "PKCEPair",
     "build_authorization_url",
+    "exchange_code_for_token",
     "generate_pkce_pair",
 ]
