@@ -39,6 +39,7 @@ from rich.markup import escape as _rich_escape
 from rich.table import Table
 
 from .. import __version__
+from ..agent.cost import CostStore
 from ..agent.executor import (
     InvalidPlanStateError,
     PlanRejected,
@@ -55,6 +56,7 @@ from ..models.health import default_window
 from ..rollout import RolloutState, RolloutStateStore
 from ..services.campaigns import CampaignService, CampaignSummary
 from ..services.health_check import HealthCheckService
+from .cost import aggregate_for_status, render_status_json, render_status_text
 from .doctor import (
     CheckResult,
     check_anthropic,
@@ -277,6 +279,49 @@ def health_cmd(
 
     if report.findings_by_severity(_Sev.HIGH):
         raise typer.Exit(code=1)
+
+
+# --------------------------------------------------------------------------
+# `cost` subapp — LLM spend tracking (M21).
+# --------------------------------------------------------------------------
+
+
+cost_app = typer.Typer(
+    name="cost",
+    help="Inspect LLM spend across agent runs.",
+    no_args_is_help=True,
+)
+app.add_typer(cost_app, name="cost")
+
+
+def _cost_store(settings: Settings) -> CostStore:
+    """Standard location: sibling to the audit log."""
+    path = settings.audit_log_path.parent / "cost.jsonl"
+    return CostStore(path)
+
+
+@cost_app.command("status")
+def cost_status_cmd(
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit JSON instead of formatted output."),
+    ] = False,
+) -> None:
+    """Show current and previous month LLM spend, with end-of-month projection.
+
+    Honours ``AGENT_MONTHLY_LLM_BUDGET_RUB`` to color-code current vs budget.
+    No enforcement happens here — this is observability only. Hard
+    auto-degrade to ``--no-llm`` mode is M21.2 follow-up.
+    """
+    settings = _bootstrap_settings()
+    store = _cost_store(settings)
+    records = store.all_records()
+    summaries = aggregate_for_status(records)
+
+    if as_json:
+        typer.echo(render_status_json(summaries, settings))
+    else:
+        render_status_text(_out, summaries, settings)
 
 
 # --------------------------------------------------------------------------
