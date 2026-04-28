@@ -37,11 +37,8 @@ demo-only, technically; it cannot be handed to a non-developer.
       Trusted Publisher and push first ``v0.1.0`` tag (see
       Blocked / waiting).
 - [x] ~~**M15.2 — `install-into-claude-desktop`**~~ — shipped, see Done.
-- [ ] **M15.3 — Standard OAuth flow with keyring**: register one
-      OAuth-app project-side (Direct + Metrika scopes), local
-      ``localhost:8765/callback`` HTTP server during ``auth login``,
-      tokens stored in OS keychain via ``python-keyring``.
-      ``Settings`` reads from keyring with env-var fallback.
+- [x] ~~**M15.3 — Standard OAuth flow with keyring**~~ — shipped,
+      see Done.
 - [ ] **M15.4 — Conversational MCP onboarding**: ``start_onboarding()``
       MCP-tool that triggers M15.3 if needed, collects
       ``BusinessProfile`` via Q&A, proposes a sensible
@@ -196,6 +193,34 @@ the PR merges or is abandoned.
 ## Tech debt / follow-ups
 
 Accumulated work that isn't blocking but will sting later.
+
+- [ ] **M15.3 follow-up — auto-refresh on 401 in DirectApiClient**:
+      ``clients/oauth.py:refresh_access_token`` ships in M15.3 but
+      is not wired into the retry path. Yandex access tokens last
+      ~year so this is rarely-needed in practice, but a long-idle
+      operator who runs the agent after a year sees an opaque
+      ``AuthError`` on the first call instead of a transparent
+      refresh. Fix: in ``DirectApiClient`` and ``MetrikaService``,
+      catch ``AuthError`` from the inner request, call
+      ``refresh_access_token`` with the stored refresh, persist the
+      new TokenSet via ``KeyringTokenStore.save``, retry the
+      original request once. Single retry, never an infinite loop.
+- [ ] **M15.3 follow-up — headless / Docker fallback printer**:
+      the ``on_browser_open`` hook lets the orchestrator be redirected
+      somewhere other than ``webbrowser.open``, but the CLI does
+      not currently detect headless / no-DISPLAY environments. Add
+      a check (``os.environ.get("DISPLAY")`` on Linux, similar
+      heuristics on macOS/Windows) and, when no browser is
+      available, render the auth URL to stdout with a clear copy-
+      paste hint instead of silently launching nothing. Lands as
+      part of M15.4 conversational onboarding or earlier if Anna
+      tries from a headless machine before then.
+- [ ] **M15.3 follow-up — auth status shows time-until-expiry**:
+      ``auth status`` prints ``expires_at`` as an ISO timestamp;
+      operators have to mentally diff against today. Add a
+      humanised "expires in N months" computed from
+      ``datetime.now(UTC)`` so the operator can plan ahead at a
+      glance. Cheap; defer until someone asks.
 
 - [ ] **Claude Desktop installer TOCTOU race** (M15.2 follow-up,
       auditor MEDIUM-3): ``install_into_config`` reads the existing
@@ -715,6 +740,83 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M15.3 — Standard OAuth flow with keyring** (§M15.3, Phase 0+1,
+      release 0.2.0). Public-client PKCE flow ships end-to-end —
+      ``yadirect-agent auth login`` opens the operator's browser to
+      ``oauth.yandex.ru/authorize``, catches the redirect on a local
+      one-shot server at ``localhost:8765/callback``, exchanges the
+      code for a TokenSet, and persists it in the OS keychain.
+      ``Settings`` hydrates empty token fields from the keychain
+      automatically, so ``.env`` no longer needs ``YANDEX_DIRECT_TOKEN``
+      / ``YANDEX_METRIKA_TOKEN`` after the first login.
+
+      Seven layers, each landed as its own red→green TDD pair:
+
+      1. ``models/auth.py`` — frozen ``TokenSet`` with SecretStr
+         (logger masks ``**********``), ``to_storage_dict``
+         (exposes secrets explicitly for keychain persistence),
+         ``from_storage_dict`` (``extra="forbid"``, validates
+         tz-aware datetimes + non-empty scope + ``obtained_at <=
+         expires_at``), ``needs_refresh`` (60s leeway pulls refresh
+         forward so we never present a token that will expire
+         mid-request).
+      2. ``clients/oauth.py`` — public CLIENT_ID + REDIRECT_URI +
+         SCOPES + AUTH_URL + TOKEN_URL constants pinned to the
+         Yandex-side OAuth app registration; PKCE generator using
+         ``secrets.token_urlsafe(32)`` (256 bits entropy, RFC 7636
+         compliant); ``build_authorization_url`` enforces non-empty
+         state + challenge at the call site; ``exchange_code_for_token``
+         and ``refresh_access_token`` over HTTPS-pinned
+         ``oauth.yandex.ru/token`` with shared error mapping
+         (4xx → AuthError, 5xx / network → ApiTransientError).
+      3. ``auth/keychain.py`` — ``KeyringTokenStore`` single-slot
+         JSON blob under service=``yadirect-agent``,
+         username=``oauth``. ``load`` collapses missing / corrupt /
+         invalid into ``None`` + structlog warning so callers handle
+         one recovery path; ``revoke`` idempotent (no-record signal
+         from ``PasswordDeleteError`` swallowed).
+      4. ``auth/callback_server.py`` — one-shot HTTP/1.1 server
+         (``asyncio.start_server`` + hand-rolled GET parser,
+         ~30 LOC instead of an aiohttp dependency) bound to
+         ``127.0.0.1`` only; constructor refuses ``0.0.0.0`` with
+         ValueError; CSRF state-match enforced; Yandex
+         ``?error=...`` propagated as ``OAuthCallbackError``;
+         method/path locked to ``GET /callback`` (405 / 404
+         otherwise); ``wait_for_code(timeout_seconds)`` so a
+         closed-tab does not block forever.
+      5. ``auth/login_flow.py`` — ``perform_login`` orchestrator
+         ties PKCE → server → consent → exchange → keychain into
+         one async function. ``DEFAULT_CALLBACK_PORT=8765`` matches
+         Yandex's exact-match enforcement on REDIRECT_URI; tests
+         pass an ephemeral port via ``socket.bind((127.0.0.1, 0))``
+         so they cannot collide with a live ``auth login``.
+      6. ``cli/auth.py`` — typer subapp ``auth login | status |
+         revoke`` with cron-friendly exit codes (0 success / 1
+         not-logged-in / 2 login-failure). Operator-facing Russian
+         strings live as module-level constants (file-scoped
+         ``ruff: noqa: RUF001, RUF003``); error causes
+         (``access_denied``, ``invalid_grant``, "timeout") flow to
+         stderr so the operator sees the cause, not a generic
+         "error". Secrets NEVER reach stdout/stderr in any path —
+         tests assert the absence of plaintext access / refresh
+         tokens across human and ``--json`` output.
+      7. ``config.py`` — ``model_validator(mode="after")`` lazily
+         imports ``KeyringTokenStore`` (avoiding the import-time
+         backend-discovery cost on every Settings()) and hydrates
+         empty ``yandex_direct_token`` / ``yandex_metrika_token``
+         from the keychain. Env wins, fail-soft on any backend
+         hiccup so a corrupt keychain row cannot brick ``auth
+         revoke`` — the recovery path. Per-field independence so
+         mixed env+keyring deployments stay supported.
+
+      85 new tests, 895 total green; mypy strict; ruff clean.
+      Out of scope (BACKLOG'd as separate items): auto-refresh
+      wiring into ``DirectApiClient`` retry loop (current TokenSet
+      lasts ~year, refresh on 401 is a follow-up), MCP
+      ``start_onboarding`` (M15.4), built-in scheduler (M15.6),
+      headless / Docker fallback prompt (the hook is in place via
+      ``on_browser_open`` but the fallback printer + URL-copy hint
+      live in M15.4).
 - [x] **M21 — Cost tracking (slice 1)** (§M21, Phase 0+1, release
       0.2.0). Per-call CostRecord (timestamp, trace_id aligned
       with AgentRun, model, input/output/cached tokens, pricing

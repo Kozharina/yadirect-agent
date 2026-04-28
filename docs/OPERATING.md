@@ -255,11 +255,48 @@ rollout_stage: shadow
 ```
 
 Set the required env vars (in your shell profile, a `.envrc`, or
-the MCP `env` block below):
+the MCP `env` block below). Two paths are supported:
+
+**Recommended — interactive OAuth (M15.3):**
+
+```bash
+yadirect-agent auth login
+```
+
+Opens your default browser to Yandex's consent page, runs a
+one-shot HTTP server on `localhost:8765` to catch the redirect,
+exchanges the code for an access token, and stores it in your OS
+keychain (Keychain on macOS, Credential Manager on Windows,
+Secret Service / KWallet / GNOME Keyring on Linux). After this,
+`Settings` reads the token automatically — no
+`YANDEX_DIRECT_TOKEN` / `YANDEX_METRIKA_TOKEN` needed in
+environment.
+
+```bash
+yadirect-agent auth status     # check token (masked) and expiry
+yadirect-agent auth revoke     # clear keychain entry
+```
+
+Exit codes for cron / wrappers: `auth login` exits 0 on success,
+2 on user-denied / callback-timeout / invalid-grant; `auth status`
+exits 0 when logged in and 1 when not (alert on this from cron);
+`auth revoke` always exits 0 (idempotent).
+
+**Alternative — env vars** (CI / Docker / headless contexts):
 
 ```bash
 export YANDEX_DIRECT_TOKEN='...'
 export YANDEX_METRIKA_TOKEN='...'
+```
+
+Env values win over the keychain when both are present, so a CI
+override never collides with a stale local-machine token. The
+keychain hydration is fail-soft — a missing or corrupt entry
+keeps `Settings` booting without crashing.
+
+**Common to both paths:**
+
+```bash
 export ANTHROPIC_API_KEY='...'      # required by the agent loop; MCP server itself doesn't need it
 export YANDEX_USE_SANDBOX=true       # ALWAYS start in sandbox
 export AGENT_MAX_DAILY_BUDGET_RUB=5000
