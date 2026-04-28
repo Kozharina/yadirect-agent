@@ -5,6 +5,9 @@ Design choices:
 - No global singleton — we pass Settings into clients/services via DI so
   tests can swap it out cleanly.
 - SecretStr for tokens so they never accidentally end up in logs.
+- M15.3: empty token fields hydrate from the OS keychain via
+  ``KeyringTokenStore``. Env-supplied values still win — the keychain
+  is the no-config-needed default, not an override.
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ import math
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -126,6 +129,54 @@ class Settings(BaseSettings):
             msg = f"value must be finite, got {v!r}"
             raise ValueError(msg)
         return v
+
+    @model_validator(mode="after")
+    def _hydrate_tokens_from_keyring(self) -> Settings:
+        """Pull access_token from the OS keychain into empty token slots (M15.3).
+
+        Per-field independence: ``yandex_direct_token`` and
+        ``yandex_metrika_token`` are evaluated separately so a mixed
+        deployment (one in env, one in keyring) keeps working. The
+        single OAuth grant covers both APIs (scopes ``direct:api``
+        + ``metrika:read`` + ``metrika:write``), so the SAME
+        access_token populates both empty fields.
+
+        Fail-soft: if the keychain backend is unavailable, the slot
+        is empty, or the payload is corrupt, both tokens stay empty.
+        That preserves the pre-M15.3 boot path for read-only CLI
+        commands (``--version``, ``mcp serve``) and matches the
+        defensive contract ``KeyringTokenStore.load`` already
+        documents.
+
+        Imported lazily inside the function to avoid pulling the
+        keyring stack into every Settings import (the import-time
+        side effect of locating the OS backend can be slow on
+        some Linux desktops).
+        """
+        if (
+            self.yandex_direct_token.get_secret_value() != ""
+            and self.yandex_metrika_token.get_secret_value() != ""
+        ):
+            return self
+
+        try:
+            from .auth.keychain import KeyringTokenStore
+        except ImportError:
+            return self
+
+        try:
+            token = KeyringTokenStore().load()
+        except Exception:
+            return self
+        if token is None:
+            return self
+
+        access = token.access_token
+        if self.yandex_direct_token.get_secret_value() == "":
+            self.yandex_direct_token = access
+        if self.yandex_metrika_token.get_secret_value() == "":
+            self.yandex_metrika_token = access
+        return self
 
 
 def get_settings() -> Settings:
