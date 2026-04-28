@@ -141,7 +141,18 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **M20 — Human-readable rationale (slice 1)** (§M20, branch
+      `feat/m20-rationale`). First slice of M20: ``Rationale``
+      model + ``RationaleStore`` (JSONL, append-only, indexed by
+      decision_id) + soft-optional emission from
+      ``@requires_plan`` (caller passes ``rationale=...``; if
+      omitted, structlog warning but operation continues — strict
+      ``no rationale → no plan`` enforcement is a follow-up after
+      callers update). New CLI subcommand
+      ``yadirect-agent rationale show|list``. Out of scope:
+      MCP ``explain_decision`` tool, auto-populated
+      ``policy_slack`` from safety pipeline, M20.4 notifications
+      integration.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
