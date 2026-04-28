@@ -222,6 +222,40 @@ Accumulated work that isn't blocking but will sting later.
       ``datetime.now(UTC)`` so the operator can plan ahead at a
       glance. Cheap; defer until someone asks.
 
+- [ ] **M15.3 follow-up — header-drain iteration cap in callback
+      server** (auditor LOW-1): ``LocalCallbackServer._handle``
+      drains request headers via an unbounded ``while True``
+      loop. ``StreamReader._DEFAULT_LIMIT`` caps each line at
+      64 KB but not the count, so an automated scanner or a
+      confused HTTP client can stall the server with thousands
+      of one-byte header lines. Single-operator local-trust
+      threat model makes this LOW, but pair it with a hard
+      counter (``if header_count > 100: break``) before the
+      first deployment that exposes the loopback to anything
+      other than the operator's own browser.
+
+- [ ] **M15.3 follow-up — narrow `suppress(Exception)` on
+      writer close** (auditor LOW-2): ``_handle``'s ``finally``
+      block wraps ``writer.close()`` + ``wait_closed()`` in
+      ``with suppress(Exception)``. ``asyncio.CancelledError``
+      inherits from ``BaseException`` so it correctly propagates,
+      but if ``wait_closed()`` raises an unexpected ``OSError``
+      from a broken pipe, it is silently discarded — could mask
+      a stalled-header-drain (LOW-1) symptom during dev. Narrow
+      to ``suppress(OSError, ConnectionResetError)`` and let
+      other exceptions propagate so they surface in test logs.
+
+- [ ] **M15.3 follow-up — trim Yandex error_description before
+      surfacing** (auditor LOW-2-second-pass): ``_raise_for_oauth_error``
+      in ``clients/oauth.py`` echoes Yandex's ``error_description``
+      verbatim into the ``AuthError`` message. ``_rich_escape``
+      handles the Rich-markup case in the CLI, but the raw string
+      also lives in ``exc.args[0]`` and would propagate through
+      structlog if any future handler logs the exception. Truncate
+      ``error_description`` to ~256 chars and mark it as
+      untrusted-third-party content. No functional change required
+      today; pre-emptive defence-in-depth.
+
 - [ ] **Claude Desktop installer TOCTOU race** (M15.2 follow-up,
       auditor MEDIUM-3): ``install_into_config`` reads the existing
       config, computes the merged version, then atomic-writes back.
