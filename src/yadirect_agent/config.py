@@ -9,6 +9,7 @@ Design choices:
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Literal
 
@@ -82,6 +83,19 @@ class Settings(BaseSettings):
     @classmethod
     def _ensure_log_dir(cls, v: Path) -> Path:
         v.parent.mkdir(parents=True, exist_ok=True)
+        return v
+
+    @field_validator("account_target_cpa_rub")
+    @classmethod
+    def _reject_non_finite_cpa(cls, v: float | None) -> float | None:
+        # ``Field(default=None, gt=0)`` rejects 0 and negative values,
+        # but not IEEE-754 specials: ``math.inf > 0`` is True (silently
+        # accepted by gt=0), and ``math.nan`` comparison semantics are
+        # asymmetric in ways that break rule short-circuits. Reject
+        # non-finite explicitly. (auditor M15.5.1 MEDIUM-2.)
+        if v is not None and not math.isfinite(v):
+            msg = f"account_target_cpa_rub must be a finite positive number, got {v!r}"
+            raise ValueError(msg)
         return v
 
 
