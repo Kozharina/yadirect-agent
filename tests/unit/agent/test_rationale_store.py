@@ -47,8 +47,14 @@ def _rationale(
 class TestAppendAndGet:
     def test_append_then_get_round_trips(self, tmp_path: Path) -> None:
         store = RationaleStore(tmp_path / "rationale.jsonl")
-        original = _rationale(
+        # Build a rich rationale directly (not via _rationale helper)
+        # so we can exercise the JSON round-trip on inputs + confidence.
+        original = Rationale(
             decision_id="abc123",
+            action="campaigns.set_daily_budget",
+            resource_type="campaign",
+            resource_ids=[42],
+            summary="full round-trip exemplar",
             inputs=[
                 InputDataPoint(
                     name="cpa",
@@ -56,9 +62,7 @@ class TestAppendAndGet:
                     source="metrika",
                     observed_at=datetime(2026, 4, 20, 12, 0, tzinfo=UTC),
                 ),
-            ]
-            if False
-            else [],
+            ],
             confidence=Confidence.HIGH,
         )
 
@@ -68,6 +72,9 @@ class TestAppendAndGet:
         assert loaded is not None
         assert loaded.decision_id == "abc123"
         assert loaded.action == original.action
+        assert loaded.confidence == Confidence.HIGH
+        assert len(loaded.inputs) == 1
+        assert loaded.inputs[0].name == "cpa"
 
     def test_get_missing_returns_none(self, tmp_path: Path) -> None:
         store = RationaleStore(tmp_path / "rationale.jsonl")
