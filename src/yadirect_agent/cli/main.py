@@ -45,6 +45,7 @@ from ..agent.executor import (
 )
 from ..agent.loop import Agent, AgentLoopError, AgentRun
 from ..agent.plans import OperationPlan, PendingPlansStore
+from ..agent.rationale_store import RationaleStore
 from ..agent.tools import build_default_registry, build_safety_pair
 from ..audit import AuditEvent, AuditSink, audit_action
 from ..config import Settings, get_settings
@@ -61,6 +62,7 @@ from .doctor import (
     check_policy_file,
 )
 from .health import render_report_json, render_report_text
+from .rationale import render_list_text, render_show_json, render_show_text
 
 app = typer.Typer(
     name="yadirect-agent",
@@ -478,6 +480,95 @@ def _render_plan_detail(plan: OperationPlan) -> None:
     if plan.args:
         _out.print("[bold]args:[/bold]")
         _out.print(_compact_json(plan.args))
+
+
+# --------------------------------------------------------------------------
+# `rationale` subapp — read-back of recorded decision rationales (M20.3 slice).
+# --------------------------------------------------------------------------
+
+
+rationale_app = typer.Typer(
+    name="rationale",
+    help="Inspect recorded rationales for past agent decisions.",
+    no_args_is_help=True,
+)
+app.add_typer(rationale_app, name="rationale")
+
+
+def _rationale_store(settings: Settings) -> RationaleStore:
+    """Standard location: next to the audit log."""
+    path = settings.audit_log_path.parent / "rationale.jsonl"
+    return RationaleStore(path)
+
+
+@rationale_app.command("show")
+def rationale_show_cmd(
+    decision_id: Annotated[
+        str,
+        typer.Argument(help="decision_id (== plan_id of the original plan)."),
+    ],
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit JSON to stdout instead of formatted text."),
+    ] = False,
+) -> None:
+    """Show the full rationale for one decision."""
+    settings = _bootstrap_settings()
+    store = _rationale_store(settings)
+    rationale = store.get(decision_id)
+    if rationale is None:
+        _err.print(f"[red]no rationale with decision_id {decision_id!r}[/red]")
+        raise typer.Exit(code=1)
+
+    if as_json:
+        typer.echo(render_show_json(rationale))
+    else:
+        render_show_text(_out, rationale)
+
+
+@rationale_app.command("list")
+def rationale_list_cmd(
+    days: Annotated[
+        int,
+        typer.Option(
+            "--days",
+            min=1,
+            max=365,
+            help="Window length, ending now. Default 7.",
+        ),
+    ] = 7,
+    campaign: Annotated[
+        int | None,
+        typer.Option(
+            "--campaign",
+            min=1,
+            help="Filter to rationales whose resource_ids include this campaign.",
+        ),
+    ] = None,
+) -> None:
+    """List recent rationales, newest first."""
+    settings = _bootstrap_settings()
+    store = _rationale_store(settings)
+
+    if campaign is not None:
+        # Defence in depth: typer ``min=1`` already rejects ``--days 0``,
+        # but the campaign branch goes via ``list_for_resource`` (no
+        # built-in window guard) rather than ``list_recent`` (which has
+        # one). Refusing here mirrors the behaviour the non-campaign
+        # branch enforces through the store. (auditor M20 MEDIUM-1.)
+        if days <= 0:
+            _err.print("[red]--days must be >= 1[/red]")
+            raise typer.Exit(code=1)
+        rationales = store.list_for_resource(campaign_id=campaign)
+        # Apply the day window client-side after the campaign filter.
+        from datetime import UTC, datetime, timedelta
+
+        cutoff = datetime.now(UTC) - timedelta(days=days)
+        rationales = [r for r in rationales if r.timestamp >= cutoff]
+    else:
+        rationales = store.list_recent(days=days)
+
+    render_list_text(_out, rationales)
 
 
 # --------------------------------------------------------------------------
