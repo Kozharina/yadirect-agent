@@ -313,3 +313,177 @@ class TestBurningCampaignRule:
             f.campaign_id for f in report.findings if f.rule_id == "burning_campaign"
         )
         assert burning_ids == [51, 73]
+
+
+# --------------------------------------------------------------------------
+# HighCpaRule.
+# --------------------------------------------------------------------------
+
+
+def _settings_with_target(settings: Settings, target_cpa: float) -> Settings:
+    """Settings copy with account_target_cpa_rub set."""
+    return settings.model_copy(update={"account_target_cpa_rub": target_cpa})
+
+
+class TestHighCpaRule:
+    async def test_flags_campaign_above_target_cpa(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Target 600 RUB; campaign at 1200 = 2× target with enough
+        # conversions to be statistically meaningful. Must produce a
+        # WARNING-severity finding (not HIGH — the campaign is converting,
+        # just expensively).
+        expensive = _perf(
+            campaign_id=51,
+            name="non-brand",
+            clicks=200,
+            cost_rub=12000.0,
+            conversions=10,
+            cpa_rub=1200.0,
+            cr_pct=5.0,
+        )
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[expensive]))
+
+        async with HealthCheckService(_settings_with_target(settings, 600.0)) as svc:
+            report = await svc.run_account_check(date_range=_WEEK, goal_id=100)
+
+        high_cpa_findings = [f for f in report.findings if f.rule_id == "high_cpa"]
+        assert len(high_cpa_findings) == 1
+        finding = high_cpa_findings[0]
+        assert finding.severity == Severity.WARNING
+        assert finding.campaign_id == 51
+        assert finding.campaign_name == "non-brand"
+        # Estimated impact = excess cost over target = 10 × (1200 - 600) = 6000
+        assert finding.estimated_impact_rub == pytest.approx(6000.0)
+        assert "1200" in finding.message
+        assert "600" in finding.message  # the target
+
+    async def test_does_not_flag_within_target(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        on_target = _perf(
+            campaign_id=42,
+            name="brand",
+            clicks=120,
+            cost_rub=850.0,
+            conversions=5,
+            cpa_rub=170.0,
+        )
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[on_target]))
+
+        async with HealthCheckService(_settings_with_target(settings, 600.0)) as svc:
+            report = await svc.run_account_check(date_range=_WEEK, goal_id=100)
+
+        high_cpa_findings = [f for f in report.findings if f.rule_id == "high_cpa"]
+        assert high_cpa_findings == []
+
+    async def test_skips_when_target_not_configured(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Settings.account_target_cpa_rub is None (default). The rule
+        # MUST silently skip — firing on every campaign because we
+        # don't know the target would be pure noise.
+        expensive = _perf(
+            campaign_id=51,
+            name="non-brand",
+            clicks=200,
+            cost_rub=12000.0,
+            conversions=10,
+            cpa_rub=1200.0,
+        )
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[expensive]))
+
+        async with HealthCheckService(settings) as svc:  # no target
+            report = await svc.run_account_check(date_range=_WEEK, goal_id=100)
+
+        high_cpa_findings = [f for f in report.findings if f.rule_id == "high_cpa"]
+        assert high_cpa_findings == []
+
+    async def test_skips_below_min_conversions(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Statistical-significance gate: a campaign with 1 conversion
+        # at "1200 RUB CPA" might just be unlucky variance. Below the
+        # min_conversions threshold the rule treats CPA as noise and
+        # skips. Without this, every brand-new campaign with 1
+        # conversion would trip immediately.
+        too_few_conversions = _perf(
+            campaign_id=51,
+            name="new",
+            clicks=15,
+            cost_rub=2400.0,
+            conversions=2,  # below default min_conversions
+            cpa_rub=1200.0,
+        )
+        _patch_reporting(
+            monkeypatch,
+            _FakeReportingService(overview=[too_few_conversions]),
+        )
+
+        async with HealthCheckService(_settings_with_target(settings, 600.0)) as svc:
+            report = await svc.run_account_check(date_range=_WEEK, goal_id=100)
+
+        high_cpa_findings = [f for f in report.findings if f.rule_id == "high_cpa"]
+        assert high_cpa_findings == []
+
+    async def test_skips_when_cpa_unknown(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # cpa_rub is None per M6 contract on zero conversions / zero
+        # cost. The high-CPA rule MUST treat None as "unknown — skip",
+        # never as "infinity > target — flag". This is the contract
+        # M6 was written against; a regression here would silently
+        # nuke every burning campaign as "high CPA" instead of
+        # letting BurningCampaignRule produce the right HIGH finding.
+        zero_conv = _perf(
+            campaign_id=51,
+            name="burning",
+            clicks=80,
+            cost_rub=2400.0,
+            conversions=0,
+            cpa_rub=None,
+        )
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[zero_conv]))
+
+        async with HealthCheckService(_settings_with_target(settings, 600.0)) as svc:
+            report = await svc.run_account_check(date_range=_WEEK, goal_id=100)
+
+        high_cpa_findings = [f for f in report.findings if f.rule_id == "high_cpa"]
+        # The campaign IS flagged as burning by the other rule,
+        # but NOT as high-CPA — those are different conditions.
+        assert high_cpa_findings == []
+        burning = [f for f in report.findings if f.rule_id == "burning_campaign"]
+        assert len(burning) == 1
+
+    async def test_skips_when_no_goal_provided(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Same gate as burning rule: no goal_id → conversions are 0
+        # by construction → CPA is None → can't compare to target.
+        looks_expensive = _perf(
+            campaign_id=51,
+            name="non-brand",
+            clicks=200,
+            cost_rub=12000.0,
+            conversions=10,
+            cpa_rub=1200.0,
+        )
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[looks_expensive]))
+
+        async with HealthCheckService(_settings_with_target(settings, 600.0)) as svc:
+            report = await svc.run_account_check(date_range=_WEEK, goal_id=None)
+
+        high_cpa_findings = [f for f in report.findings if f.rule_id == "high_cpa"]
+        assert high_cpa_findings == []

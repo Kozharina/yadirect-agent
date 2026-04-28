@@ -38,6 +38,14 @@ class Settings(BaseSettings):
     # (agency mode) territory.
     yandex_metrika_counter_id: int | None = Field(default=None, ge=1)
 
+    # M15.5.1 health check — account-wide target CPA in RUB. Used by
+    # the high-CPA rule to flag campaigns spending above the operator's
+    # acceptable cost-per-acquisition. Optional; rules that need it
+    # silently skip when None — better than firing on every campaign.
+    # A future M11 milestone will add per-campaign targets that override
+    # this account-wide value.
+    account_target_cpa_rub: float | None = Field(default=None, gt=0)
+
     # --- Anthropic ---
     anthropic_api_key: SecretStr = Field(default=SecretStr(""))
     anthropic_model: str = "claude-opus-4-7"
