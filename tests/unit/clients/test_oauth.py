@@ -39,6 +39,7 @@ from yadirect_agent.clients.oauth import (
     build_authorization_url,
     exchange_code_for_token,
     generate_pkce_pair,
+    refresh_access_token,
 )
 from yadirect_agent.exceptions import ApiTransientError, AuthError
 
@@ -359,3 +360,83 @@ class TestExchangeCodeForToken:
 
         with pytest.raises(ApiTransientError):
             await exchange_code_for_token(code="c", code_verifier="v", now=_FROZEN_NOW)
+
+
+class TestRefreshAccessToken:
+    @respx.mock
+    async def test_success_returns_fresh_tokenset(self) -> None:
+        # Yandex returns a fresh access_token (and usually a fresh
+        # refresh_token too — Yandex rotates refresh on use, like
+        # most OAuth providers). The new TokenSet replaces the old
+        # one in keychain.
+        respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(
+                200,
+                json=_success_payload(
+                    access="AQAA-NEW-access",
+                    refresh="1.AQAA-NEW-refresh",
+                    expires_in=31_536_000,
+                ),
+            ),
+        )
+
+        ts = await refresh_access_token(
+            refresh_token="1.AQAA-OLD-refresh",
+            now=_FROZEN_NOW,
+        )
+
+        assert ts.access_token.get_secret_value() == "AQAA-NEW-access"
+        assert ts.refresh_token.get_secret_value() == "1.AQAA-NEW-refresh"
+        assert ts.obtained_at == _FROZEN_NOW
+        assert ts.expires_at == _FROZEN_NOW + timedelta(seconds=31_536_000)
+
+    @respx.mock
+    async def test_request_uses_grant_type_refresh_token(self) -> None:
+        route = respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(200, json=_success_payload()),
+        )
+
+        await refresh_access_token(refresh_token="my-refresh", now=_FROZEN_NOW)
+
+        request = route.calls.last.request
+        body = parse_qs(request.content.decode("ascii"))
+        assert body["grant_type"] == ["refresh_token"]
+        assert body["refresh_token"] == ["my-refresh"]
+        assert body["client_id"] == [CLIENT_ID]
+        # Refresh does NOT carry a code_verifier — PKCE is for the
+        # initial exchange, not refresh. Pin its absence so a regression
+        # that conflates the two surface paths is caught.
+        assert "code_verifier" not in body
+
+    @respx.mock
+    async def test_request_uses_https(self) -> None:
+        route = respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(200, json=_success_payload()),
+        )
+
+        await refresh_access_token(refresh_token="r", now=_FROZEN_NOW)
+
+        assert route.calls.last.request.url.scheme == "https"
+
+    @respx.mock
+    async def test_400_raises_autherror(self) -> None:
+        # Most common 400: ``invalid_grant`` because the refresh
+        # token has been rotated out (used elsewhere, revoked by the
+        # user from yandex.ru/profile/access). Auth path: operator
+        # must redo ``auth login``, no auto-retry.
+        respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(
+                400,
+                json={"error": "invalid_grant", "error_description": "rotated"},
+            ),
+        )
+
+        with pytest.raises(AuthError, match="invalid_grant"):
+            await refresh_access_token(refresh_token="r", now=_FROZEN_NOW)
+
+    @respx.mock
+    async def test_500_raises_transient(self) -> None:
+        respx.post(TOKEN_URL).mock(return_value=httpx.Response(503, text="bad gateway"))
+
+        with pytest.raises(ApiTransientError):
+            await refresh_access_token(refresh_token="r", now=_FROZEN_NOW)
