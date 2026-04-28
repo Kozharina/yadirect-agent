@@ -37,7 +37,6 @@ from yadirect_agent.models.rationale import (
     Rationale,
 )
 
-
 # --------------------------------------------------------------------------
 # Stubs (parallel to test_executor.py — kept local for isolation).
 # --------------------------------------------------------------------------
@@ -276,7 +275,7 @@ class TestRationaleSkippedOnReject:
         # by the audit sink).
         assert store.all_plans() == []
         # Empty file = no recorded rationales.
-        loaded = list(rationale_store._collapse_by_id().values())  # noqa: SLF001
+        loaded = list(rationale_store._collapse_by_id().values())
         assert loaded == []
 
 
@@ -302,7 +301,7 @@ class TestRationaleSoftOptional:
 
         assert result == "ok"
         # Empty file = no rationale recorded.
-        loaded = list(rationale_store._collapse_by_id().values())  # noqa: SLF001
+        loaded = list(rationale_store._collapse_by_id().values())
         assert loaded == []
 
     async def test_rationale_without_store_warns_but_continues(
@@ -351,5 +350,5 @@ class TestRationaleNotReEmittedOnApply:
         )
 
         # No new rationale persisted by the apply-plan re-entry.
-        loaded = list(rationale_store._collapse_by_id().values())  # noqa: SLF001
+        loaded = list(rationale_store._collapse_by_id().values())
         assert loaded == []

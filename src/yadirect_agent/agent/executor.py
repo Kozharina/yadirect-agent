@@ -56,7 +56,10 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+import structlog
+
 from ..audit import AuditSink, audit_action
+from ..models.rationale import Rationale
 from .pipeline import (
     ReviewContext,
     SafetyPipeline,
@@ -64,7 +67,10 @@ from .pipeline import (
     serialize_review_context,
 )
 from .plans import OperationPlan, PendingPlansStore, generate_plan_id
+from .rationale_store import RationaleStore
 from .safety import CheckResult
+
+_log = structlog.get_logger(component="agent.executor")
 
 __all__ = [
     "InvalidPlanStateError",
@@ -165,6 +171,77 @@ class _SafetyAware(Protocol):
 
 
 # --------------------------------------------------------------------------
+# Rationale emission helper (M20.2).
+# --------------------------------------------------------------------------
+
+
+def _resolve_rationale_store(self: object) -> RationaleStore | None:
+    """Best-effort lookup of a service's rationale store.
+
+    Services that landed before M20 do not implement
+    ``_resolve_rationale_store``; we ``getattr`` to keep them working
+    instead of forcing a Protocol-level break change. Services that
+    DO implement it return the store (or None if explicitly disabled).
+    """
+    resolver = getattr(self, "_resolve_rationale_store", None)
+    if resolver is None:
+        return None
+    result: RationaleStore | None = resolver()
+    return result
+
+
+def _emit_rationale(
+    self: object,
+    plan: OperationPlan,
+    rationale: Rationale | None,
+) -> None:
+    """Persist ``rationale`` under ``plan.plan_id`` if both sides cooperate.
+
+    Soft-optional contract during the M20 rollout:
+
+    - rationale present + store present: persist with decision_id
+      overwritten to plan.plan_id (caller-provided ids cannot diverge).
+    - rationale present + no store: warn, continue (legacy services
+      that don't implement ``_resolve_rationale_store`` keep working).
+    - rationale absent + store present: warn, continue (caller didn't
+      explain themselves yet; hard requirement is a follow-up).
+    - rationale absent + no store: silent (rationale not configured
+      end-to-end on this surface).
+    """
+    rationale_store = _resolve_rationale_store(self)
+
+    if rationale is None and rationale_store is None:
+        return
+
+    if rationale is None:
+        _log.warning(
+            "rationale.missing",
+            plan_id=plan.plan_id,
+            action=plan.action,
+            resource_type=plan.resource_type,
+            resource_ids=plan.resource_ids,
+        )
+        return
+
+    if rationale_store is None:
+        _log.warning(
+            "rationale.store_missing",
+            plan_id=plan.plan_id,
+            action=plan.action,
+            note="caller passed rationale= but service has no rationale store wired up",
+        )
+        return
+
+    # Overwrite caller-provided decision_id with plan_id. Without this,
+    # a buggy or malicious caller could persist multiple rationales
+    # under the same string id, or worse, overwrite an existing
+    # decision's record. Forcing the alignment here means the rationale
+    # store is always indexable by the same identifier as the plan.
+    aligned = rationale.model_copy(update={"decision_id": plan.plan_id})
+    rationale_store.append(aligned)
+
+
+# --------------------------------------------------------------------------
 # @requires_plan decorator.
 # --------------------------------------------------------------------------
 
@@ -212,10 +289,17 @@ def requires_plan(
             self: _SafetyAware,
             *args: Any,
             _applying_plan_id: str | None = None,
+            rationale: Rationale | None = None,
             **kwargs: Any,
         ) -> Any:
             # Bypass path: apply_plan already handled review + will
             # handle on_applied. Just run the wrapped call.
+            #
+            # The rationale was recorded when the plan was first
+            # proposed; re-emitting on the apply-plan re-entry would
+            # either duplicate (worst case) or contradict (worse) the
+            # original record, so we deliberately drop any rationale
+            # kwarg here. The CLI's apply-plan path doesn't pass one.
             if _applying_plan_id is not None:
                 return await fn(self, *args, **kwargs)
 
@@ -239,7 +323,19 @@ def requires_plan(
             decision = pipeline.review(plan, context)
 
             if decision.status == "reject":
+                # Reject: do NOT persist rationale. A rationale describes
+                # the WHY behind a decision the agent took; if the
+                # policy refused, there is no decision to act on. The
+                # rejection itself is captured by the audit sink.
                 raise PlanRejected(decision.reason or "rejected", list(decision.blocking_checks))
+
+            # allow / confirm: emit rationale (best-effort) BEFORE
+            # the plan is persisted or the wrapped method runs.
+            # Emitting first means a wrapped method that crashes mid-call
+            # still leaves the rationale on disk — operators can see
+            # what the agent was *trying* to do even if execution
+            # failed.
+            _emit_rationale(self, plan, rationale)
 
             if decision.status == "confirm":
                 persisted = plan.model_copy(
