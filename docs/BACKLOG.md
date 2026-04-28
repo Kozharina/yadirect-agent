@@ -179,21 +179,15 @@ the PR merges or is abandoned.
 
 ## Blocked / waiting
 
-- [ ] **PyPI Trusted Publisher registration** — the
-      `.github/workflows/release.yml` workflow lands as part of
-      M15.1 but cannot publish until the project is registered as
-      a Trusted Publisher at pypi.org → "Publishing":
-      Owner=``Kozharina``, Repo=``yadirect-agent``,
-      Workflow=``release.yml``, Environment=``pypi``. Until
-      registered, the publish step fails clearly (build artefacts
-      remain on the workflow run for inspection). Operator action
-      required.
-- [ ] **First PyPI release tag** — after Trusted Publisher
-      registration, push ``v0.1.0`` (matching pyproject.toml
-      version). The workflow triggers automatically, builds and
-      publishes. Verify via ``pip install yadirect-agent`` in a
-      clean venv; ``yadirect-agent --version`` should print
-      ``0.1.0``.
+- [x] ~~**PyPI Trusted Publisher registration**~~ — done.
+      Pending publisher registered for ``yadirect-agent`` /
+      ``Kozharina`` / ``release.yml`` / ``pypi``.
+- [x] ~~**First PyPI release tag**~~ — ``v0.1.0`` shipped.
+      Build + publish workflow took ~40s end-to-end; package live
+      at <https://pypi.org/project/yadirect-agent/>;
+      ``pip install yadirect-agent==0.1.0`` smoke-tested in a
+      clean venv (``yadirect-agent --version`` → ``0.1.0``,
+      all 10 subcommands wired correctly).
 - [ ] **Codecov integration** — adds a live coverage badge to README.
       Needs user action: register the repo at codecov.io, add
       `CODECOV_TOKEN` to GH Actions secrets, then I wire up the
@@ -710,6 +704,19 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **First PyPI release: ``yadirect-agent==0.1.0`` live**
+      (M15.1 follow-through). Pending Trusted Publisher registered
+      at pypi.org, ``v0.1.0`` tag pushed, ``release.yml`` workflow
+      triggered: build (sdist + wheel, 14s) → publish (PyPI via
+      OIDC, 26s) → GitHub release with auto-generated notes.
+      Smoke-tested ``pip install yadirect-agent==0.1.0`` in a
+      clean venv on macOS / Python 3.11; ``yadirect-agent --version``
+      prints ``0.1.0``; all 10 subcommands enumerated by
+      ``yadirect-agent --help``. PyPI page shows the correct
+      summary, classifiers, and all 5 project URLs. From this
+      point forward Anna can ``pip install yadirect-agent``
+      instead of ``git clone``-ing the repo — closes the M15.1
+      acceptance gate.
 - [x] **M15.1 — PyPI release infrastructure** (§M15.1, Phase 0+1,
       release 0.2.0). Tag-triggered ``.github/workflows/release.yml``
       builds sdist + wheel via ``python -m build`` and publishes via
