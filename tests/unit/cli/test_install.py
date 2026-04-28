@@ -177,6 +177,48 @@ class TestInstallIntoConfig:
         # Backup contains the original config verbatim.
         assert json.loads(result.backup_path.read_text(encoding="utf-8")) == original
 
+    def test_backup_preserves_source_permissions(self, tmp_path: Path) -> None:
+        # auditor M15.2 MEDIUM-1: a 0600 source must produce a 0600
+        # backup, not the umask-default 0644. On a multi-user host the
+        # naive write_bytes leaked accumulated config snapshots —
+        # shutil.copy2 copies both content and permission bits in one
+        # syscall.
+        import os
+        import stat
+
+        path = tmp_path / "claude_desktop_config.json"
+        path.write_text(json.dumps({"mcpServers": {"other": {"command": "x"}}}))
+        os.chmod(path, 0o600)
+
+        result = install_into_config(path)
+
+        assert result.backup_path is not None
+        backup_mode = stat.S_IMODE(result.backup_path.stat().st_mode)
+        assert backup_mode == 0o600, f"backup mode {oct(backup_mode)} != 0o600"
+
+    def test_backup_paths_unique_within_one_second(self, tmp_path: Path) -> None:
+        # auditor M15.2 LOW-2: two backups in the same UTC second
+        # used to collide because the timestamp had only second
+        # resolution. Microsecond resolution closes that.
+        path = tmp_path / "claude_desktop_config.json"
+
+        # First install creates a config.
+        install_into_config(path)
+        # Second install with stale entry forces another backup.
+        # Manually rewrite to a stale-shape config so the next install
+        # path takes the "updated" branch (which always backs up).
+        stale = {"mcpServers": {"yadirect-agent": {"command": "x", "args": []}}}
+        path.write_text(json.dumps(stale))
+        result_a = install_into_config(path)
+        # And one more time — same flow.
+        path.write_text(json.dumps(stale))
+        result_b = install_into_config(path)
+
+        assert result_a.backup_path is not None
+        assert result_b.backup_path is not None
+        # Even back-to-back the two backups have distinct names.
+        assert result_a.backup_path != result_b.backup_path
+
     def test_no_backup_when_config_did_not_exist(self, tmp_path: Path) -> None:
         # Fresh install with no prior config — nothing to back up.
         path = tmp_path / "claude_desktop_config.json"

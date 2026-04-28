@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import shutil
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -169,9 +170,28 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
 
 
 def _backup_path(config_path: Path) -> Path:
-    """Generate a timestamped backup path next to the config."""
-    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    """Generate a timestamped backup path next to the config.
+
+    Microsecond resolution avoids collisions when two installs land
+    in the same second (auditor M15.2 LOW-2). Same-second collisions
+    used to cause the second install to silently overwrite the
+    first install's backup, losing recovery for the first.
+    """
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
     return config_path.with_suffix(config_path.suffix + f".backup-{stamp}")
+
+
+def _backup_existing(path: Path, dest: Path) -> None:
+    """Copy ``path`` to ``dest`` preserving permission bits.
+
+    The naive ``dest.write_bytes(path.read_bytes())`` creates the
+    backup at mode 0o666 & ~umask (typically 0o644 — world-readable),
+    even when the source was 0o600. On a multi-user host this leaks
+    accumulated config snapshots to all local users. ``shutil.copy2``
+    copies both content and permission bits in one syscall, matching
+    the source mode. (auditor M15.2 MEDIUM-1.)
+    """
+    shutil.copy2(path, dest)
 
 
 def install_into_config(path: Path, *, dry_run: bool = False) -> InstallResult:
@@ -231,7 +251,7 @@ def install_into_config(path: Path, *, dry_run: bool = False) -> InstallResult:
     # there is nothing to back up.
     if not is_new_file:
         backup_path = _backup_path(path)
-        backup_path.write_bytes(path.read_bytes())
+        _backup_existing(path, backup_path)
         _log.info(
             "claude_desktop.config.backed_up",
             original=str(path),
@@ -292,7 +312,7 @@ def uninstall_from_config(path: Path, *, dry_run: bool = False) -> UninstallResu
     new_config["mcpServers"] = new_servers
 
     backup_path = _backup_path(path)
-    backup_path.write_bytes(path.read_bytes())
+    _backup_existing(path, backup_path)
     _log.info(
         "claude_desktop.config.backed_up",
         original=str(path),
