@@ -979,3 +979,24 @@ def test_apply_plan_routes_set_keyword_bids_to_service(
     final = PendingPlansStore(plans_path).get("plan-bid")
     assert final is not None
     assert final.status == "applied"
+
+
+# --------------------------------------------------------------------------
+# `health` — argument validation.
+# --------------------------------------------------------------------------
+
+
+def test_health_rejects_zero_goal_id(runner: CliRunner) -> None:
+    # Metrika goal IDs are positive integers; --goal-id 0 is nonsensical
+    # and would silently produce empty conversion data, flooding the
+    # report with false-positive burning-campaign findings.
+    # (auditor M15.5.1 LOW-4.)
+    result = runner.invoke(app, ["health", "--goal-id", "0"])
+
+    assert result.exit_code != 0
+
+
+def test_health_rejects_negative_goal_id(runner: CliRunner) -> None:
+    result = runner.invoke(app, ["health", "--goal-id", "-1"])
+
+    assert result.exit_code != 0

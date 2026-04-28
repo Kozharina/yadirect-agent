@@ -175,3 +175,24 @@ class CampaignPerformance:
     conversions: int
     cpa_rub: float | None
     cr_pct: float | None
+
+    def __post_init__(self) -> None:
+        # Frozen dataclasses don't enforce field types at construction.
+        # We pin the integer-non-negative invariant here so a future
+        # deserialization path can't sneak in ``True`` (which is an int
+        # subtype in Python — ``isinstance(True, int)`` is True) or a
+        # negative value that would invert rule semantics. Same defensive
+        # pattern as ``GoalConversions.__post_init__`` in agent/safety.py.
+        # (auditor M15.5.1 LOW-3.)
+        if isinstance(self.conversions, bool) or not isinstance(self.conversions, int):
+            msg = f"conversions must be int (not bool), got {type(self.conversions).__name__}"
+            raise TypeError(msg)
+        if self.conversions < 0:
+            msg = f"conversions must be non-negative, got {self.conversions}"
+            raise ValueError(msg)
+        if self.clicks < 0:
+            msg = f"clicks must be non-negative, got {self.clicks}"
+            raise ValueError(msg)
+        if self.cost_rub < 0:
+            msg = f"cost_rub must be non-negative, got {self.cost_rub}"
+            raise ValueError(msg)

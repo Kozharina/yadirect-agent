@@ -254,6 +254,57 @@ class TestBurningCampaignRule:
 
         assert report.findings == []
 
+    async def test_does_not_flag_at_exactly_min_burn_threshold(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Boundary case: cost_rub == MIN_BURN_RUB (50.0) with 0
+        # conversions is treated as below-threshold noise, NOT flagged.
+        # The rule uses ``cost_rub <= MIN_BURN_RUB`` for the skip
+        # condition. (auditor M15.5.1 LOW-5: boundary semantics
+        # explicitly pinned.)
+        at_threshold = _perf(
+            campaign_id=12,
+            name="exact-threshold",
+            clicks=2,
+            cost_rub=50.0,
+            conversions=0,
+            cpa_rub=None,
+            cr_pct=0.0,
+        )
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[at_threshold]))
+
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=_WEEK, goal_id=100)
+
+        assert report.findings == []
+
+    async def test_flags_just_above_min_burn_threshold(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Boundary case: 1 cent above MIN_BURN_RUB does fire. Together
+        # with the at-threshold test above, this pins the boundary
+        # semantics — strict greater-than. (auditor M15.5.1 LOW-5.)
+        just_above = _perf(
+            campaign_id=12,
+            name="just-above",
+            clicks=2,
+            cost_rub=50.01,
+            conversions=0,
+            cpa_rub=None,
+            cr_pct=0.0,
+        )
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[just_above]))
+
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=_WEEK, goal_id=100)
+
+        assert len(report.findings) == 1
+        assert report.findings[0].rule_id == "burning_campaign"
+
     async def test_skips_when_no_goal_provided(
         self,
         settings: Settings,

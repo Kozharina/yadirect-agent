@@ -81,6 +81,62 @@ class TestCampaignPerformance:
         with pytest.raises(FrozenInstanceError):
             perf.cost_rub = 999.0  # type: ignore[misc]
 
+    def test_bool_conversions_rejected(self) -> None:
+        # ``isinstance(True, int)`` is True in Python; without the
+        # explicit bool guard a future deserialization path could
+        # sneak ``True`` in as conversions=1, which would silently
+        # change rule semantics. (auditor M15.5.1 LOW-3.)
+        with pytest.raises(TypeError, match="not bool"):
+            CampaignPerformance(
+                campaign_id=42,
+                campaign_name="brand",
+                date_range=DateRange(start=date(2026, 4, 1), end=date(2026, 4, 7)),
+                clicks=0,
+                cost_rub=0.0,
+                conversions=True,  # type: ignore[arg-type]
+                cpa_rub=None,
+                cr_pct=None,
+            )
+
+    def test_negative_conversions_rejected(self) -> None:
+        with pytest.raises(ValueError, match="non-negative"):
+            CampaignPerformance(
+                campaign_id=42,
+                campaign_name="brand",
+                date_range=DateRange(start=date(2026, 4, 1), end=date(2026, 4, 7)),
+                clicks=0,
+                cost_rub=0.0,
+                conversions=-1,
+                cpa_rub=None,
+                cr_pct=None,
+            )
+
+    def test_negative_clicks_rejected(self) -> None:
+        with pytest.raises(ValueError, match="clicks must be non-negative"):
+            CampaignPerformance(
+                campaign_id=42,
+                campaign_name="brand",
+                date_range=DateRange(start=date(2026, 4, 1), end=date(2026, 4, 7)),
+                clicks=-1,
+                cost_rub=0.0,
+                conversions=0,
+                cpa_rub=None,
+                cr_pct=None,
+            )
+
+    def test_negative_cost_rejected(self) -> None:
+        with pytest.raises(ValueError, match="cost_rub must be non-negative"):
+            CampaignPerformance(
+                campaign_id=42,
+                campaign_name="brand",
+                date_range=DateRange(start=date(2026, 4, 1), end=date(2026, 4, 7)),
+                clicks=0,
+                cost_rub=-1.0,
+                conversions=0,
+                cpa_rub=None,
+                cr_pct=None,
+            )
+
     def test_zero_conversions_carries_none_cpa(self) -> None:
         # The model itself doesn't enforce this — it just types it.
         # The service is responsible for setting None on zero conversions;

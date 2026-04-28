@@ -73,10 +73,14 @@ class BurningCampaignRule(_Rule):
 
     rule_id = "burning_campaign"
 
-    # Below this threshold we treat zero-conversion spend as noise.
+    # Strict-greater-than threshold: a campaign spending exactly
+    # MIN_BURN_RUB with 0 conversions is treated as below-threshold
+    # noise (the rule uses ``cost_rub <= MIN_BURN_RUB`` to skip).
     # 50 RUB over a 7-day window with 0 conversions is statistically
     # nothing on most accounts; calling it out wastes operator
     # attention. This becomes a Settings.policy knob in a follow-up.
+    # (auditor M15.5.1 LOW-5: boundary semantics documented and
+    # tested at exactly the threshold + one cent above.)
     MIN_BURN_RUB: float = 50.0
 
     def check(

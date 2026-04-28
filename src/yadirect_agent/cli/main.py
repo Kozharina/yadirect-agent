@@ -223,9 +223,11 @@ def health_cmd(
         int | None,
         typer.Option(
             "--goal-id",
+            min=1,
             help=(
                 "Metrika goal id to count conversions against. "
-                "Without it, conversion-based rules silently skip."
+                "Without it, conversion-based rules silently skip. "
+                "Must be a positive integer."
             ),
         ),
     ] = None,
