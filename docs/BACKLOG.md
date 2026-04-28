@@ -32,13 +32,30 @@ it, nothing else matters because Anna can't get past install.
 **This is the top of the queue.** Until M15 ships, the product is
 demo-only, technically; it cannot be handed to a non-developer.
 
-- [ ] **M15 — Frictionless onboarding** (§M15): PyPI release,
-      `install-into-claude-desktop`, standard OAuth flow with
-      localhost callback + keyring, conversational MCP onboarding,
-      `--no-llm` rule-based mode, built-in scheduler
-      (LaunchAgent/systemd/Task Scheduler). Acceptance:
-      time-to-first-value ≤ 10 min on a clean machine, **without
-      Anthropic key**. Smoke-tested in CI.
+- [x] ~~**M15.1 — PyPI release**~~ — shipped (workflow + metadata),
+      see Done. **Blocked on operator action** to register
+      Trusted Publisher and push first ``v0.1.0`` tag (see
+      Blocked / waiting).
+- [ ] **M15.2 — `install-into-claude-desktop`**: cross-platform
+      command that finds the Claude Desktop config, validates JSON,
+      backs it up, inserts the ``mcpServers`` block for
+      ``yadirect-agent``. ``--dry-run`` flag. ``uninstall-from-claude-desktop``
+      reverse. Tested with a fake config-path injected via env.
+- [ ] **M15.3 — Standard OAuth flow with keyring**: register one
+      OAuth-app project-side (Direct + Metrika scopes), local
+      ``localhost:8765/callback`` HTTP server during ``auth login``,
+      tokens stored in OS keychain via ``python-keyring``.
+      ``Settings`` reads from keyring with env-var fallback.
+- [ ] **M15.4 — Conversational MCP onboarding**: ``start_onboarding()``
+      MCP-tool that triggers M15.3 if needed, collects
+      ``BusinessProfile`` via Q&A, proposes a sensible
+      ``agent_policy.yml`` based on current account state, snapshots
+      baseline (M19), runs first M15.5 health check.
+- [ ] **M15.6 — Built-in scheduler**: ``yadirect-agent schedule
+      install`` cross-platform — LaunchAgent on macOS, systemd
+      timer on Linux, Task Scheduler on Windows. Daily run at 08:00
+      local + hourly health. Logs into ``audit_log_path``.
+      M15.5 ``--no-llm`` is shipped (M15.5.1).
 - [x] ~~**M20 — Human-readable rationale (slice 1)**~~ — shipped,
       see Done. Model + store + soft-optional emission +
       ``yadirect-agent rationale show/list`` CLI.
@@ -155,26 +172,28 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-- [ ] **M15.1 — PyPI release** (§M15.1, branch
-      `feat/m15-1-pypi-release`). First slice of M15 (frictionless
-      onboarding). Polish ``pyproject.toml`` metadata for PyPI
-      (urls, classifiers, keywords, license file), add
-      ``.github/workflows/release.yml`` triggered on
-      ``v*.*.*`` tags that builds sdist+wheel and publishes via
-      PyPI Trusted Publishing (OIDC — no PyPI token in secrets),
-      verify local build succeeds, document the ``pip install
-      yadirect-agent`` path in README + OPERATING.md. **Blocked
-      on a manual one-time human action**: registering this
-      project as a Trusted Publisher at pypi.org. Workflow will
-      be in place but no release tag pushed in this PR — first
-      tag is a separate operator action after the workflow
-      lands.
+*(empty — nothing checked out right now)*
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
 
 ## Blocked / waiting
 
+- [ ] **PyPI Trusted Publisher registration** — the
+      `.github/workflows/release.yml` workflow lands as part of
+      M15.1 but cannot publish until the project is registered as
+      a Trusted Publisher at pypi.org → "Publishing":
+      Owner=``Kozharina``, Repo=``yadirect-agent``,
+      Workflow=``release.yml``, Environment=``pypi``. Until
+      registered, the publish step fails clearly (build artefacts
+      remain on the workflow run for inspection). Operator action
+      required.
+- [ ] **First PyPI release tag** — after Trusted Publisher
+      registration, push ``v0.1.0`` (matching pyproject.toml
+      version). The workflow triggers automatically, builds and
+      publishes. Verify via ``pip install yadirect-agent`` in a
+      clean venv; ``yadirect-agent --version`` should print
+      ``0.1.0``.
 - [ ] **Codecov integration** — adds a live coverage badge to README.
       Needs user action: register the repo at codecov.io, add
       `CODECOV_TOKEN` to GH Actions secrets, then I wire up the
@@ -691,6 +710,29 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M15.1 — PyPI release infrastructure** (§M15.1, Phase 0+1,
+      release 0.2.0). Tag-triggered ``.github/workflows/release.yml``
+      builds sdist + wheel via ``python -m build`` and publishes via
+      PyPI Trusted Publishing (OIDC) — no PyPI token in repo
+      secrets. Two-stage workflow: build job verifies the tag
+      version matches ``pyproject.toml`` and uploads artefacts;
+      publish job (gated on the ``pypi`` GitHub Environment)
+      mints OIDC token, uploads to PyPI, attaches artefacts to a
+      GitHub release with auto-generated notes. Concurrency
+      control prevents double-publishing on duplicate tags.
+      ``pyproject.toml`` polished: meaningful description,
+      contributors-attributed authors, 9 keywords, 14 classifiers
+      (incl. Typing :: Typed), all 5 standard project URLs
+      (Homepage / Documentation / Repository / Issues / Changelog).
+      ``py.typed`` marker file ships in wheel so downstream
+      type-checkers see our types automatically. Local
+      ``python -m build`` verified producing
+      yadirect_agent-0.1.0.tar.gz + yadirect_agent-0.1.0-py3-none-any.whl
+      with correct METADATA. README + OPERATING.md show both the
+      ``pip install`` (post-release) and ``git clone`` (current)
+      paths. **Manual gate**: registering Trusted Publisher and
+      pushing first tag remain operator actions tracked in
+      Blocked / waiting. 742 tests green.
 - [x] **M20 — Human-readable rationale (slice 1)** (§M20, Phase 0+1,
       release 0.2.0). Foundation for the rationale layer that makes
       shadow-week calibration honest. New ``Rationale`` model with
