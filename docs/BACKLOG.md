@@ -168,7 +168,20 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **M21 — Cost tracking** (§M21, branch `feat/m21-cost-tracking`).
+      Per-call ``input_tokens`` / ``output_tokens`` capture in
+      ``agent/loop.py`` (already on AgentRun); cost calculator
+      from Anthropic published prices + configurable USD→RUB
+      rate; CostRecord persisted to ``logs/cost.jsonl`` (sibling
+      of audit.jsonl); ``yadirect-agent cost status`` shows
+      month-to-date spend, run count, and projected end-of-month
+      usage. Settings gain ``agent_monthly_llm_budget_rub`` (None
+      by default — soft observability, no hard enforcement) and
+      ``usd_to_rub_rate`` (default 100, configurable). Out of
+      scope for this PR: hard auto-degrade to ``--no-llm`` when
+      budget exhausted (M21.2 follow-up; needs M18 for the
+      operator alert path), Telegram cost notifications, real-
+      time currency lookup.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
