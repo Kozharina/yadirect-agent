@@ -2,7 +2,7 @@
 
 The store is the only path the OAuth token data takes to the OS
 keychain: every read goes through ``load``, every write through
-``save``, every clear through ``revoke``. So the contract this file
+``save``, every clear through ``delete``. So the contract this file
 pins is the contract the rest of M15.3 — login flow, CLI commands,
 Settings keyring fallback — relies on.
 
@@ -18,8 +18,8 @@ What we enforce:
   payload (manually-edited keychain entry, partial write under
   power loss) also returns ``None`` and the operator is back to
   "not logged in" rather than facing an opaque exception.
-- ``revoke`` is idempotent: calling it on an empty slot is a no-op,
-  not an exception, so ``yadirect-agent auth revoke`` always exits
+- ``delete`` is idempotent: calling it on an empty slot is a no-op,
+  not an exception, so ``yadirect-agent auth logout`` always exits
   zero on the no-op path.
 
 Tests use an in-memory keyring backend via monkeypatch — never
@@ -35,12 +35,12 @@ from datetime import UTC, datetime, timedelta
 import keyring.errors
 import pytest
 from pydantic import SecretStr
+
 from yadirect_agent.auth.keychain import (
     KEYRING_SERVICE_NAME,
     KEYRING_USERNAME,
     KeyringTokenStore,
 )
-
 from yadirect_agent.models.auth import TokenSet
 
 
@@ -165,27 +165,27 @@ class TestLoadDefensive:
         assert store.load() is None
 
 
-class TestRevoke:
-    def test_revoke_clears_existing_record(
+class TestDelete:
+    def test_delete_clears_existing_record(
         self, memory_keyring: dict[tuple[str, str], str]
     ) -> None:
         store = KeyringTokenStore()
         store.save(_ts())
         assert store.load() is not None
 
-        store.revoke()
+        store.delete()
 
         assert store.load() is None
         assert (KEYRING_SERVICE_NAME, KEYRING_USERNAME) not in memory_keyring
 
-    def test_revoke_is_idempotent_when_no_record(
+    def test_delete_is_idempotent_when_no_record(
         self, memory_keyring: dict[tuple[str, str], str]
     ) -> None:
-        # ``yadirect-agent auth revoke`` on a fresh install must not
+        # ``yadirect-agent auth logout`` on a fresh install must not
         # raise — operator should always exit zero on the no-op path.
         store = KeyringTokenStore()
 
-        store.revoke()  # Must not raise.
-        store.revoke()  # Twice for good measure.
+        store.delete()  # Must not raise.
+        store.delete()  # Twice for good measure.
 
         assert store.load() is None

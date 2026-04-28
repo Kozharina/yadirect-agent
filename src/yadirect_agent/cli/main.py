@@ -68,7 +68,7 @@ from .auth import (
     LOGIN_OPENING_BROWSER_HINT,
     LOGIN_SUCCESS,
     LOGIN_TIMEOUT_HINT,
-    REVOKE_SUCCESS,
+    LOGOUT_SUCCESS,
     STATUS_NOT_LOGGED_IN,
 )
 from .auth import render_status_text as render_auth_status_text
@@ -415,16 +415,21 @@ def auth_status_cmd(
     _out.print(render_auth_status_text(token))
 
 
-@auth_app.command("revoke")
-def auth_revoke_cmd() -> None:
+@auth_app.command("logout")
+def auth_logout_cmd() -> None:
     """Clear the stored TokenSet from the OS keychain.
 
+    Local-only operation: deletes the keychain slot. Yandex OAuth
+    has no public revocation endpoint, so the refresh token issued
+    to us remains valid server-side until manually revoked at
+    ``yandex.ru/profile/access``. The CLI message says so.
+
     Idempotent: running on a fresh install (no record) is a no-op
-    exit-zero, so a setup script can call ``auth revoke`` then
+    exit-zero, so a setup script can call ``auth logout`` then
     ``auth login`` without conditional logic.
     """
-    KeyringTokenStore().revoke()
-    _out.print(f"[green]{REVOKE_SUCCESS}[/green]")
+    KeyringTokenStore().delete()
+    _out.print(f"[green]{LOGOUT_SUCCESS}[/green]")
 
 
 # --------------------------------------------------------------------------

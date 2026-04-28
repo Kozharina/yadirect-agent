@@ -14,9 +14,17 @@ All three public methods are defensive:
   validation. Each of these maps to "operator must re-login" —
   surfacing them as exceptions would force every caller to handle
   three flavours of "no usable token", which is the same path.
-- ``revoke`` is idempotent: deleting a non-existent slot is a no-op,
-  not an error. ``yadirect-agent auth revoke`` always exits zero on
+- ``delete`` is idempotent: deleting a non-existent slot is a no-op,
+  not an error. ``yadirect-agent auth logout`` always exits zero on
   the no-op path.
+
+The method is named ``delete`` rather than ``revoke``: it removes
+the local keychain slot only. Yandex OAuth has no public revocation
+endpoint, so a true server-side revoke is impossible from the CLI;
+the refresh token Yandex issued remains valid until manual
+revocation at https://yandex.ru/profile/access. The method name
+reflects what we actually do — delete a local secret — instead of
+implying a server-side action we cannot take.
 
 The keychain backend is auto-detected by the ``keyring`` package:
 Keychain on macOS, Credential Manager on Windows, Secret Service
@@ -96,19 +104,26 @@ class KeyringTokenStore:
             self._logger.warning("keychain.payload_failed_validation")
             return None
 
-    def revoke(self) -> None:
+    def delete(self) -> None:
         """Delete the TokenSet from the keychain (idempotent).
 
-        ``yadirect-agent auth revoke`` calls this; running it twice
+        ``yadirect-agent auth logout`` calls this; running it twice
         in a row, or on a fresh install, must not raise. The
         ``PasswordDeleteError`` path from ``keyring.delete_password``
         is the "no record" signal we swallow.
+
+        The method removes the LOCAL slot only. Yandex OAuth has no
+        public revocation endpoint, so the refresh token remains
+        valid server-side until manually revoked at
+        https://yandex.ru/profile/access. ``delete`` reflects what
+        we actually do; a name like ``revoke`` would imply a
+        server-side action we cannot take.
         """
         try:
             keyring.delete_password(KEYRING_SERVICE_NAME, KEYRING_USERNAME)
-            self._logger.info("keychain.token_revoked")
+            self._logger.info("keychain.token_deleted")
         except keyring.errors.PasswordDeleteError:
-            self._logger.info("keychain.revoke_noop_no_record")
+            self._logger.info("keychain.delete_noop_no_record")
 
 
 __all__ = [

@@ -44,7 +44,11 @@ LOGIN_SUCCESS = "Авторизация успешно завершена."
 LOGIN_KEYCHAIN_NOTE = "Токен сохранён в OS keychain. Можно запускать остальные команды."
 STATUS_NOT_LOGGED_IN = "Не вошли в Yandex. Запустите [bold]yadirect-agent auth login[/bold]."
 STATUS_HEADER_LOGGED_IN = "Авторизация: активна"
-REVOKE_SUCCESS = "Токен удалён из keychain."
+LOGOUT_SUCCESS = (
+    "Токен удалён из OS keychain. "
+    "Refresh-токен на стороне Yandex остаётся валидным — "
+    "при необходимости отозвать его вручную на yandex.ru/profile/access."
+)
 
 
 def status_dict(token: TokenSet) -> dict[str, Any]:
@@ -90,7 +94,7 @@ __all__ = [
     "LOGIN_OPENING_BROWSER_HINT",
     "LOGIN_SUCCESS",
     "LOGIN_TIMEOUT_HINT",
-    "REVOKE_SUCCESS",
+    "LOGOUT_SUCCESS",
     "STATUS_HEADER_LOGGED_IN",
     "STATUS_NOT_LOGGED_IN",
     "render_status_text",

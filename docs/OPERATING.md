@@ -274,13 +274,16 @@ environment.
 
 ```bash
 yadirect-agent auth status     # check token (masked) and expiry
-yadirect-agent auth revoke     # clear keychain entry
+yadirect-agent auth logout     # clear keychain entry
 ```
 
 Exit codes for cron / wrappers: `auth login` exits 0 on success,
 2 on user-denied / callback-timeout / invalid-grant; `auth status`
 exits 0 when logged in and 1 when not (alert on this from cron);
-`auth revoke` always exits 0 (idempotent).
+`auth logout` always exits 0 (idempotent). Note: `logout` clears the
+LOCAL keychain slot only — Yandex OAuth has no public revocation
+endpoint, so the refresh token remains valid server-side until you
+manually revoke it at <https://yandex.ru/profile/access>.
 
 **Alternative — env vars** (CI / Docker / headless contexts):
 

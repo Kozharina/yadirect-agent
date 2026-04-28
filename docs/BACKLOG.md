@@ -807,8 +807,12 @@ Last 10 items (newest at top). Older items are available via
          JSON blob under service=``yadirect-agent``,
          username=``oauth``. ``load`` collapses missing / corrupt /
          invalid into ``None`` + structlog warning so callers handle
-         one recovery path; ``revoke`` idempotent (no-record signal
-         from ``PasswordDeleteError`` swallowed).
+         one recovery path; ``delete`` idempotent (no-record signal
+         from ``PasswordDeleteError`` swallowed). Method named
+         ``delete``, not ``revoke``: Yandex OAuth has no public
+         revocation endpoint so we can only clear the local slot;
+         the refresh token stays valid server-side until manually
+         revoked at ``yandex.ru/profile/access``.
       4. ``auth/callback_server.py`` — one-shot HTTP/1.1 server
          (``asyncio.start_server`` + hand-rolled GET parser,
          ~30 LOC instead of an aiohttp dependency) bound to
@@ -825,7 +829,7 @@ Last 10 items (newest at top). Older items are available via
          pass an ephemeral port via ``socket.bind((127.0.0.1, 0))``
          so they cannot collide with a live ``auth login``.
       6. ``cli/auth.py`` — typer subapp ``auth login | status |
-         revoke`` with cron-friendly exit codes (0 success / 1
+         logout`` with cron-friendly exit codes (0 success / 1
          not-logged-in / 2 login-failure). Operator-facing Russian
          strings live as module-level constants (file-scoped
          ``ruff: noqa: RUF001, RUF003``); error causes
@@ -840,7 +844,7 @@ Last 10 items (newest at top). Older items are available via
          empty ``yandex_direct_token`` / ``yandex_metrika_token``
          from the keychain. Env wins, fail-soft on any backend
          hiccup so a corrupt keychain row cannot brick ``auth
-         revoke`` — the recovery path. Per-field independence so
+         logout`` — the recovery path. Per-field independence so
          mixed env+keyring deployments stay supported.
 
       85 new tests, 895 total green; mypy strict; ruff clean.

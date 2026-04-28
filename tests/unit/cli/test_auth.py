@@ -6,7 +6,7 @@ Three commands operators run by hand:
   keychain, print a confirmation.
 - ``auth status`` — read the persisted token, print masked summary
   (or JSON), exit 1 when nothing is stored.
-- ``auth revoke`` — clear the keychain slot, exit 0 idempotently.
+- ``auth logout`` — clear the keychain slot, exit 0 idempotently.
 
 CLI tests deliberately stay at the boundary: ``perform_login`` is
 monkey-patched into a fake that returns a known TokenSet, the
@@ -216,8 +216,8 @@ class TestAuthStatus:
         assert "AQAA-secret-access-value" not in result.stdout
 
 
-class TestAuthRevoke:
-    def test_revoke_clears_record(
+class TestAuthLogout:
+    def test_logout_clears_record(
         self,
         runner: CliRunner,
         memory_keyring: dict[tuple[str, str], str],
@@ -225,19 +225,36 @@ class TestAuthRevoke:
         KeyringTokenStore().save(_tokenset())
         assert (KEYRING_SERVICE_NAME, KEYRING_USERNAME) in memory_keyring
 
-        result = runner.invoke(app, ["auth", "revoke"])
+        result = runner.invoke(app, ["auth", "logout"])
 
         assert result.exit_code == 0, result.output
         assert (KEYRING_SERVICE_NAME, KEYRING_USERNAME) not in memory_keyring
 
-    def test_revoke_when_not_logged_in_is_noop_and_exits_zero(
+    def test_logout_warns_about_server_side_token_persistence(
         self,
         runner: CliRunner,
         memory_keyring: dict[tuple[str, str], str],
     ) -> None:
-        # Idempotent: running revoke twice in a row, or on a fresh
+        # The keychain slot is gone but Yandex still considers the
+        # refresh token valid — operators MUST see this in the
+        # logout message so they don't think they've fully signed
+        # out. (Reviewer point: name was misleading; here we pin
+        # that the new copy actually says so.)
+        KeyringTokenStore().save(_tokenset())
+
+        result = runner.invoke(app, ["auth", "logout"])
+
+        assert result.exit_code == 0, result.output
+        assert "yandex.ru/profile/access" in result.output
+
+    def test_logout_when_not_logged_in_is_noop_and_exits_zero(
+        self,
+        runner: CliRunner,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # Idempotent: running logout twice in a row, or on a fresh
         # install, must not raise. cron / setup scripts depend on
         # this being a no-op exit-zero.
-        result = runner.invoke(app, ["auth", "revoke"])
+        result = runner.invoke(app, ["auth", "logout"])
 
         assert result.exit_code == 0, result.output
