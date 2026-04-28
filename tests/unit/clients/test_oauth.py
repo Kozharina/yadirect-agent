@@ -22,9 +22,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import re
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
+import respx
 
 from yadirect_agent.clients.oauth import (
     AUTH_URL,
@@ -34,8 +37,10 @@ from yadirect_agent.clients.oauth import (
     SCOPES,
     TOKEN_URL,
     build_authorization_url,
+    exchange_code_for_token,
     generate_pkce_pair,
 )
+from yadirect_agent.exceptions import ApiTransientError, AuthError
 
 # RFC 3986 §2.3 unreserved set: ALPHA / DIGIT / "-" / "." / "_" / "~"
 _UNRESERVED_RE = re.compile(r"^[A-Za-z0-9\-._~]+$")
@@ -189,3 +194,168 @@ class TestBuildAuthorizationURL:
         # the URL builder rather than letting the request go out.
         with pytest.raises(ValueError, match="code_challenge"):
             build_authorization_url(state="any-state", code_challenge="")
+
+
+_FROZEN_NOW = datetime(2026, 4, 28, 12, 0, tzinfo=UTC)
+
+
+def _success_payload(
+    *,
+    expires_in: int = 31_536_000,
+    scope: str | None = None,
+    refresh: str = "1.AQAA-refresh-token-value",
+    access: str = "AQAA-access-token-value",
+) -> dict[str, object]:
+    body: dict[str, object] = {
+        "token_type": "bearer",
+        "access_token": access,
+        "refresh_token": refresh,
+        "expires_in": expires_in,
+    }
+    if scope is not None:
+        body["scope"] = scope
+    return body
+
+
+class TestExchangeCodeForToken:
+    @respx.mock
+    async def test_success_returns_tokenset_with_correct_fields(self) -> None:
+        respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json=_success_payload()))
+
+        ts = await exchange_code_for_token(
+            code="auth-code-from-callback",
+            code_verifier="verifier-43-chars-of-random-bytes-XYZ",
+            now=_FROZEN_NOW,
+        )
+
+        assert ts.access_token.get_secret_value() == "AQAA-access-token-value"
+        assert ts.refresh_token.get_secret_value() == "1.AQAA-refresh-token-value"
+        assert ts.token_type == "bearer"
+        assert ts.obtained_at == _FROZEN_NOW
+        assert ts.expires_at == _FROZEN_NOW + timedelta(seconds=31_536_000)
+
+    @respx.mock
+    async def test_request_uses_https_token_url(self) -> None:
+        # Defence-in-depth: the secret-bearing exchange must hit the
+        # HTTPS endpoint we pinned. respx's ``called`` accessor lets
+        # us verify post-hoc that the actual hop was the expected one.
+        route = respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(200, json=_success_payload())
+        )
+
+        await exchange_code_for_token(
+            code="auth-code",
+            code_verifier="some-verifier",
+            now=_FROZEN_NOW,
+        )
+
+        assert route.called
+        request = route.calls.last.request
+        assert request.url.scheme == "https"
+        assert str(request.url) == TOKEN_URL
+
+    @respx.mock
+    async def test_request_carries_pkce_verifier_and_grant_type(self) -> None:
+        # Pin the form-encoded body. A regression that drops
+        # ``code_verifier`` would silently degrade us to the pre-PKCE
+        # world (Yandex would still 200 a non-PKCE flow on a public
+        # client without checking).
+        route = respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(200, json=_success_payload())
+        )
+
+        await exchange_code_for_token(
+            code="the-code",
+            code_verifier="the-verifier",
+            now=_FROZEN_NOW,
+        )
+
+        request = route.calls.last.request
+        assert request.headers["content-type"].startswith("application/x-www-form-urlencoded")
+        body = parse_qs(request.content.decode("ascii"))
+        assert body["grant_type"] == ["authorization_code"]
+        assert body["code"] == ["the-code"]
+        assert body["code_verifier"] == ["the-verifier"]
+        assert body["client_id"] == [CLIENT_ID]
+        assert body["redirect_uri"] == [REDIRECT_URI]
+
+    @respx.mock
+    async def test_response_scope_string_overrides_default_scopes(self) -> None:
+        # If Yandex narrows the granted scopes (user denied one of the
+        # checkboxes), the token has fewer privileges. We MUST surface
+        # the actually-granted scope set, not our request's intent —
+        # otherwise the agent would later 403 trying to write to a
+        # resource the user explicitly denied.
+        respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(
+                200, json=_success_payload(scope="direct:api metrika:read")
+            ),
+        )
+
+        ts = await exchange_code_for_token(
+            code="c",
+            code_verifier="v",
+            now=_FROZEN_NOW,
+        )
+
+        assert ts.scope == ("direct:api", "metrika:read")
+
+    @respx.mock
+    async def test_missing_scope_in_response_falls_back_to_requested(self) -> None:
+        # Yandex omits ``scope`` in the response when ALL requested
+        # scopes were granted. Falling back to our SCOPES is correct
+        # here — pinning that behaviour explicitly.
+        respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json=_success_payload()))
+
+        ts = await exchange_code_for_token(
+            code="c",
+            code_verifier="v",
+            now=_FROZEN_NOW,
+        )
+
+        assert ts.scope == SCOPES
+
+    @respx.mock
+    async def test_400_raises_autherror(self) -> None:
+        # The most common 400 here is ``invalid_grant`` (expired or
+        # already-consumed code, or PKCE verifier mismatch). All four
+        # flavours mean the operator must redo ``auth login`` — not
+        # retry. AuthError is the right escalation.
+        respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(
+                400,
+                json={"error": "invalid_grant", "error_description": "expired code"},
+            ),
+        )
+
+        with pytest.raises(AuthError, match="invalid_grant"):
+            await exchange_code_for_token(code="c", code_verifier="v", now=_FROZEN_NOW)
+
+    @respx.mock
+    async def test_401_raises_autherror(self) -> None:
+        # Per RFC 6749 §5.2, ``invalid_client`` returns 401 with a
+        # WWW-Authenticate header. AuthError is correct.
+        respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(401, json={"error": "invalid_client"}),
+        )
+
+        with pytest.raises(AuthError):
+            await exchange_code_for_token(code="c", code_verifier="v", now=_FROZEN_NOW)
+
+    @respx.mock
+    async def test_500_raises_transient(self) -> None:
+        # Token exchange is NOT auto-retried (a consumed code cannot
+        # be replayed), but a 5xx surfaces as ApiTransientError so the
+        # CLI can tell the operator "try again" rather than "fix your
+        # credentials".
+        respx.post(TOKEN_URL).mock(return_value=httpx.Response(503, text="bad gateway"))
+
+        with pytest.raises(ApiTransientError):
+            await exchange_code_for_token(code="c", code_verifier="v", now=_FROZEN_NOW)
+
+    @respx.mock
+    async def test_network_timeout_raises_transient(self) -> None:
+        respx.post(TOKEN_URL).mock(side_effect=httpx.TimeoutException("slow"))
+
+        with pytest.raises(ApiTransientError):
+            await exchange_code_for_token(code="c", code_verifier="v", now=_FROZEN_NOW)
