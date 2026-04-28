@@ -1,11 +1,39 @@
 [project]
 name = "yadirect-agent"
 version = "0.1.0"
-description = "Autonomous agent for Yandex Direct & Metrika management"
+description = "Autonomous AI agent for Yandex.Direct and Yandex.Metrika — with safety rails, audit trail, and a plan→confirm→execute policy."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "You" }]
+authors = [{ name = "yadirect-agent contributors" }]
+keywords = [
+    "yandex-direct",
+    "yandex-metrika",
+    "ppc",
+    "advertising",
+    "ai-agent",
+    "anthropic",
+    "claude",
+    "mcp",
+    "automation",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Office/Business :: Financial",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
 
 dependencies = [
     # HTTP
@@ -52,6 +80,13 @@ dev = [
 # binary. A previous ``yadirect-mcp`` script that pointed at a never-
 # implemented ``mcp_server`` package was removed in M3 (auditor M-1).
 yadirect-agent = "yadirect_agent.cli.main:app"
+
+[project.urls]
+Homepage = "https://github.com/Kozharina/yadirect-agent"
+Documentation = "https://github.com/Kozharina/yadirect-agent/blob/main/docs/OPERATING.md"
+Repository = "https://github.com/Kozharina/yadirect-agent"
+Issues = "https://github.com/Kozharina/yadirect-agent/issues"
+Changelog = "https://github.com/Kozharina/yadirect-agent/blob/main/docs/BACKLOG.md"
 
 [build-system]
 requires = ["hatchling"]
