@@ -52,6 +52,15 @@ demo-only, technically; it cannot be handed to a non-developer.
       spend creeps invisibly and the agent silently dies at
       month-end.
 - [x] ~~**M6 (basic) — Metrika reporting**~~ — shipped, see Done.
+- [x] ~~**M15.5.1 — Account health check (basic rules)**~~ — shipped,
+      see Done. Two rules + ``yadirect-agent health`` CLI.
+- [ ] **M15.5.2-6 — Health check rule expansion**: low-CTR rule
+      (needs impressions from Direct reports), rejected-ads /
+      rejected-keywords rule (needs Direct ad/keyword status
+      readers), CTR-drift rule (needs week-over-week comparison
+      = small history store), MCP tool ``account_health()`` mirror,
+      ``@requires_llm`` decorator pattern for tools that gate on
+      Anthropic key presence. Each is a separate small PR.
 
 ### 🛡️ Phase 2 (Assist) — release 0.3.0
 
@@ -655,6 +664,30 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M15.5.1 — Account health check (rule-based, no LLM)**
+      (§M15.5, Phase 0+1, release 0.2.0). First user-visible
+      product surface that doesn't require an Anthropic API
+      key — deterministic ``HealthCheckService`` consuming M6's
+      ``account_overview`` and applying rule classes. Two rules
+      shipped: ``BurningCampaignRule`` (HIGH severity, cost > 50
+      RUB AND conversions == 0 with goal_id set) and
+      ``HighCpaRule`` (WARNING severity, cpa_rub > target with
+      ≥5 conversions and ``Settings.account_target_cpa_rub``
+      configured). Both rules respect the M6 ``cpa_rub is None``
+      contract — None means undefined, never infinity, so a
+      regression can't silently nuke burning campaigns through
+      the high-CPA path. New ``health.py`` model module
+      (``Severity``, ``Finding``, ``HealthReport``,
+      ``default_window``); new
+      ``Settings.account_target_cpa_rub: float | None``. New
+      ``yadirect-agent health`` CLI command with
+      ``--days``/``--goal-id``/``--json`` options and exit code
+      1 on HIGH findings (cron-alertable). Renderer separated
+      into ``cli/health.py`` for cleanliness. 34 new unit tests
+      (11 model + 15 service + 8 cli); 675 total green. Out of
+      scope (deferred to M15.5.2-6): low-CTR (needs impressions),
+      rejected-ads/keywords (needs Direct reports), CTR drift
+      (needs history), MCP tool, ``@requires_llm`` decorator.
 - [x] **M6 (basic) — Metrika reading** (§M6, Phase 0+1, release
       0.2.0). Three Metrika endpoints
       (`MetrikaService.get_goals`, `get_report`,

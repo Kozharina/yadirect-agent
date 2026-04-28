@@ -49,8 +49,10 @@ from ..agent.tools import build_default_registry, build_safety_pair
 from ..audit import AuditEvent, AuditSink, audit_action
 from ..config import Settings, get_settings
 from ..logging import configure_logging
+from ..models.health import default_window
 from ..rollout import RolloutState, RolloutStateStore
 from ..services.campaigns import CampaignService, CampaignSummary
+from ..services.health_check import HealthCheckService
 from .doctor import (
     CheckResult,
     check_anthropic,
@@ -58,6 +60,7 @@ from .doctor import (
     check_env,
     check_policy_file,
 )
+from .health import render_report_json, render_report_text
 
 app = typer.Typer(
     name="yadirect-agent",
@@ -198,6 +201,71 @@ def list_campaigns_cmd(
         typer.echo(json.dumps([asdict(s) for s in summaries], ensure_ascii=False))
         return
     _render_campaigns_table(summaries)
+
+
+# --------------------------------------------------------------------------
+# `health` — rule-based account health check (M15.5.1).
+# --------------------------------------------------------------------------
+
+
+@app.command("health")
+def health_cmd(
+    days: Annotated[
+        int,
+        typer.Option(
+            "--days",
+            min=1,
+            max=90,
+            help="Window length, ending yesterday. Default 7.",
+        ),
+    ] = 7,
+    goal_id: Annotated[
+        int | None,
+        typer.Option(
+            "--goal-id",
+            min=1,
+            help=(
+                "Metrika goal id to count conversions against. "
+                "Without it, conversion-based rules silently skip. "
+                "Must be a positive integer."
+            ),
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Emit JSON to stdout instead of a table.",
+        ),
+    ] = False,
+) -> None:
+    """Run rule-based account health check, emit findings.
+
+    No LLM involved — entirely deterministic on Direct + Metrika data.
+    Use this for the first read of a new account and as a daily probe
+    in cron. Exit code is 0 if no HIGH-severity findings, 1 if any
+    HIGH finding fired (suitable for cron alerting).
+    """
+    settings = _bootstrap_settings()
+
+    async def fetch() -> Any:
+        async with HealthCheckService(settings) as svc:
+            return await svc.run_account_check(
+                date_range=default_window(days=days),
+                goal_id=goal_id,
+            )
+
+    report = asyncio.run(fetch())
+
+    if as_json:
+        typer.echo(render_report_json(report))
+    else:
+        render_report_text(_out, report)
+
+    from ..models.health import Severity as _Sev
+
+    if report.findings_by_severity(_Sev.HIGH):
+        raise typer.Exit(code=1)
 
 
 # --------------------------------------------------------------------------
