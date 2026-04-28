@@ -50,11 +50,19 @@ Real Wordstat, A/B testing, Metrika reporting and alerts don't yet.
 
 Requires Python 3.11+.
 
-**End user** (after the first PyPI release tag — workflow lands in this
-PR, first publish is a separate operator action):
+**End user** (recommended — once on the host machine):
 
 ```bash
 pip install yadirect-agent                      # or: pipx install yadirect-agent
+yadirect-agent install-into-claude-desktop      # wires it into Claude Desktop
+# Restart Claude Desktop, then in chat:
+#   "помоги настроить Яндекс.Директ-агент"
+```
+
+If you prefer the CLI without Claude Desktop:
+
+```bash
+pip install yadirect-agent
 cp /path/to/.env.example .env                   # fill tokens; keep YANDEX_USE_SANDBOX=true
 cp /path/to/agent_policy.example.yml agent_policy.yml
 yadirect-agent --version

@@ -36,11 +36,7 @@ demo-only, technically; it cannot be handed to a non-developer.
       see Done. **Blocked on operator action** to register
       Trusted Publisher and push first ``v0.1.0`` tag (see
       Blocked / waiting).
-- [ ] **M15.2 — `install-into-claude-desktop`**: cross-platform
-      command that finds the Claude Desktop config, validates JSON,
-      backs it up, inserts the ``mcpServers`` block for
-      ``yadirect-agent``. ``--dry-run`` flag. ``uninstall-from-claude-desktop``
-      reverse. Tested with a fake config-path injected via env.
+- [x] ~~**M15.2 — `install-into-claude-desktop`**~~ — shipped, see Done.
 - [ ] **M15.3 — Standard OAuth flow with keyring**: register one
       OAuth-app project-side (Direct + Metrika scopes), local
       ``localhost:8765/callback`` HTTP server during ``auth login``,
@@ -198,6 +194,18 @@ the PR merges or is abandoned.
 
 Accumulated work that isn't blocking but will sting later.
 
+- [ ] **Claude Desktop installer TOCTOU race** (M15.2 follow-up,
+      auditor MEDIUM-3): ``install_into_config`` reads the existing
+      config, computes the merged version, then atomic-writes back.
+      If another process writes to the file between the read and
+      the write (Claude Desktop auto-updating its own config, or
+      a parallel installer for a different MCP server), our write
+      silently overwrites their change. Documented in the
+      ``install_into_config`` docstring; same single-operator
+      local-trust model as ``apply-plan``. Fix when a multi-
+      process workflow becomes a real requirement: ``fcntl.flock``
+      on POSIX, ``msvcrt.locking`` on Windows, or a separate
+      lockfile under the same parent dir.
 - [ ] **MetrikaService report pagination** (M6 follow-up):
       ``/stat/v1/data`` returns up to 100k rows by default. For an
       account with thousands of keywords/campaigns over a long
@@ -704,6 +712,27 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M15.2 — `install-into-claude-desktop`** (§M15.2, Phase 0+1,
+      release 0.2.0). Two new CLI subcommands —
+      ``install-into-claude-desktop`` and
+      ``uninstall-from-claude-desktop`` — that wire yadirect-agent's
+      MCP server into the Claude Desktop config so non-developer
+      users do not have to find and hand-edit JSON. Cross-platform
+      ``resolve_config_path`` (macOS / Windows with APPDATA fallback /
+      Linux with XDG_CONFIG_HOME). Pure-JSON ``install_into_config`` /
+      ``uninstall_from_config`` with merge-without-clobber, timestamped
+      backup of pre-existing config, idempotency on already-installed,
+      action="updated" when overwriting a stale entry, ``--dry-run``
+      preview, refusal to overwrite corrupt JSON (operator decides
+      how to recover). Atomic writes via ``tempfile.mkstemp`` +
+      ``os.replace`` so a crash mid-write leaves the previous config
+      intact. Operator-facing output color-codes the action and
+      always emits a "Restart Claude Desktop" hint after a real
+      install — the most predictable user-experience footgun
+      ("installed but Claude doesn't see the tool" because the user
+      didn't restart) is now blocked at the CLI layer. 26 new unit
+      tests (6 path-resolver + 8 install + 5 uninstall + 7 CLI);
+      768 total green.
 - [x] **First PyPI release: ``yadirect-agent==0.1.0`` live**
       (M15.1 follow-through). Pending Trusted Publisher registered
       at pypi.org, ``v0.1.0`` tag pushed, ``release.yml`` workflow
