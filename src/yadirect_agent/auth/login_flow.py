@@ -66,7 +66,15 @@ class _TokenSink(Protocol):
     object with a ``save(TokenSet)`` method.
     """
 
-    def save(self, token: TokenSet) -> None: ...
+    def save(self, token: TokenSet) -> None:
+        """Persist the given TokenSet to durable storage.
+
+        A docstring-only body (instead of the equivalent ``...``) is
+        functionally identical for a Protocol method but quiets
+        CodeQL's ``py/ineffective-statement`` heuristic, which
+        flags standalone ``Ellipsis`` even though PEP 544 documents
+        it as the canonical Protocol body.
+        """
 
 
 def _default_browser_open(url: str) -> None:
