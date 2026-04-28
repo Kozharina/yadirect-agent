@@ -250,6 +250,124 @@ class TestDefaultRegistry:
 
 
 # --------------------------------------------------------------------------
+# M20 slice 2 — handlers construct a ``Rationale`` from ``inp.reason``
+# and pass it via ``rationale=`` to the underlying service method.
+# The decorator overwrites ``decision_id`` with ``plan.plan_id`` and
+# persists; the test patches at the service level (so the decorator
+# is bypassed) and verifies the kwarg shape directly.
+# --------------------------------------------------------------------------
+
+
+class TestHandlersPassRationaleToService:
+    @pytest.mark.parametrize(
+        (
+            "tool_name",
+            "args",
+            "service_class_name",
+            "method_name",
+            "expected_action",
+            "expected_rt",
+            "expected_ids",
+        ),
+        [
+            (
+                "pause_campaigns",
+                {"ids": [1, 2], "reason": "CTR < 0.5% over the last 7 days."},
+                "CampaignService",
+                "pause",
+                "pause_campaigns",
+                "campaign",
+                [1, 2],
+            ),
+            (
+                "resume_campaigns",
+                {"ids": [3], "reason": "Refreshed creatives, resuming campaign."},
+                "CampaignService",
+                "resume",
+                "resume_campaigns",
+                "campaign",
+                [3],
+            ),
+            (
+                "set_campaign_budget",
+                {
+                    "campaign_id": 5,
+                    "budget_rub": 700,
+                    "reason": "Strong ROAS this week, scaling spend.",
+                },
+                "CampaignService",
+                "set_daily_budget",
+                "set_campaign_budget",
+                "campaign",
+                [5],
+            ),
+            (
+                "set_keyword_bids",
+                {
+                    "updates": [{"keyword_id": 9, "new_search_bid_rub": 8.0}],
+                    "reason": "Top converter, raising bid by 10%.",
+                },
+                "BiddingService",
+                "apply",
+                "set_keyword_bids",
+                "keyword",
+                [9],
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_handler_constructs_rationale_with_reason_as_summary(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        monkeypatch: pytest.MonkeyPatch,
+        tool_name: str,
+        args: dict[str, Any],
+        service_class_name: str,
+        method_name: str,
+        expected_action: str,
+        expected_rt: str,
+        expected_ids: list[int],
+    ) -> None:
+        from yadirect_agent.services.bidding import BiddingService
+        from yadirect_agent.services.campaigns import CampaignService
+
+        captured: dict[str, Any] = {}
+
+        async def _fake(self: Any, *_args: Any, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        target_class = (
+            CampaignService if service_class_name == "CampaignService" else BiddingService
+        )
+        monkeypatch.setattr(target_class, method_name, _fake)
+
+        tool = build_default_registry(settings).get(tool_name)
+        inp = tool.input_model.model_validate(args)
+        await tool.handler(inp, tool_context)
+
+        # Handler MUST pass ``rationale=`` so the decorator can persist
+        # it. Without this, M20 slice 2 collapses to the same
+        # ``rationale.missing`` warning the soft-optional path used
+        # to emit — the operator still gets no record of the reason.
+        assert "rationale" in captured, (
+            f"{tool_name} handler did not pass rationale= to {service_class_name}.{method_name}"
+        )
+        rat = captured["rationale"]
+        # Summary IS the reason verbatim — the args are already in
+        # ``plan.preview`` / ``plan.args``, no need to duplicate them
+        # into the summary.
+        assert rat.summary == args["reason"]
+        # Action / resource_type / resource_ids mirror the
+        # ``@requires_plan(...)`` configuration so a future read-back
+        # query like ``rationale list --action=set_campaign_budget``
+        # finds this record.
+        assert rat.action == expected_action
+        assert rat.resource_type == expected_rt
+        assert rat.resource_ids == expected_ids
+
+
+# --------------------------------------------------------------------------
 # M2.4 — Daily-budget hard guard (env backstop).
 #
 # When ``settings.agent_max_daily_budget_rub`` is tighter than the YAML's
