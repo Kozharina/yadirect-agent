@@ -29,6 +29,7 @@ import asyncio
 import json
 from dataclasses import asdict
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated, Any
 
 import structlog
@@ -62,6 +63,14 @@ from .doctor import (
     check_policy_file,
 )
 from .health import render_report_json, render_report_text
+from .install import (
+    ConfigError as ClaudeConfigError,
+)
+from .install import (
+    install_into_config,
+    resolve_config_path,
+    uninstall_from_config,
+)
 from .rationale import render_list_text, render_show_json, render_show_text
 
 app = typer.Typer(
@@ -268,6 +277,121 @@ def health_cmd(
 
     if report.findings_by_severity(_Sev.HIGH):
         raise typer.Exit(code=1)
+
+
+# --------------------------------------------------------------------------
+# `install-into-claude-desktop` / `uninstall-from-claude-desktop` (M15.2).
+# --------------------------------------------------------------------------
+
+
+def _resolve_install_path(config_path: Path | None) -> Path:
+    """Decide whether to use the explicit ``--config-path`` or the OS default."""
+    if config_path is not None:
+        return config_path
+    try:
+        return resolve_config_path()
+    except ClaudeConfigError as exc:
+        _err.print(f"[red]error:[/red] {exc}")
+        _err.print("Pass --config-path to override.")
+        raise typer.Exit(code=1) from exc
+
+
+@app.command("install-into-claude-desktop")
+def install_into_claude_desktop_cmd(
+    config_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-path",
+            help=(
+                "Explicit path to claude_desktop_config.json. "
+                "Default: OS-conventional location (macOS / Windows / Linux)."
+            ),
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Show what would change without writing.",
+        ),
+    ] = False,
+) -> None:
+    """Wire yadirect-agent into the Claude Desktop config.
+
+    Idempotent — re-running on an already-installed config is a no-op.
+    Existing config is backed up with a timestamped suffix before any
+    write. Operator-set MCP servers and unrelated top-level fields
+    are preserved verbatim.
+
+    Run this once after ``pip install yadirect-agent``, then restart
+    Claude Desktop to see the new tool.
+    """
+    path = _resolve_install_path(config_path)
+    try:
+        result = install_into_config(path, dry_run=dry_run)
+    except ClaudeConfigError as exc:
+        _err.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    prefix = "[dim](dry-run)[/dim] " if result.dry_run else ""
+    if result.action == "added":
+        _out.print(f"{prefix}[green]✓[/green] Added yadirect-agent to {result.config_path}")
+    elif result.action == "updated":
+        _out.print(
+            f"{prefix}[yellow]✓[/yellow] Updated stale yadirect-agent entry "
+            f"at {result.config_path}",
+        )
+    else:  # already_installed
+        _out.print(f"{prefix}[dim]Already installed at {result.config_path}[/dim]")
+
+    if result.backup_path is not None:
+        _out.print(f"{prefix}[dim]Backed up previous config to {result.backup_path}[/dim]")
+
+    if not result.dry_run and result.action != "already_installed":
+        _out.print(
+            "\n[bold]Next:[/bold] Restart Claude Desktop. "
+            "The new tool appears under the slider icon in the chat input.",
+        )
+
+
+@app.command("uninstall-from-claude-desktop")
+def uninstall_from_claude_desktop_cmd(
+    config_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-path",
+            help="Explicit path to claude_desktop_config.json.",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Show what would change without writing."),
+    ] = False,
+) -> None:
+    """Remove the yadirect-agent entry from Claude Desktop config.
+
+    Other MCP servers and unrelated top-level fields are preserved.
+    No-op when the entry is absent or the config file does not exist.
+    """
+    path = _resolve_install_path(config_path)
+    try:
+        result = uninstall_from_config(path, dry_run=dry_run)
+    except ClaudeConfigError as exc:
+        _err.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    prefix = "[dim](dry-run)[/dim] " if result.dry_run else ""
+    if result.action == "removed":
+        _out.print(f"{prefix}[green]✓[/green] Removed yadirect-agent from {result.config_path}")
+        if result.backup_path is not None:
+            _out.print(f"{prefix}[dim]Backed up previous config to {result.backup_path}[/dim]")
+        if not result.dry_run:
+            _out.print("\n[dim]Restart Claude Desktop to drop the tool from the menu.[/dim]")
+    else:  # not_installed
+        _out.print(
+            f"{prefix}[dim]yadirect-agent not installed at "
+            f"{result.config_path} — nothing to do.[/dim]",
+        )
 
 
 # --------------------------------------------------------------------------
