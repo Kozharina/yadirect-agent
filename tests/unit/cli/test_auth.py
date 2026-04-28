@@ -125,7 +125,10 @@ class TestAuthLogin:
 
         assert result.exit_code == 2, result.output
         # Operator must see the CAUSE — not just "error".
-        assert "access_denied" in result.stdout
+        # ``result.output`` captures both stdout + stderr; error
+        # messages go to stderr per UNIX convention but are part of
+        # the operator-visible output.
+        assert "access_denied" in result.output
 
     def test_login_timeout_exits_two_with_helpful_hint(
         self,
@@ -141,7 +144,7 @@ class TestAuthLogin:
         result = runner.invoke(app, ["auth", "login"])
 
         assert result.exit_code == 2, result.output
-        assert "timeout" in result.stdout.lower() or "истёк" in result.stdout.lower()
+        assert "timeout" in result.output.lower() or "истёк" in result.output.lower()
 
     def test_login_auth_error_exits_two(
         self,
@@ -157,7 +160,7 @@ class TestAuthLogin:
         result = runner.invoke(app, ["auth", "login"])
 
         assert result.exit_code == 2, result.output
-        assert "invalid_grant" in result.stdout
+        assert "invalid_grant" in result.output
 
 
 class TestAuthStatus:
@@ -171,7 +174,7 @@ class TestAuthStatus:
         result = runner.invoke(app, ["auth", "status"])
 
         assert result.exit_code == 1, result.output
-        assert "не вошли" in result.stdout.lower() or "not logged in" in result.stdout.lower()
+        assert "не вошли" in result.output.lower() or "not logged in" in result.output.lower()
 
     def test_status_when_logged_in_prints_masked_summary(
         self,

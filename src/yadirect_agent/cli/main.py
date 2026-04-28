@@ -50,12 +50,29 @@ from ..agent.plans import OperationPlan, PendingPlansStore
 from ..agent.rationale_store import RationaleStore
 from ..agent.tools import build_default_registry, build_safety_pair
 from ..audit import AuditEvent, AuditSink, audit_action
+from ..auth.callback_server import OAuthCallbackError
+from ..auth.keychain import KeyringTokenStore
+from ..auth.login_flow import perform_login
 from ..config import Settings, get_settings
+from ..exceptions import AuthError
 from ..logging import configure_logging
 from ..models.health import default_window
 from ..rollout import RolloutState, RolloutStateStore
 from ..services.campaigns import CampaignService, CampaignSummary
 from ..services.health_check import HealthCheckService
+from .auth import (
+    LOGIN_BROWSER_FALLBACK_HINT,
+    LOGIN_EXCHANGE_ERROR_PREFIX,
+    LOGIN_KEYCHAIN_NOTE,
+    LOGIN_OAUTH_ERROR_PREFIX,
+    LOGIN_OPENING_BROWSER_HINT,
+    LOGIN_SUCCESS,
+    LOGIN_TIMEOUT_HINT,
+    REVOKE_SUCCESS,
+    STATUS_NOT_LOGGED_IN,
+)
+from .auth import render_status_text as render_auth_status_text
+from .auth import status_dict as auth_status_dict
 from .cost import aggregate_for_status, render_status_json, render_status_text
 from .doctor import (
     CheckResult,
@@ -322,6 +339,92 @@ def cost_status_cmd(
         typer.echo(render_status_json(summaries, settings))
     else:
         render_status_text(_out, summaries, settings)
+
+
+# --------------------------------------------------------------------------
+# `auth` subapp — Yandex OAuth login / status / revoke (M15.3).
+# --------------------------------------------------------------------------
+
+
+auth_app = typer.Typer(
+    name="auth",
+    help="Yandex OAuth: log in (PKCE flow), inspect status, revoke.",
+    no_args_is_help=True,
+)
+app.add_typer(auth_app, name="auth")
+
+
+@auth_app.command("login")
+def auth_login_cmd() -> None:
+    """Run the Yandex OAuth PKCE flow and persist the token to the OS keychain.
+
+    Opens the operator's default browser to the Yandex consent
+    page, runs a one-shot HTTP server on ``localhost:8765`` to
+    catch the redirect, exchanges the code, and writes the
+    TokenSet under ``yadirect-agent / oauth`` in the keychain.
+
+    Exit codes:
+    - 0  — success.
+    - 2  — user denied, callback timed out, or token exchange
+      rejected. The CLI surfaces the cause; the operator re-runs.
+    """
+    _out.print(LOGIN_OPENING_BROWSER_HINT)
+    _out.print(LOGIN_BROWSER_FALLBACK_HINT)
+    try:
+        token = asyncio.run(perform_login())
+    except OAuthCallbackError as exc:
+        _err.print(f"[red]{LOGIN_OAUTH_ERROR_PREFIX}:[/red] {_rich_escape(str(exc))}")
+        raise typer.Exit(code=2) from exc
+    except TimeoutError as exc:
+        _err.print(f"[red]{LOGIN_TIMEOUT_HINT}[/red]")
+        raise typer.Exit(code=2) from exc
+    except AuthError as exc:
+        _err.print(f"[red]{LOGIN_EXCHANGE_ERROR_PREFIX}:[/red] {_rich_escape(str(exc))}")
+        raise typer.Exit(code=2) from exc
+
+    _out.print(f"[green]{LOGIN_SUCCESS}[/green]")
+    _out.print(f"  scope: {', '.join(token.scope)}")
+    _out.print(f"  expires_at: {token.expires_at.isoformat()}")
+    _out.print(LOGIN_KEYCHAIN_NOTE)
+
+
+@auth_app.command("status")
+def auth_status_cmd(
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit JSON instead of formatted output."),
+    ] = False,
+) -> None:
+    """Show whether a TokenSet is stored, plus its scope + expiry (masked).
+
+    Exit codes:
+    - 0  — token present.
+    - 1  — not logged in. Cron-friendly so a wrapper can alert.
+    """
+    token = KeyringTokenStore().load()
+    if token is None:
+        if as_json:
+            typer.echo(json.dumps({"status": "not_logged_in"}))
+        else:
+            _err.print(STATUS_NOT_LOGGED_IN)
+        raise typer.Exit(code=1)
+
+    if as_json:
+        typer.echo(json.dumps(auth_status_dict(token)))
+        return
+    _out.print(render_auth_status_text(token))
+
+
+@auth_app.command("revoke")
+def auth_revoke_cmd() -> None:
+    """Clear the stored TokenSet from the OS keychain.
+
+    Idempotent: running on a fresh install (no record) is a no-op
+    exit-zero, so a setup script can call ``auth revoke`` then
+    ``auth login`` without conditional logic.
+    """
+    KeyringTokenStore().revoke()
+    _out.print(f"[green]{REVOKE_SUCCESS}[/green]")
 
 
 # --------------------------------------------------------------------------
