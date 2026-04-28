@@ -269,6 +269,45 @@ async def exchange_code_for_token(
     return _parse_token_payload(body, obtained_at=obtained_at)
 
 
+async def refresh_access_token(
+    *,
+    refresh_token: str,
+    now: datetime | None = None,
+) -> TokenSet:
+    """Mint a fresh TokenSet from an existing refresh token.
+
+    Yandex (like most OAuth 2.0 providers) rotates the refresh token
+    on use: the response carries BOTH a new access_token AND a new
+    refresh_token. Callers must persist the whole new TokenSet —
+    keeping the old refresh_token would silently lock the operator
+    out of the next refresh.
+
+    Refresh does NOT use PKCE. PKCE protects the initial code-for-
+    token exchange against loopback interception; the refresh token
+    is itself the secret that proves identity to the token endpoint.
+
+    Same error mapping as ``exchange_code_for_token``: 4xx →
+    ``AuthError`` (operator redoes login; usually the refresh has
+    been rotated out, revoked from ``yandex.ru/profile/access``, or
+    expired), 5xx / network → ``ApiTransientError`` (operator can
+    retry without re-doing login).
+    """
+    obtained_at = now if now is not None else datetime.now(UTC)
+    payload = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLIENT_ID,
+    }
+    response = await _do_oauth_request(payload)
+    _raise_for_oauth_error(response)
+    try:
+        body: dict[str, Any] = response.json()
+    except ValueError as exc:
+        msg = f"non-JSON response from Yandex OAuth refresh: {response.text[:200]!r}"
+        raise ApiTransientError(msg) from exc
+    return _parse_token_payload(body, obtained_at=obtained_at)
+
+
 __all__ = [
     "AUTH_URL",
     "CLIENT_ID",
@@ -280,4 +319,5 @@ __all__ = [
     "build_authorization_url",
     "exchange_code_for_token",
     "generate_pkce_pair",
+    "refresh_access_token",
 ]
