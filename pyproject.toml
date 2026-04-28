@@ -52,6 +52,9 @@ dependencies = [
     "mcp>=1.0",                     # official MCP SDK
     # Config files
     "pyyaml>=6.0",                  # agent_policy.yml parsing (M2 safety layer)
+    # Auth (M15.3: PKCE OAuth flow persists tokens in the OS keychain
+    # with env-var fallback for headless / CI / Docker contexts).
+    "keyring>=25",
     # Utilities
     "tldextract>=5.1",              # domain extraction for seeds
     "python-slugify>=8.0",
