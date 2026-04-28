@@ -361,6 +361,45 @@ class TestExchangeCodeForToken:
         with pytest.raises(ApiTransientError):
             await exchange_code_for_token(code="c", code_verifier="v", now=_FROZEN_NOW)
 
+    @respx.mock
+    async def test_malformed_200_payload_raises_transient(self) -> None:
+        # 200 OK with a body missing required fields — Yandex changed
+        # a field name, a misconfigured proxy stripped a header, or a
+        # bug in our parser drifts from upstream. The exact failure
+        # mode that surfaces only at 2 AM during an unrelated incident.
+        # Pin the mapping: malformed payload → ApiTransientError, NOT
+        # KeyError / TypeError that would crash the CLI.
+        respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(200, json={"access_token": "only-this-field"}),
+        )
+
+        with pytest.raises(ApiTransientError, match="malformed"):
+            await exchange_code_for_token(code="c", code_verifier="v", now=_FROZEN_NOW)
+
+    @respx.mock
+    async def test_non_json_200_body_raises_transient(self) -> None:
+        # 200 OK with non-JSON body — typically an HTML maintenance
+        # page from a misconfigured upstream proxy. Same recovery
+        # path: ApiTransientError so the CLI can suggest retry.
+        respx.post(TOKEN_URL).mock(
+            return_value=httpx.Response(200, text="<html>maintenance</html>"),
+        )
+
+        with pytest.raises(ApiTransientError):
+            await exchange_code_for_token(code="c", code_verifier="v", now=_FROZEN_NOW)
+
+    @respx.mock
+    async def test_400_with_non_json_body_still_raises_autherror(self) -> None:
+        # 4xx with HTML body (provider error page instead of JSON).
+        # The error path falls back to a generic ``oauth_error``
+        # message but still raises AuthError — operator must redo
+        # login, the CLI does not crash trying to ``.json()`` the
+        # body.
+        respx.post(TOKEN_URL).mock(return_value=httpx.Response(400, text="<h1>bad</h1>"))
+
+        with pytest.raises(AuthError):
+            await exchange_code_for_token(code="c", code_verifier="v", now=_FROZEN_NOW)
+
 
 class TestRefreshAccessToken:
     @respx.mock
