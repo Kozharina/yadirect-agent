@@ -39,6 +39,7 @@ import structlog
 from pydantic import ValidationError as PydanticValidationError
 
 from ..config import Settings
+from .cost import CostStore, calculate_cost
 from .prompts import SYSTEM_PROMPT
 from .tools import Tool, ToolContext, ToolRegistry
 
@@ -95,6 +96,12 @@ class AgentRun:
     input_tokens: int
     output_tokens: int
     stop_reason: str
+    cost_rub: float = 0.0
+    """Total RUB cost for this run, summed over all messages.create
+    calls. Per-call CostRecord entries with the same ``trace_id`` are
+    persisted to ``cost.jsonl`` alongside the audit log (M21). Default
+    0.0 keeps backward-compat for tests that construct AgentRun
+    directly without going through the loop's cost capture."""
 
 
 # --------------------------------------------------------------------------
@@ -178,6 +185,7 @@ class _Accumulator:
     tool_calls: list[ToolCall] = field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
+    cost_rub: float = 0.0
 
 
 class Agent:
@@ -193,6 +201,7 @@ class Agent:
         max_tokens_per_call: int = 4096,
         repetition_limit: int = 5,
         system_prompt: str = SYSTEM_PROMPT,
+        cost_store: CostStore | None = None,
     ) -> None:
         if max_iterations < 1:
             msg = "max_iterations must be >= 1"
@@ -208,6 +217,14 @@ class Agent:
         self._repetition_limit = repetition_limit
         self._system_prompt = system_prompt
         self._logger = structlog.get_logger().bind(component="agent")
+        # Cost tracking (M21). Default store is sibling to the audit
+        # log so all agent-life records cluster in one directory.
+        # Caller can pass a custom store (tests inject in-memory or
+        # tmp_path stores; multi-account deployments could route to
+        # per-tenant files in a future M14).
+        if cost_store is None:
+            cost_store = CostStore(settings.audit_log_path.parent / "cost.jsonl")
+        self._cost_store = cost_store
 
     async def run(self, user_message: str) -> AgentRun:
         """Execute the tool-use loop until end_turn or a guard trips."""
@@ -230,6 +247,7 @@ class Agent:
                 max_tokens=self._max_tokens,
             )
             self._accumulate_tokens(accum, response)
+            self._capture_cost(accum, response, trace_id)
 
             messages.append({"role": "assistant", "content": _dump_content(response.content)})
 
@@ -248,6 +266,7 @@ class Agent:
                     input_tokens=accum.input_tokens,
                     output_tokens=accum.output_tokens,
                     stop_reason=response.stop_reason,
+                    cost_rub=accum.cost_rub,
                 )
 
             if response.stop_reason != "tool_use":
@@ -265,6 +284,7 @@ class Agent:
                     input_tokens=accum.input_tokens,
                     output_tokens=accum.output_tokens,
                     stop_reason=str(response.stop_reason or "unknown"),
+                    cost_rub=accum.cost_rub,
                 )
 
             tool_result_blocks = await self._execute_tool_uses(
@@ -396,6 +416,58 @@ class Agent:
             return
         accum.input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
         accum.output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
+
+    def _capture_cost(
+        self,
+        accum: _Accumulator,
+        response: Message,
+        trace_id: str,
+    ) -> None:
+        """Persist a CostRecord for this messages.create call (M21).
+
+        Reads the same ``response.usage`` shape ``_accumulate_tokens``
+        does, but also pulls cached-input tokens (Anthropic exposes
+        these separately) and converts to RUB through the calculator.
+        Per-call write rather than per-run aggregation: an agent run
+        that crashes mid-loop still leaves accurate partial cost on
+        disk for the operator to investigate.
+
+        Failures here MUST NOT abort the agent run. A broken cost
+        store is operationally annoying but a write-time JSONL
+        failure leaking up would mean a working agent stops working
+        because of a tracking bug. Same defensive posture as the
+        audit sink (M2.3 emit-guards). Errors are logged and
+        swallowed.
+        """
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+        cached_input_tokens = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+        try:
+            record = calculate_cost(
+                trace_id=trace_id,
+                model=self._settings.anthropic_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_input_tokens=cached_input_tokens,
+                settings=self._settings,
+            )
+            self._cost_store.append(record)
+            accum.cost_rub += record.cost_rub
+        except (OSError, ValueError) as exc:
+            # OSError: cost.jsonl write failure (disk full, perms, etc.)
+            # ValueError: pydantic validation rejected the record
+            #             (e.g. impossibly negative tokens from a
+            #             malformed Anthropic response).
+            # Either way: log + continue. The agent run is more
+            # important than the cost record.
+            self._logger.warning(
+                "agent.cost.capture_failed",
+                trace_id=trace_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
 
 
 # --------------------------------------------------------------------------

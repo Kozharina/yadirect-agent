@@ -72,12 +72,15 @@ demo-only, technically; it cannot be handed to a non-developer.
       threshold) into ``CheckResult.details``; the decorator pulls
       these out and merges into ``Rationale.policy_slack``
       automatically. Today the caller fills it manually.
-- [ ] **M21 — Cost tracking** (§M21, promoted from Ideas): per-call
-      tokens + RUB capture, `agent_monthly_llm_budget_rub` knob,
-      auto-degrade to `--no-llm` when budget exhausted, `cost
-      status` surface. **Required before autonomy** — otherwise LLM
-      spend creeps invisibly and the agent silently dies at
-      month-end.
+- [x] ~~**M21 — Cost tracking (slice 1)**~~ — shipped, see Done.
+      Observability surface (per-call CostRecord, JSONL persistence,
+      ``cost status`` CLI). Hard auto-degrade to ``--no-llm`` on
+      budget exhaust deferred to M21.2 (needs M18 alert path).
+- [ ] **M21.2 — Cost tracking enforcement**: hard auto-degrade to
+      ``--no-llm`` when ``agent_monthly_llm_budget_rub`` exhausted.
+      Blocked on M18 (notifications) — silently degrading without
+      an operator alert is a worse failure mode than hitting the
+      budget.
 - [x] ~~**M6 (basic) — Metrika reporting**~~ — shipped, see Done.
 - [x] ~~**M15.5.1 — Account health check (basic rules)**~~ — shipped,
       see Done. Two rules + ``yadirect-agent health`` CLI.
@@ -712,6 +715,30 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **M21 — Cost tracking (slice 1)** (§M21, Phase 0+1, release
+      0.2.0). Per-call CostRecord (timestamp, trace_id aligned
+      with AgentRun, model, input/output/cached tokens, pricing
+      snapshot at write time, ``cost_rub``). ``calculate_cost``
+      reads ``Settings.usd_to_rub_rate`` + DEFAULT_ANTHROPIC_PRICING
+      (Opus / Sonnet / Haiku rates as of 2026-04, conservative
+      Opus fallback for unknown models). ``CostStore`` JSONL
+      sibling to audit/plans/rationale (defensive parsing of
+      corrupt lines, missing-file = empty reads). Wired into
+      ``agent/loop.py:run`` after every ``messages.create``;
+      ``AgentRun.cost_rub`` sums across iterations. Failure
+      defensive (auditor M2.3a pattern): OSError / ValidationError
+      logged + swallowed, never aborts the agent run. New
+      Settings knobs ``usd_to_rub_rate`` (default 100, gt=0,
+      finite-only) and ``agent_monthly_llm_budget_rub``
+      (Optional, gt=0, finite-only); ``.env.example`` documents
+      both. ``yadirect-agent cost status [--json]`` shows
+      current vs previous month, end-of-month projection, and
+      color-coded budget view when configured. 56 new unit
+      tests (15 model + 7 config + 13 agent.cost + 4 loop
+      integration + 17 implicit cli/cost coverage); 810 total
+      green. Out of scope: hard auto-degrade to ``--no-llm`` on
+      budget exhaust (M21.2, needs M18); Telegram cost alerts;
+      real-time currency lookup.
 - [x] **M15.2 — `install-into-claude-desktop`** (§M15.2, Phase 0+1,
       release 0.2.0). Two new CLI subcommands —
       ``install-into-claude-desktop`` and
