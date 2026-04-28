@@ -551,6 +551,14 @@ def rationale_list_cmd(
     store = _rationale_store(settings)
 
     if campaign is not None:
+        # Defence in depth: typer ``min=1`` already rejects ``--days 0``,
+        # but the campaign branch goes via ``list_for_resource`` (no
+        # built-in window guard) rather than ``list_recent`` (which has
+        # one). Refusing here mirrors the behaviour the non-campaign
+        # branch enforces through the store. (auditor M20 MEDIUM-1.)
+        if days <= 0:
+            _err.print("[red]--days must be >= 1[/red]")
+            raise typer.Exit(code=1)
         rationales = store.list_for_resource(campaign_id=campaign)
         # Apply the day window client-side after the campaign filter.
         from datetime import UTC, datetime, timedelta

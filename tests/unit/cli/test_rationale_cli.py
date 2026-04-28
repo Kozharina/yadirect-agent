@@ -223,6 +223,23 @@ class TestRationaleList:
 
         assert result.exit_code != 0
 
+    def test_zero_days_rejected_with_campaign_filter(
+        self,
+        runner: CliRunner,
+        _patch_bootstrap: None,
+    ) -> None:
+        # Campaign branch uses list_for_resource which doesn't have a
+        # built-in days guard; the typer min=1 constraint catches the
+        # 0 today, but defence in depth requires the same guard at
+        # the command level for the campaign branch too.
+        # (auditor M20 MEDIUM-1.)
+        result = runner.invoke(
+            app,
+            ["rationale", "list", "--campaign", "42", "--days", "0"],
+        )
+
+        assert result.exit_code != 0
+
 
 # --------------------------------------------------------------------------
 # Markup-injection safety in CLI rendering (mirrors M15.5.1 HIGH-1).
