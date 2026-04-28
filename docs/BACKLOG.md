@@ -172,7 +172,19 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **M15.2 — `install-into-claude-desktop`** (§M15.2, branch
+      `feat/m15-2-install-into-claude-desktop`). Cross-platform
+      command that finds the Claude Desktop config file (macOS:
+      ``~/Library/Application Support/Claude/claude_desktop_config.json``;
+      Windows: ``%APPDATA%\Claude\claude_desktop_config.json``;
+      Linux: ``~/.config/Claude/claude_desktop_config.json``),
+      validates JSON, backs it up with timestamp, merges in the
+      ``mcpServers`` block for ``yadirect-agent``, writes back
+      atomically. ``--dry-run`` flag shows the diff without
+      writing. ``uninstall-from-claude-desktop`` is the reverse.
+      Idempotent: re-running install does not duplicate. Tests
+      monkeypatch ``platform.system()`` and the home dir so no
+      real config is touched.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
