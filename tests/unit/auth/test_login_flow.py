@@ -29,6 +29,7 @@ fixture replaces the OS keyring.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import socket
 from datetime import UTC, datetime
 from typing import Any
@@ -37,13 +38,13 @@ import httpx
 import keyring.errors
 import pytest
 import respx
-from yadirect_agent.auth.login_flow import perform_login
 
 from yadirect_agent.auth.keychain import (
     KEYRING_SERVICE_NAME,
     KEYRING_USERNAME,
     KeyringTokenStore,
 )
+from yadirect_agent.auth.login_flow import perform_login
 from yadirect_agent.clients.oauth import (
     CLIENT_ID,
     REDIRECT_URI,
@@ -115,16 +116,35 @@ def _drive_callback_when_browser_opens(
     """Build an ``on_browser_open`` hook that, when the orchestrator
     "opens" the auth URL, schedules a coroutine driving the local
     callback server with a valid callback. Returns the hook plus a
-    list that captures the URLs handed to it (for assertions)."""
+    list that captures the URLs handed to it (for assertions).
+
+    Uses a raw asyncio socket rather than ``httpx`` because the test
+    runs under ``@respx.mock``, which intercepts every ``httpx``
+    request — including the loopback one we want to actually hit
+    our server. Raw sockets bypass that interception."""
     captured: list[str] = []
 
     async def _drive() -> None:
         # Yield once so perform_login can reach ``wait_for_code``.
         await asyncio.sleep(0.05)
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            await client.get(
-                f"http://127.0.0.1:{test_port}/callback?code={code}&state={state}",
+        reader, writer = await asyncio.open_connection("127.0.0.1", test_port)
+        try:
+            request = (
+                f"GET /callback?code={code}&state={state} HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{test_port}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
             )
+            writer.write(request.encode("ascii"))
+            await writer.drain()
+            # Drain the server's response so the server-side write
+            # completes cleanly.
+            while await reader.read(1024):
+                pass
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
 
     # Hold a strong reference to the task so it cannot be garbage-
     # collected mid-flight (RUF006). The list lives until the test
