@@ -22,6 +22,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import re
+from urllib.parse import parse_qs, urlparse
+
+import pytest
 
 from yadirect_agent.clients.oauth import (
     AUTH_URL,
@@ -30,6 +33,7 @@ from yadirect_agent.clients.oauth import (
     REDIRECT_URI,
     SCOPES,
     TOKEN_URL,
+    build_authorization_url,
     generate_pkce_pair,
 )
 
@@ -117,3 +121,71 @@ class TestConstants:
         assert TOKEN_URL.startswith("https://")
         assert "oauth.yandex.ru" in AUTH_URL
         assert "oauth.yandex.ru" in TOKEN_URL
+
+
+class TestBuildAuthorizationURL:
+    def _build(self, *, state: str = "csrf-32-chars-of-random-bytes-XYZ") -> str:
+        pair = generate_pkce_pair()
+        return build_authorization_url(state=state, code_challenge=pair.challenge)
+
+    def test_url_starts_with_oauth_endpoint(self) -> None:
+        url = self._build()
+
+        assert url.startswith(AUTH_URL + "?"), (
+            f"URL must extend the AUTH_URL with a query string, got: {url}"
+        )
+
+    def test_required_params_present(self) -> None:
+        url = self._build()
+        params = parse_qs(urlparse(url).query)
+
+        # Yandex enforces presence of every parameter; missing any is a
+        # generic 400 with no diagnostic. Pin the full required set.
+        assert params["response_type"] == ["code"]
+        assert params["client_id"] == [CLIENT_ID]
+        assert params["redirect_uri"] == [REDIRECT_URI]
+        assert params["code_challenge_method"] == [CODE_CHALLENGE_METHOD]
+        assert "code_challenge" in params
+        assert "state" in params
+        assert "scope" in params
+
+    def test_scope_is_space_separated_per_oauth_spec(self) -> None:
+        # OAuth 2.0 §3.3: scope is a list of space-delimited values.
+        # Yandex is strict here — comma-separated scopes are silently
+        # truncated to the first entry, leaving the agent half-blind.
+        url = self._build()
+        params = parse_qs(urlparse(url).query)
+
+        scope_value = params["scope"][0]
+        assert scope_value == " ".join(SCOPES)
+
+    def test_state_is_propagated_verbatim(self) -> None:
+        marker = "csrf-32-chars-of-random-bytes-XYZ"
+        url = build_authorization_url(state=marker, code_challenge="abc-challenge")
+        params = parse_qs(urlparse(url).query)
+
+        # ``state`` is the CSRF defence: any drift between what we
+        # send and what we receive in the callback aborts the login.
+        assert params["state"] == [marker]
+
+    def test_code_challenge_is_propagated_verbatim(self) -> None:
+        url = build_authorization_url(state="anything", code_challenge="my-challenge-xyz")
+        params = parse_qs(urlparse(url).query)
+
+        # The verifier-challenge link breaks if the challenge in the
+        # URL differs from the one tied to the verifier we keep in
+        # memory — Yandex would 400 the eventual exchange.
+        assert params["code_challenge"] == ["my-challenge-xyz"]
+
+    def test_empty_state_rejected(self) -> None:
+        # Empty state is no state — eliminates CSRF protection. The
+        # caller MUST supply a fresh random value per login.
+        with pytest.raises(ValueError, match="state"):
+            build_authorization_url(state="", code_challenge="any-challenge")
+
+    def test_empty_challenge_rejected(self) -> None:
+        # An empty challenge means PKCE is effectively disabled (the
+        # token endpoint will accept any verifier or none). Refuse at
+        # the URL builder rather than letting the request go out.
+        with pytest.raises(ValueError, match="code_challenge"):
+            build_authorization_url(state="any-state", code_challenge="")
