@@ -214,12 +214,18 @@ def _emit_rationale(
         return
 
     if rationale is None:
+        # Tag the warning so a future log aggregator can alert on
+        # systematic suppression (auditor M20 LOW-6). The
+        # ``will_be_hard_required_in`` field signals that this
+        # warning becomes an error in M20 slice 2.
         _log.warning(
             "rationale.missing",
             plan_id=plan.plan_id,
             action=plan.action,
             resource_type=plan.resource_type,
             resource_ids=plan.resource_ids,
+            severity="warn",
+            will_be_hard_required_in="M20-slice2",
         )
         return
 
