@@ -130,6 +130,28 @@ class TestInstallCmd:
         assert result.exit_code == 0
         assert "restart" in result.output.lower()
 
+    def test_rich_markup_in_path_does_not_inject(
+        self,
+        runner: CliRunner,
+        tmp_path: Path,
+    ) -> None:
+        # auditor M15.2 MEDIUM-2: --config-path is operator-controlled
+        # and could carry Rich markup characters. Without _rich_escape,
+        # a path like ".../[red]FAKE ERROR[/red].json" renders the
+        # bracketed text as styled output, misleading the operator.
+        # Path must appear as literal text in the output.
+        config_path = tmp_path / "[red]injected[/red].json"
+
+        result = runner.invoke(
+            app,
+            ["install-into-claude-desktop", "--config-path", str(config_path)],
+        )
+
+        assert result.exit_code == 0, result.output
+        # The literal "[red]" must appear in the output — if Rich
+        # consumed it as markup, it would be missing.
+        assert "[red]" in result.output
+
 
 # --------------------------------------------------------------------------
 # uninstall-from-claude-desktop

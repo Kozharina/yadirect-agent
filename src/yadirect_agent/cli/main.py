@@ -291,7 +291,10 @@ def _resolve_install_path(config_path: Path | None) -> Path:
     try:
         return resolve_config_path()
     except ClaudeConfigError as exc:
-        _err.print(f"[red]error:[/red] {exc}")
+        # Escape the exception message — it embeds the env-var value
+        # (XDG_CONFIG_HOME, APPDATA) which is operator-controlled and
+        # could carry Rich markup (auditor M15.2 LOW-4 / MEDIUM-2).
+        _err.print(f"[red]error:[/red] {_rich_escape(str(exc))}")
         _err.print("Pass --config-path to override.")
         raise typer.Exit(code=1) from exc
 
@@ -330,22 +333,27 @@ def install_into_claude_desktop_cmd(
     try:
         result = install_into_config(path, dry_run=dry_run)
     except ClaudeConfigError as exc:
-        _err.print(f"[red]error:[/red] {exc}")
+        _err.print(f"[red]error:[/red] {_rich_escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
+    # All path-shaped values come from operator input (--config-path
+    # or XDG_CONFIG_HOME / APPDATA env vars) and must pass through
+    # _rich_escape — same hardening as M15.5.1 HIGH-1. (auditor
+    # M15.2 MEDIUM-2.)
+    cfg_str = _rich_escape(str(result.config_path))
     prefix = "[dim](dry-run)[/dim] " if result.dry_run else ""
     if result.action == "added":
-        _out.print(f"{prefix}[green]✓[/green] Added yadirect-agent to {result.config_path}")
+        _out.print(f"{prefix}[green]✓[/green] Added yadirect-agent to {cfg_str}")
     elif result.action == "updated":
         _out.print(
-            f"{prefix}[yellow]✓[/yellow] Updated stale yadirect-agent entry "
-            f"at {result.config_path}",
+            f"{prefix}[yellow]✓[/yellow] Updated stale yadirect-agent entry at {cfg_str}",
         )
     else:  # already_installed
-        _out.print(f"{prefix}[dim]Already installed at {result.config_path}[/dim]")
+        _out.print(f"{prefix}[dim]Already installed at {cfg_str}[/dim]")
 
     if result.backup_path is not None:
-        _out.print(f"{prefix}[dim]Backed up previous config to {result.backup_path}[/dim]")
+        backup_str = _rich_escape(str(result.backup_path))
+        _out.print(f"{prefix}[dim]Backed up previous config to {backup_str}[/dim]")
 
     if not result.dry_run and result.action != "already_installed":
         _out.print(
@@ -377,20 +385,21 @@ def uninstall_from_claude_desktop_cmd(
     try:
         result = uninstall_from_config(path, dry_run=dry_run)
     except ClaudeConfigError as exc:
-        _err.print(f"[red]error:[/red] {exc}")
+        _err.print(f"[red]error:[/red] {_rich_escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
+    cfg_str = _rich_escape(str(result.config_path))
     prefix = "[dim](dry-run)[/dim] " if result.dry_run else ""
     if result.action == "removed":
-        _out.print(f"{prefix}[green]✓[/green] Removed yadirect-agent from {result.config_path}")
+        _out.print(f"{prefix}[green]✓[/green] Removed yadirect-agent from {cfg_str}")
         if result.backup_path is not None:
-            _out.print(f"{prefix}[dim]Backed up previous config to {result.backup_path}[/dim]")
+            backup_str = _rich_escape(str(result.backup_path))
+            _out.print(f"{prefix}[dim]Backed up previous config to {backup_str}[/dim]")
         if not result.dry_run:
             _out.print("\n[dim]Restart Claude Desktop to drop the tool from the menu.[/dim]")
     else:  # not_installed
         _out.print(
-            f"{prefix}[dim]yadirect-agent not installed at "
-            f"{result.config_path} — nothing to do.[/dim]",
+            f"{prefix}[dim]yadirect-agent not installed at {cfg_str} — nothing to do.[/dim]",
         )
 
 
