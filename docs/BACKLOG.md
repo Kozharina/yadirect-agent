@@ -194,6 +194,18 @@ the PR merges or is abandoned.
 
 Accumulated work that isn't blocking but will sting later.
 
+- [ ] **Claude Desktop installer TOCTOU race** (M15.2 follow-up,
+      auditor MEDIUM-3): ``install_into_config`` reads the existing
+      config, computes the merged version, then atomic-writes back.
+      If another process writes to the file between the read and
+      the write (Claude Desktop auto-updating its own config, or
+      a parallel installer for a different MCP server), our write
+      silently overwrites their change. Documented in the
+      ``install_into_config`` docstring; same single-operator
+      local-trust model as ``apply-plan``. Fix when a multi-
+      process workflow becomes a real requirement: ``fcntl.flock``
+      on POSIX, ``msvcrt.locking`` on Windows, or a separate
+      lockfile under the same parent dir.
 - [ ] **MetrikaService report pagination** (M6 follow-up):
       ``/stat/v1/data`` returns up to 100k rows by default. For an
       account with thousands of keywords/campaigns over a long

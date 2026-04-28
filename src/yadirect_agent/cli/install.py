@@ -204,6 +204,26 @@ def install_into_config(path: Path, *, dry_run: bool = False) -> InstallResult:
 
     Raises:
         ConfigError: corrupt JSON or non-object root in existing config.
+
+    Concurrency caveat (auditor M15.2 MEDIUM-3): there is a TOCTOU
+    window between the read of the existing config and the atomic
+    write back. If another process (Claude Desktop itself, or a
+    parallel installer for a different MCP server) writes to the
+    file in that window, our write will silently overwrite their
+    change. The flow is:
+
+        1. read existing config A
+        2. compute merged config A + yadirect-agent
+        3. backup, atomic-write (A + yadirect-agent)
+
+    If between steps 1 and 3 another process writes B (where B
+    contains entries A doesn't), step 3 silently drops those
+    entries. For human-paced operator action this race window is
+    sub-millisecond and effectively unreachable, but a provisioning
+    script that runs ``install-into-claude-desktop`` in parallel
+    with another MCP installer is at risk. Same operational model
+    as ``apply-plan`` (single-operator local trust, no fcntl.flock);
+    fix when multi-process concurrency becomes a real requirement.
     """
     existing = _load_existing(path)
     is_new_file = existing is None
