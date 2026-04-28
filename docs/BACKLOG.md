@@ -155,7 +155,20 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **M15.1 — PyPI release** (§M15.1, branch
+      `feat/m15-1-pypi-release`). First slice of M15 (frictionless
+      onboarding). Polish ``pyproject.toml`` metadata for PyPI
+      (urls, classifiers, keywords, license file), add
+      ``.github/workflows/release.yml`` triggered on
+      ``v*.*.*`` tags that builds sdist+wheel and publishes via
+      PyPI Trusted Publishing (OIDC — no PyPI token in secrets),
+      verify local build succeeds, document the ``pip install
+      yadirect-agent`` path in README + OPERATING.md. **Blocked
+      on a manual one-time human action**: registering this
+      project as a Trusted Publisher at pypi.org. Workflow will
+      be in place but no release tag pushed in this PR — first
+      tag is a separate operator action after the workflow
+      lands.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
