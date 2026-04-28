@@ -73,3 +73,42 @@ class TestAccountTargetCpaRub:
         # crashes ``json.dumps`` in --json mode.
         with pytest.raises(ValidationError):
             Settings(**_settings_kwargs(account_target_cpa_rub=math.nan))  # type: ignore[arg-type]
+
+
+class TestUsdToRubRate:
+    def test_default_is_100(self) -> None:
+        settings = Settings(**_settings_kwargs())  # type: ignore[arg-type]
+
+        assert settings.usd_to_rub_rate == pytest.approx(100.0)
+
+    def test_zero_rejected(self) -> None:
+        # gt=0; a zero rate would zero out every cost calculation.
+        with pytest.raises(ValidationError):
+            Settings(**_settings_kwargs(usd_to_rub_rate=0))  # type: ignore[arg-type]
+
+    def test_inf_rejected(self) -> None:
+        # auditor M15.5.1 MEDIUM-2 pattern.
+        with pytest.raises(ValidationError):
+            Settings(**_settings_kwargs(usd_to_rub_rate=math.inf))  # type: ignore[arg-type]
+
+
+class TestAgentMonthlyLlmBudgetRub:
+    def test_default_none(self) -> None:
+        settings = Settings(**_settings_kwargs())  # type: ignore[arg-type]
+
+        assert settings.agent_monthly_llm_budget_rub is None
+
+    def test_finite_positive_accepted(self) -> None:
+        settings = Settings(**_settings_kwargs(agent_monthly_llm_budget_rub=3000.0))  # type: ignore[arg-type]
+
+        assert settings.agent_monthly_llm_budget_rub == pytest.approx(3000.0)
+
+    def test_zero_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(**_settings_kwargs(agent_monthly_llm_budget_rub=0))  # type: ignore[arg-type]
+
+    def test_inf_rejected(self) -> None:
+        # An inf budget would silently defeat any future enforcement
+        # path (M21.2). Reject at construction.
+        with pytest.raises(ValidationError):
+            Settings(**_settings_kwargs(agent_monthly_llm_budget_rub=math.inf))  # type: ignore[arg-type]

@@ -47,6 +47,22 @@ class Settings(BaseSettings):
     # this account-wide value.
     account_target_cpa_rub: float | None = Field(default=None, gt=0)
 
+    # --- M21 cost tracking ---
+
+    # USD → RUB conversion rate. Default 100 is a reasonable round
+    # number for read-back-friendly cost estimates; operators with a
+    # specific accounting rate (e.g. CBR fixing) override via env or
+    # .env. Per-record snapshots in CostRecord preserve the exact
+    # rate used at write time, so changing this here only affects
+    # future records, not historical cost.
+    usd_to_rub_rate: float = Field(default=100.0, gt=0)
+
+    # Optional monthly LLM-spend budget in RUB. None ⇒ no enforcement
+    # (observability only via ``yadirect-agent cost status``). Hard
+    # auto-degrade to ``--no-llm`` mode is M21.2 follow-up — needs M18
+    # for the alert path before we can enforce silently.
+    agent_monthly_llm_budget_rub: float | None = Field(default=None, gt=0)
+
     # --- Anthropic ---
     anthropic_api_key: SecretStr = Field(default=SecretStr(""))
     anthropic_model: str = "claude-opus-4-7"
@@ -95,6 +111,19 @@ class Settings(BaseSettings):
         # non-finite explicitly. (auditor M15.5.1 MEDIUM-2.)
         if v is not None and not math.isfinite(v):
             msg = f"account_target_cpa_rub must be a finite positive number, got {v!r}"
+            raise ValueError(msg)
+        return v
+
+    @field_validator("usd_to_rub_rate", "agent_monthly_llm_budget_rub")
+    @classmethod
+    def _reject_non_finite_money(cls, v: float | None) -> float | None:
+        # Same hardening as ``account_target_cpa_rub``: ``gt=0`` doesn't
+        # reject ``inf`` (it satisfies ``inf > 0`` as True). An ``inf``
+        # rate would zero out every cost_rub conversion (or in the
+        # worst case crash json.dumps in the JSONL store); an ``inf``
+        # budget would defeat enforcement when M21.2 lands.
+        if v is not None and not math.isfinite(v):
+            msg = f"value must be finite, got {v!r}"
             raise ValueError(msg)
         return v
 
