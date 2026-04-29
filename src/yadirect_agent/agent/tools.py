@@ -22,12 +22,13 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from ..audit import AuditSink, JsonlSink
+from ..audit import AuditEvent, AuditSink, JsonlSink
 from ..auth.keychain import KeyringTokenStore
 from ..clients.direct import DirectService
 from ..clients.wordstat import DirectKeywordsResearch
@@ -907,14 +908,17 @@ async def _build_policy_proposed_response(
     and doesn't touch the safety pipeline. Building the full
     triple here would carry the slice 1 design forward
     needlessly.
+
+    The response carries ``account_summary`` (count + total) so
+    the LLM can describe the current state in chat alongside
+    the proposal, and so the slice 4 audit emitter on
+    fresh-save reuses the figures rather than re-reading the
+    account.
     """
     svc = CampaignService(settings)
     campaigns = await svc.list_active()
-    on_total = sum(
-        c.daily_budget_rub or 0
-        for c in campaigns
-        if c.state == "ON" and c.daily_budget_rub is not None
-    )
+    on_campaigns = [c for c in campaigns if c.state == "ON"]
+    on_total = sum(c.daily_budget_rub or 0 for c in on_campaigns if c.daily_budget_rub is not None)
     proposal = generate_policy_proposal(
         profile=profile,
         current_active_daily_total_rub=float(on_total),
@@ -923,7 +927,59 @@ async def _build_policy_proposed_response(
         "status": "policy_proposed",
         "profile": profile.model_dump(mode="json"),
         "proposal": proposal,
+        "account_summary": {
+            "on_campaigns_count": len(on_campaigns),
+            "active_daily_total_rub": float(on_total),
+        },
     }
+
+
+async def _emit_onboarding_completed_event(
+    *,
+    settings: Settings,
+    response: dict[str, Any],
+    trace_id: str | None,
+) -> None:
+    """Emit one ``onboarding_completed`` audit event after a fresh-save.
+
+    The event is the slice 4 replacement for the originally-planned
+    full-baseline-snapshot file: it answers "when did onboarding
+    complete and what was the account state at that moment?"
+    using existing infrastructure. Re-run probe and incomplete
+    submits do NOT call this helper — only the post-store path.
+
+    Payload reuses the ``response`` dict already built by
+    ``_build_policy_proposed_response`` rather than re-reading
+    the account, so the audit-trail figures are guaranteed to
+    match what the operator was just told. ``target_cpa_rub`` is
+    flagged as bool (set / not set) rather than echoed — the
+    audit log records "did the operator pick a CPA target?",
+    not the value (which lives in the profile file already).
+    """
+    sink = JsonlSink(settings.audit_log_path)
+    profile = response["profile"]
+    payload: dict[str, Any] = {
+        "profile_summary": {
+            "niche": profile["niche"],
+            "monthly_budget_rub": profile["monthly_budget_rub"],
+            "target_cpa_rub_set": profile.get("target_cpa_rub") is not None,
+        },
+        "account_summary": response["account_summary"],
+        "proposal_summary": {
+            "chosen_account_daily_budget_cap_rub": response["proposal"]["summary"][
+                "chosen_account_daily_budget_cap_rub"
+            ],
+        },
+    }
+    event = AuditEvent(
+        ts=datetime.now(UTC),
+        actor="agent",
+        action="onboarding_completed",
+        trace_id=trace_id,
+        resource="onboarding:business_profile",
+        result=payload,
+    )
+    await sink.emit(event)
 
 
 def _make_start_onboarding_tool(settings: Settings) -> Tool:
@@ -1062,8 +1118,18 @@ def _make_start_onboarding_tool(settings: Settings) -> Tool:
 
         # Full valid profile → persist atomically + propose policy.
         store.save(profile)
+        response = await _build_policy_proposed_response(settings=settings, profile=profile)
+        # Slice 4: emit one ``onboarding_completed`` audit event so an
+        # operator-side investigation can answer "when did Anna
+        # complete setup?". Re-run probe (above) intentionally
+        # skipped — it doesn't change state. Emission AFTER the
+        # response is built so the audit numbers match what the
+        # LLM is about to relay to the operator.
+        await _emit_onboarding_completed_event(
+            settings=settings, response=response, trace_id=ctx.trace_id
+        )
         ctx.logger.info("tool.start_onboarding.policy_proposed.fresh")
-        return await _build_policy_proposed_response(settings=settings, profile=profile)
+        return response
 
     return Tool(
         name="start_onboarding",
