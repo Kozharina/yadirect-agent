@@ -41,6 +41,7 @@ from ..services.bidding import BiddingService, BidUpdate
 from ..services.business_profile_store import BusinessProfileStore
 from ..services.campaigns import CampaignService
 from ..services.health_check import HealthCheckService
+from ..services.policy_proposal import generate_policy_proposal
 from .executor import PlanRejected, PlanRequired
 from .pipeline import SafetyPipeline
 from .plans import PendingPlansStore
@@ -883,6 +884,48 @@ def _make_account_health_tool(settings: Settings) -> Tool:
     )
 
 
+async def _build_policy_proposed_response(
+    *, settings: Settings, profile: BusinessProfile
+) -> dict[str, Any]:
+    """Read account state, derive a policy proposal, build the response.
+
+    Shared between the slice 3 re-run path (``answers=None`` +
+    saved profile) and the fresh-save path (valid full
+    ``answers``). Both surfaces want the same payload so the LLM
+    sees one shape regardless of how the operator got here.
+
+    The Direct read sums ``daily_budget_rub`` over campaigns in
+    state ``ON`` only — SUSPENDED campaigns aren't currently
+    spending, so counting them would inflate the proposed cap
+    above the operator's actual spend. ``CampaignSummary``s with
+    ``daily_budget_rub=None`` (a campaign with no daily cap set)
+    contribute 0 — the missing-cap signal flows through Direct's
+    own moderation, not through the agent's account-cap.
+
+    ``CampaignService(settings)`` constructed without
+    pipeline / store / audit_sink: ``list_active`` is read-only
+    and doesn't touch the safety pipeline. Building the full
+    triple here would carry the slice 1 design forward
+    needlessly.
+    """
+    svc = CampaignService(settings)
+    campaigns = await svc.list_active()
+    on_total = sum(
+        c.daily_budget_rub or 0
+        for c in campaigns
+        if c.state == "ON" and c.daily_budget_rub is not None
+    )
+    proposal = generate_policy_proposal(
+        profile=profile,
+        current_active_daily_total_rub=float(on_total),
+    )
+    return {
+        "status": "policy_proposed",
+        "profile": profile.model_dump(mode="json"),
+        "proposal": proposal,
+    }
+
+
 def _make_start_onboarding_tool(settings: Settings) -> Tool:
     """Conversational onboarding entry point (M15.4 slices 1-2).
 
@@ -972,15 +1015,14 @@ def _make_start_onboarding_tool(settings: Settings) -> Tool:
         store = BusinessProfileStore(profile_path)
 
         if inp.answers is None:
-            # Probe path: surface either the schema (no profile yet)
-            # or the existing profile (re-run path).
+            # Probe path: either we have a profile (re-run — slice 3
+            # advances straight to ``policy_proposed`` so the LLM
+            # gets full state in one response) or we don't (slice 2
+            # ``ready_for_profile_qa``).
             existing = store.load()
             if existing is not None:
-                ctx.logger.info("tool.start_onboarding.profile_exists")
-                return {
-                    "status": "profile_exists",
-                    "profile": existing.model_dump(mode="json"),
-                }
+                ctx.logger.info("tool.start_onboarding.policy_proposed.re_run")
+                return await _build_policy_proposed_response(settings=settings, profile=existing)
             ctx.logger.info("tool.start_onboarding.ready_for_profile_qa")
             schema = BusinessProfile.model_json_schema()
             required = list(schema.get("required", []))
@@ -1013,13 +1055,10 @@ def _make_start_onboarding_tool(settings: Settings) -> Tool:
                 "errors": errors,
             }
 
-        # Full valid profile → persist atomically and advance.
+        # Full valid profile → persist atomically + propose policy.
         store.save(profile)
-        ctx.logger.info("tool.start_onboarding.profile_saved")
-        return {
-            "status": "ready_for_policy_proposal",
-            "profile": profile.model_dump(mode="json"),
-        }
+        ctx.logger.info("tool.start_onboarding.policy_proposed.fresh")
+        return await _build_policy_proposed_response(settings=settings, profile=profile)
 
     return Tool(
         name="start_onboarding",
@@ -1041,14 +1080,21 @@ def _make_start_onboarding_tool(settings: Settings) -> Tool:
             "'ready_for_profile_qa', schema, collected, missing} when no "
             "profile is saved (the schema describes the BusinessProfile "
             "fields; ask the operator naturally and submit ``answers={...}`` "
-            "WHOLE when you have them); or {status: 'profile_exists', "
-            "profile} when one exists (ask 'what would you like to update?' "
-            "then submit answers with the corrections). Submitting "
-            "``answers`` with missing or invalid fields returns {status: "
-            "'incomplete_profile', errors} — read the pydantic error locs "
-            "and ask the right next question. Submitting valid full "
-            "``answers`` returns {status: 'ready_for_policy_proposal', "
-            "profile} after an atomic save."
+            "WHOLE when you have them). Submitting ``answers`` with missing "
+            "or invalid fields returns {status: 'incomplete_profile', "
+            "errors} — read the pydantic error locs and ask the right next "
+            "question.\n\n"
+            "Once a profile exists (either freshly submitted or loaded from "
+            "a previous onboarding), the tool returns {status: "
+            "'policy_proposed', profile, proposal: {policy_yaml, summary}}. "
+            "``proposal.policy_yaml`` is the YAML the operator copy-pastes "
+            "into AGENT_POLICY_PATH after review (the tool deliberately "
+            "does NOT write it to disk — that's the operator's call). "
+            "``proposal.summary`` carries the inputs (current active daily "
+            "total, monthly budget) and the chosen cap so you can explain "
+            "the number in chat without re-deriving it. The operator can "
+            "either accept and copy the YAML, or update the profile by "
+            "submitting fresh ``answers``."
         ),
         input_model=_StartOnboardingInput,
         is_write=False,
