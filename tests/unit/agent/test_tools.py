@@ -881,21 +881,28 @@ class TestStartOnboardingTool:
         assert inp.answers is None
 
     @pytest.mark.asyncio
-    async def test_handler_returns_profile_exists_when_profile_saved(
+    async def test_handler_returns_policy_proposed_in_re_run_path(
         self,
         settings: Settings,
         tool_context: ToolContext,
         memory_keyring: dict[tuple[str, str], str],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Re-run path: the operator already onboarded once, comes
-        # back later. The handler must surface the existing profile
-        # so the LLM can ask "what would you like to update?"
-        # rather than starting from scratch (per §M15.4 spec).
+        # back later. Slice 3 retires the slice 2 ``profile_exists``
+        # branch — the operator now gets the full state (profile +
+        # fresh proposal against current account state) in one
+        # response so the LLM can ask "want to keep this policy or
+        # update the profile?" without a second tool call.
         from datetime import UTC, datetime, timedelta
 
         from yadirect_agent.models.business_profile import BusinessProfile
         from yadirect_agent.services.business_profile_store import (
             BusinessProfileStore,
+        )
+        from yadirect_agent.services.campaigns import (
+            CampaignService,
+            CampaignSummary,
         )
 
         now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
@@ -911,14 +918,45 @@ class TestStartOnboardingTool:
             ),
         )
 
+        # Mock the account-state read so no real HTTP fires. Two
+        # ON campaigns @ 3000 RUB each → 6000 total.
+        async def fake_list_active(
+            self: CampaignService, limit: int = 200
+        ) -> list[CampaignSummary]:
+            del self, limit
+            return [
+                CampaignSummary(
+                    id=1,
+                    name="c1",
+                    state="ON",
+                    status="ACCEPTED",
+                    type="TEXT_CAMPAIGN",
+                    daily_budget_rub=3_000.0,
+                ),
+                CampaignSummary(
+                    id=2,
+                    name="c2",
+                    state="ON",
+                    status="ACCEPTED",
+                    type="TEXT_CAMPAIGN",
+                    daily_budget_rub=3_000.0,
+                ),
+            ]
+
+        monkeypatch.setattr(CampaignService, "list_active", fake_list_active)
+
         tool = build_default_registry(settings).get("start_onboarding")
         inp = tool.input_model.model_validate({})
         result = await tool.handler(inp, tool_context)
 
-        assert result["status"] == "profile_exists"
+        assert result["status"] == "policy_proposed"
         assert result["profile"]["niche"] == "Plumbing services in Moscow"
         assert result["profile"]["monthly_budget_rub"] == 120_000
-        assert result["profile"]["target_cpa_rub"] == 2_000
+        # 1.2 * 6000 = 7200; monthly/30 = 4000; max = 7200.
+        assert result["proposal"]["summary"]["chosen_account_daily_budget_cap_rub"] == 7_200
+        # Provenance header in the YAML, ready for copy-paste.
+        assert "yadirect-agent" in result["proposal"]["policy_yaml"]
+        assert "account_daily_budget_cap_rub: 7200" in result["proposal"]["policy_yaml"]
 
     @pytest.mark.asyncio
     async def test_handler_returns_incomplete_profile_on_partial_answers(
@@ -978,22 +1016,39 @@ class TestStartOnboardingTool:
         assert any("monthly_budget_rub" in loc for loc in flat_locs)
 
     @pytest.mark.asyncio
-    async def test_handler_saves_full_profile_and_advances(
+    async def test_handler_saves_full_profile_and_proposes_policy(
         self,
         settings: Settings,
         tool_context: ToolContext,
         memory_keyring: dict[tuple[str, str], str],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Happy path: full valid profile → save + advance to
-        # ``ready_for_policy_proposal`` (slice 3 placeholder).
+        # Happy path: full valid profile → save + return
+        # ``policy_proposed`` with proposal payload. Slice 3
+        # replaces the slice 2 placeholder ``ready_for_policy_proposal``.
         from datetime import UTC, datetime, timedelta
 
         from yadirect_agent.services.business_profile_store import (
             BusinessProfileStore,
         )
+        from yadirect_agent.services.campaigns import (
+            CampaignService,
+            CampaignSummary,
+        )
 
         now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
         self._save_token(obtained_at=now, expires_at=now + timedelta(days=365))
+
+        # Sandbox account: zero current spend. Forces the
+        # monthly/30 fallback (50_000/30 = 1666.67 → ceil_to_100 =
+        # 1700).
+        async def fake_list_active(
+            self: CampaignService, limit: int = 200
+        ) -> list[CampaignSummary]:
+            del self, limit
+            return []
+
+        monkeypatch.setattr(CampaignService, "list_active", fake_list_active)
 
         tool = build_default_registry(settings).get("start_onboarding")
         inp = tool.input_model.model_validate(
@@ -1007,13 +1062,18 @@ class TestStartOnboardingTool:
         )
         result = await tool.handler(inp, tool_context)
 
-        assert result["status"] == "ready_for_policy_proposal"
+        assert result["status"] == "policy_proposed"
         assert result["profile"]["niche"] == "Online courses on woodworking"
         assert result["profile"]["monthly_budget_rub"] == 50_000
 
-        # Pin: the profile actually landed on disk so slice 3 can
-        # read it back. Otherwise the "advance" status would be
-        # a lie.
+        # Sandbox: cap_from_current=0, cap_from_monthly=1700, max=1700.
+        proposal_summary = result["proposal"]["summary"]
+        assert proposal_summary["current_active_daily_total_rub"] == 0.0
+        assert proposal_summary["chosen_account_daily_budget_cap_rub"] == 1_700
+
+        # Pin: the profile actually landed on disk so a re-run
+        # picks it up via ``profile_exists`` (now folded into
+        # ``policy_proposed`` re-run path).
         store_path = settings.audit_log_path.parent / "business_profile.json"
         saved = BusinessProfileStore(store_path).load()
         assert saved is not None
@@ -1026,6 +1086,7 @@ class TestStartOnboardingTool:
         settings: Settings,
         tool_context: ToolContext,
         memory_keyring: dict[tuple[str, str], str],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Re-run with a fresh full submit → overwrite. The store's
         # save is atomic; we pin the end-to-end behaviour through
@@ -1036,6 +1097,10 @@ class TestStartOnboardingTool:
         from yadirect_agent.models.business_profile import BusinessProfile
         from yadirect_agent.services.business_profile_store import (
             BusinessProfileStore,
+        )
+        from yadirect_agent.services.campaigns import (
+            CampaignService,
+            CampaignSummary,
         )
 
         now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
@@ -1050,6 +1115,14 @@ class TestStartOnboardingTool:
             ),
         )
 
+        async def fake_list_active(
+            self: CampaignService, limit: int = 200
+        ) -> list[CampaignSummary]:
+            del self, limit
+            return []
+
+        monkeypatch.setattr(CampaignService, "list_active", fake_list_active)
+
         tool = build_default_registry(settings).get("start_onboarding")
         inp = tool.input_model.model_validate(
             {
@@ -1063,12 +1136,88 @@ class TestStartOnboardingTool:
         )
         result = await tool.handler(inp, tool_context)
 
-        assert result["status"] == "ready_for_policy_proposal"
+        assert result["status"] == "policy_proposed"
         saved = BusinessProfileStore(store_path).load()
         assert saved is not None
         assert saved.niche == "new niche"
         assert saved.monthly_budget_rub == 80_000
         assert saved.target_cpa_rub is None
+        # Proposal reflects the NEW profile, not the old one:
+        # 80_000/30 = 2666.67 → ceil_to_100 = 2700 (zero current).
+        assert result["proposal"]["summary"]["chosen_account_daily_budget_cap_rub"] == 2_700
+
+    @pytest.mark.asyncio
+    async def test_handler_proposal_uses_only_on_campaigns(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        memory_keyring: dict[tuple[str, str], str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # ``CampaignService.list_active`` returns ON + SUSPENDED
+        # together. For the proposal we want only ON (suspended
+        # campaigns aren't currently spending). A regression that
+        # summed both states would inflate ``current`` and quietly
+        # raise the cap above what the operator expects.
+        from datetime import UTC, datetime, timedelta
+
+        from yadirect_agent.services.campaigns import (
+            CampaignService,
+            CampaignSummary,
+        )
+
+        now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
+        self._save_token(obtained_at=now, expires_at=now + timedelta(days=365))
+
+        async def fake_list_active(
+            self: CampaignService, limit: int = 200
+        ) -> list[CampaignSummary]:
+            del self, limit
+            return [
+                CampaignSummary(
+                    id=1,
+                    name="active",
+                    state="ON",
+                    status="ACCEPTED",
+                    type="TEXT_CAMPAIGN",
+                    daily_budget_rub=5_000.0,
+                ),
+                CampaignSummary(
+                    id=2,
+                    name="paused",
+                    state="SUSPENDED",
+                    status="ACCEPTED",
+                    type="TEXT_CAMPAIGN",
+                    daily_budget_rub=20_000.0,  # would inflate if counted
+                ),
+                CampaignSummary(
+                    id=3,
+                    name="no-budget",
+                    state="ON",
+                    status="ACCEPTED",
+                    type="TEXT_CAMPAIGN",
+                    daily_budget_rub=None,  # no daily budget set
+                ),
+            ]
+
+        monkeypatch.setattr(CampaignService, "list_active", fake_list_active)
+
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate(
+            {
+                "answers": {
+                    "niche": "ok",
+                    "monthly_budget_rub": 30_000,
+                },
+            },
+        )
+        result = await tool.handler(inp, tool_context)
+
+        # Pin: only the ON campaign with a budget contributes (5000),
+        # not the SUSPENDED 20_000 or the None-budget ON.
+        assert result["proposal"]["summary"]["current_active_daily_total_rub"] == 5_000.0
+        # 1.2 * 5000 = 6000; monthly/30 = 1000; max = 6000.
+        assert result["proposal"]["summary"]["chosen_account_daily_budget_cap_rub"] == 6_000
 
     @pytest.mark.asyncio
     async def test_handler_oauth_check_takes_priority_over_answers(
