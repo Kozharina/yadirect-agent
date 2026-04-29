@@ -42,15 +42,8 @@ demo-only, technically; it cannot be handed to a non-developer.
 - [ ] **M15.4 — Conversational MCP onboarding** (split into slices —
       §M15.4 in TECHNICAL_SPEC names one tool but the actual
       contract is "five distinct phases", each test-isolatable):
-  - [ ] **slice 1 — `start_onboarding()` skeleton + OAuth state probe**:
-        read-only MCP tool, no Q&A, no policy generation, no
-        baseline. Returns a structured next-step
-        (``{status: "needs_oauth"|"ready_for_profile_qa", ...}``)
-        based on ``KeyringTokenStore`` contents. The OAuth
-        "trigger" promised in the spec is, in MCP reality, a
-        actionable next-step pointing at
-        ``yadirect-agent auth login`` — an MCP server cannot
-        legally open a browser on the operator's machine.
+  - [x] ~~**slice 1 — `start_onboarding()` skeleton + OAuth state probe**~~
+        — shipped, see Done.
   - [ ] **slice 2 — BusinessProfile Q&A**: pydantic
         ``BusinessProfile`` schema (niche, ICP, budget, goals,
         forbidden phrasings) + Q&A-state-machine inputs
@@ -191,22 +184,7 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-- [ ] **M15.4 slice 1 — `start_onboarding()` skeleton + OAuth probe**
-      (§M15.4, Phase 0+1, release 0.2.0). First read-only cut:
-      pydantic ``_StartOnboardingInput`` (``extra="forbid"``,
-      no required fields), ``_make_start_onboarding_tool``
-      registered in ``_PLAIN_FACTORIES``. Handler reads
-      ``KeyringTokenStore.load()`` and returns one of:
-      ``{status: "needs_oauth", action:
-      "yadirect-agent auth login", reason: ...}`` when the slot
-      is empty / payload corrupt; ``{status: "needs_oauth",
-      action: "yadirect-agent auth login", reason: "token expired
-      or near expiry"}`` when ``token.needs_refresh()``;
-      ``{status: "ready_for_profile_qa", reason: "..."}`` when
-      a valid token exists. The "ready_for_profile_qa" branch
-      is a placeholder — slice 2 fills the actual Q&A flow
-      under the same status. **No** browser opening from MCP:
-      see §M15.4 split note above.
+*(empty — nothing checked out right now)*
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
@@ -885,6 +863,69 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M15.4 slice 1 — `start_onboarding()` skeleton + OAuth probe**
+      (§M15.4, Phase 0+1, release 0.2.0). First read-only cut of
+      the conversational onboarding entry point. Read-only MCP
+      tool that probes ``KeyringTokenStore`` and returns a
+      structured next-step.
+
+      Three pieces:
+
+      1. ``_StartOnboardingInput`` — pydantic with no fields
+         (``extra="forbid"`` inherited from ``_STRICT``). The
+         first call from the LLM ("помоги настроить агента")
+         must succeed with zero context. Slice 2 will add an
+         optional ``answers: dict[str, Any]`` for the Q&A
+         state machine.
+      2. ``_make_start_onboarding_tool`` — read-only handler
+         with three branches: empty / corrupt keychain →
+         ``{status: "needs_oauth", action:
+         "yadirect-agent auth login", reason}``; expired /
+         near-expiry token → same shape with distinct ``reason``
+         text so the LLM can frame "your token expired"
+         differently from "no token yet"; valid token →
+         ``{status: "ready_for_profile_qa", reason}``. The
+         ``ready_for_profile_qa`` branch is a placeholder —
+         slice 2 fills the actual Q&A under the same status
+         name. The factory takes ``settings`` even though slice
+         1 doesn't use it, so slice 2 doesn't churn the
+         registration site.
+      3. Registered in ``_PLAIN_FACTORIES`` so
+         ``build_default_registry`` exposes it by default.
+         ``is_write=False`` joins the read-only catalogue
+         (now 6 tools: ``list_campaigns`` / ``get_keywords`` /
+         ``validate_phrases`` / ``explain_decision`` /
+         ``account_health`` / ``start_onboarding``) without
+         operator opt-in — the operator's first chat needs a
+         tool to land on.
+
+      Tool description written for the LLM: WHEN to call
+      ("help me set up the agent" + Russian equivalents the
+      operator actually uses); enumerates response shape so
+      the LLM doesn't need to inspect the schema; pins
+      "MCP cannot open a browser, return a CLI pointer" as
+      the contract for the ``needs_oauth`` branch.
+
+      Why an MCP tool returns "run this CLI command" rather
+      than triggering the OAuth flow: an MCP server runs as a
+      background subprocess of Claude Desktop with no UI
+      ownership. The ``yadirect-agent auth login`` CLI command
+      runs in the operator's terminal and OWNS the
+      browser-launch decision. The §M15.4 spec phrase
+      "triggers M15.3" is realised as a structured pointer at
+      the CLI, not a literal trigger.
+
+      967 tests green (+9 new — 4 ``TestStartOnboardingTool``
+      handler-state cases, 1 MCP dispatch end-to-end, +1
+      parametrised row across each of 3 registry-sweep tests);
+      mypy strict; ruff clean.
+
+      Out of scope (deferred, slices 2-5 in Active queue):
+      BusinessProfile Q&A schema and persistence, policy
+      proposal generator, onboarding baseline snapshot
+      (precedes M19.1), first ``account_health`` rollup into
+      the onboarding report.
 
 - [x] **M15.5 — `account_health()` MCP tool mirror** (§M15.5,
       Phase 0+1, release 0.2.0). Closes the Phase 0 chat surface
