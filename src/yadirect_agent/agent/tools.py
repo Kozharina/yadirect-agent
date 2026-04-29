@@ -28,6 +28,7 @@ import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..audit import AuditSink, JsonlSink
+from ..auth.keychain import KeyringTokenStore
 from ..clients.direct import DirectService
 from ..clients.wordstat import DirectKeywordsResearch
 from ..config import Settings
@@ -443,6 +444,18 @@ class _AccountHealthInput(BaseModel):
             "Optional — runs cost-only rules without it."
         ),
     )
+
+
+class _StartOnboardingInput(BaseModel):
+    model_config = _STRICT
+
+    # Slice 1 takes no fields — the first call from the LLM
+    # ("помоги настроить агента") must succeed with zero context.
+    # ``extra="forbid"`` (inherited from ``_STRICT``) still rejects
+    # unknown keys, so a future attempt to sneak in
+    # ``_force_ready=True`` cannot bypass the OAuth probe. Slice 2
+    # will add an optional ``answers: dict[str, Any]`` for the
+    # BusinessProfile Q&A state machine.
 
 
 # --------------------------------------------------------------------------
@@ -861,6 +874,106 @@ def _make_account_health_tool(settings: Settings) -> Tool:
     )
 
 
+def _make_start_onboarding_tool(settings: Settings) -> Tool:
+    """Conversational onboarding entry point (M15.4 slice 1).
+
+    First, minimal cut: probes OAuth state via ``KeyringTokenStore``
+    and returns a structured next-step. Slices 2-5 layer the
+    BusinessProfile Q&A, policy proposal, baseline snapshot, and
+    first health-check on top of this skeleton.
+
+    Branches:
+    - keychain empty / corrupt → ``{status: "needs_oauth", action,
+      reason}``. ``KeyringTokenStore.load`` collapses
+      missing-slot, corrupt-JSON, and validation-failure into a
+      single ``None`` return — all three map to the same operator
+      action ("re-run ``auth login``").
+    - token expired or near-expiry → ``{status: "needs_oauth",
+      action, reason}`` with distinct text so the LLM can frame
+      "your token expired" differently from "no token yet".
+      Auto-refresh on 401 is a separate backlog item (M15.3
+      follow-up); here we keep the surface explicit.
+    - valid token → ``{status: "ready_for_profile_qa", reason}``.
+      Placeholder until slice 2 fills the Q&A flow under the same
+      status name.
+
+    The ``settings`` argument is unused in slice 1 — kept on the
+    factory signature so the slice 2 handler (which will need
+    ``settings.audit_log_path.parent`` for the BusinessProfile
+    JSONL) doesn't change the registration site.
+
+    Why an MCP tool returns "run this CLI command" rather than
+    triggering the OAuth flow itself: an MCP server cannot legally
+    open a browser on the operator's machine — it runs as a
+    background subprocess of Claude Desktop, with no UI ownership.
+    The ``yadirect-agent auth login`` CLI command, by contrast,
+    runs in the operator's terminal and OWNS the browser-launch
+    decision. Returning an actionable next-step keeps the chat
+    flow honest: the LLM tells the operator "please run X", and
+    the operator stays in control.
+    """
+
+    del settings  # slice 1 has no settings dependencies
+
+    async def handler(_raw: BaseModel, ctx: ToolContext) -> Any:
+        token = KeyringTokenStore().load()
+        if token is None:
+            ctx.logger.info("tool.start_onboarding.needs_oauth_empty")
+            return {
+                "status": "needs_oauth",
+                "action": "yadirect-agent auth login",
+                "reason": (
+                    "No OAuth token found in the OS keychain. "
+                    "Run `yadirect-agent auth login` in your "
+                    "terminal to grant the agent access to your "
+                    "Yandex.Direct account."
+                ),
+            }
+        if token.needs_refresh():
+            ctx.logger.info("tool.start_onboarding.needs_oauth_expired")
+            return {
+                "status": "needs_oauth",
+                "action": "yadirect-agent auth login",
+                "reason": (
+                    "Stored OAuth token is expired or near expiry. "
+                    "Re-run `yadirect-agent auth login` in your "
+                    "terminal to obtain a fresh token."
+                ),
+            }
+        ctx.logger.info("tool.start_onboarding.ready")
+        return {
+            "status": "ready_for_profile_qa",
+            "reason": (
+                "OAuth token is valid. Next step: collect the "
+                "BusinessProfile (niche, ICP, budget, goals, "
+                "forbidden phrasings). Slice 2 will surface the "
+                "Q&A flow here."
+            ),
+        }
+
+    return Tool(
+        name="start_onboarding",
+        description=(
+            "Conversational onboarding entry point. Use this when the user "
+            "says 'help me set up the agent', 'how do I get started?', "
+            "'configure me', or any equivalent in Russian (the operator "
+            "speaks Russian; common phrasings include 'pomogi nastroit "
+            "agenta', 'kak nachat?', 'nastroi menya'). The tool probes "
+            "setup state and returns a structured next-step. Slice 1 only "
+            "checks OAuth: returns {status: 'needs_oauth', action: "
+            "'yadirect-agent auth login', reason: ...} when the OS "
+            "keychain has no valid Yandex token (operator must run the "
+            "CLI command — an MCP server cannot open a browser on the "
+            "operator's machine), or {status: 'ready_for_profile_qa', "
+            "reason: ...} when a valid token exists. Re-runnable: calling "
+            "it again is always safe and idempotent."
+        ),
+        input_model=_StartOnboardingInput,
+        is_write=False,
+        handler=handler,
+    )
+
+
 # --------------------------------------------------------------------------
 # Public factory.
 # --------------------------------------------------------------------------
@@ -1064,6 +1177,7 @@ _PLAIN_FACTORIES: list[_PlainFactory] = [
     _make_validate_phrases_tool,
     _make_explain_decision_tool,
     _make_account_health_tool,
+    _make_start_onboarding_tool,
 ]
 
 
