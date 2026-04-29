@@ -2636,14 +2636,17 @@ class TestKs4QualityScoreGuardEmitsPolicySlack:
 
 class TestKs5BudgetBalanceDriftEmitsPolicySlack:
     """KS#5: ``slack = max_shift_pct - actual_shift_pct``. Both sides
-    in PCT (0..1)."""
+    in PCT (0..1). KS#5 measures share-of-account drift, so a
+    multi-campaign account is needed to get a non-zero shift."""
 
     def test_ok_path_emits_positive_slack_for_small_drift(self) -> None:
         check = BudgetBalanceDriftCheck(_bbd_policy(max_shift=0.3))
-        baseline = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 1_000)])
-        snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 1_100)])
+        # baseline: 50/50 (1k+1k=2k total); snapshot: 40/60 (800+1200=2k).
+        # Each campaign's share moves 10pp.
+        baseline = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 1_000), _ab_campaign(2, 1_000)])
+        snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 800), _ab_campaign(2, 1_200)])
 
-        # +10% drift, threshold 30% → 20% headroom.
+        # max_shift = 0.1, threshold 0.3 → 0.2 headroom.
         result = check.check(baseline, snapshot, [])
 
         assert result.status == "ok"
@@ -2651,14 +2654,15 @@ class TestKs5BudgetBalanceDriftEmitsPolicySlack:
 
     def test_blocked_path_emits_negative_slack_for_large_drift(self) -> None:
         check = BudgetBalanceDriftCheck(_bbd_policy(max_shift=0.3))
-        baseline = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 1_000)])
-        snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 1_500)])
+        # baseline: 50/50; snapshot: 10/90 (200+1800=2k). Each share moves 40pp.
+        baseline = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 1_000), _ab_campaign(2, 1_000)])
+        snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 200), _ab_campaign(2, 1_800)])
 
-        # +50% drift, threshold 30% → -20% (over by 20pp).
+        # max_shift = 0.4, threshold 0.3 → -0.1 (over by 10pp).
         result = check.check(baseline, snapshot, [])
 
         assert result.status == "blocked"
-        assert result.details["policy_slack"] == pytest.approx(-0.2)
+        assert result.details["policy_slack"] == pytest.approx(-0.1)
 
 
 class TestKs6ConversionIntegrityEmitsPolicySlack:
