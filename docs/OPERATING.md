@@ -334,9 +334,19 @@ On Windows: `%APPDATA%\Claude\claude_desktop_config.json`.
 }
 ```
 
-In this mode the agent in Claude Desktop sees three tools:
-`list_campaigns`, `get_keywords`, `validate_phrases`. **It cannot
-call any mutating tool** — they're not registered.
+In this mode the agent in Claude Desktop sees four tools:
+`list_campaigns`, `get_keywords`, `validate_phrases`, and
+`explain_decision`. **It cannot call any mutating tool** — they're
+not registered.
+
+`explain_decision(decision_id)` is the read-back tool for recorded
+rationales (M20). In chat: *"Почему ты вчера снизил budget на
+campaign 42?"* — Claude pulls the `decision_id` from the previous
+turn or from `yadirect-agent rationale list`, calls
+`explain_decision`, and reports the recorded reason verbatim.
+The agent never fabricates a reason — when the `decision_id` is
+unknown the tool returns `{status: "not_found"}` and Claude says
+so honestly.
 
 Restart Claude Desktop after editing the config. The new tools
 appear under the slider icon in the chat input.
@@ -360,23 +370,22 @@ opt in to mutations by adding `--allow-write` (or
 ```
 
 Now the agent can also see `pause_campaigns`, `resume_campaigns`,
-`set_campaign_budget`. **Every mutating call still flows through
-`@requires_plan`** — `set_campaign_budget` and `resume_campaigns`
-return `{status: "pending", plan_id: ...}` and you must run
+`set_campaign_budget`, and `set_keyword_bids`. **Every mutating
+call still flows through `@requires_plan`** — `set_campaign_budget`,
+`resume_campaigns`, and `set_keyword_bids` return
+`{status: "pending", plan_id: ...}` and you must run
 `yadirect-agent apply-plan <id>` from a terminal to actually
 apply. `pause_campaigns` is auto-approved by default
 (`auto_approve_pause=True` in the policy) and completes in one
 shot without an apply-plan step — it's reversible (just resume)
-and the audit JSONL records every pause regardless. The MCP
-path cannot bypass any of these.
+and the audit JSONL records every pause regardless. The MCP path
+cannot bypass any of these.
 
-**`set_keyword_bids` is NOT exposed over MCP yet**, even with
-`--allow-write`. `BiddingService.apply` doesn't have its
-`@requires_plan` gate yet (KS#2 / KS#4 wiring is the next safety
-PR), and the MCP layer keeps it on a denylist until then —
-otherwise an MCP client could set arbitrary bids without a
-safety review. Run keyword bid changes through the in-process
-agent loop (`yadirect-agent run "..."`) until the gate lands.
+Every mutating tool requires a `reason` field (M20 slice 2) — the
+LLM articulates WHY before the safety pipeline runs. The reason
+is recorded as `summary` on the `Rationale` row written to
+`rationale.jsonl`, which `explain_decision` later returns
+verbatim when you ask "why did you do X?".
 
 **Flag/env precedence**: `--allow-write` and `MCP_ALLOW_WRITE` are
 both treated as enabling. The CLI flag wins on its own; the env
