@@ -826,18 +826,18 @@ class TestStartOnboardingTool:
         assert "expir" in result["reason"].lower()
 
     @pytest.mark.asyncio
-    async def test_handler_returns_ready_when_token_valid(
+    async def test_handler_returns_profile_qa_when_no_profile(
         self,
         settings: Settings,
         tool_context: ToolContext,
         memory_keyring: dict[tuple[str, str], str],
     ) -> None:
-        # The healthy case: a valid, fresh token exists. The handler
-        # advances the state machine to ``ready_for_profile_qa`` —
-        # placeholder slice 2 will fill with the actual Q&A payload.
-        # For slice 1 we pin the contract: status name + a non-empty
-        # reason, so a chat client can render "OAuth ok, next step:
-        # collect business profile" without inspecting the schema.
+        # Slice 2 contract evolution: when the token is valid AND no
+        # profile is saved yet, the handler returns the JSON Schema
+        # of ``BusinessProfile`` plus ``collected={}`` and the list
+        # of missing required fields. The LLM owns the conversation
+        # and submits ``answers={...}`` whole when it has them — no
+        # state machine in code.
         from datetime import UTC, datetime, timedelta
 
         now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
@@ -848,8 +848,256 @@ class TestStartOnboardingTool:
         result = await tool.handler(inp, tool_context)
 
         assert result["status"] == "ready_for_profile_qa"
-        assert isinstance(result["reason"], str)
-        assert result["reason"]
+        # Pin: schema is BusinessProfile's JSON Schema, including
+        # ``properties`` with field names so the LLM can render
+        # questions without inspecting our source.
+        assert isinstance(result["schema"], dict)
+        assert "properties" in result["schema"]
+        assert {"niche", "monthly_budget_rub"} <= set(result["schema"]["properties"])
+        # Pin: nothing collected yet, both required fields missing.
+        # ``target_cpa_rub`` is optional and must NOT appear in
+        # ``missing`` — only required fields.
+        assert result["collected"] == {}
+        assert set(result["missing"]) == {"niche", "monthly_budget_rub"}
+
+    def test_input_accepts_answers_dict(self, settings: Settings) -> None:
+        # Slice 2 extends the input with ``answers``. The LLM
+        # submits the whole profile when it's collected; partial
+        # submits also pass the input model and get routed to
+        # ``incomplete_profile`` by the handler.
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate(
+            {"answers": {"niche": "ok", "monthly_budget_rub": 50_000}},
+        )
+        assert inp.answers == {"niche": "ok", "monthly_budget_rub": 50_000}
+
+    def test_input_answers_none_by_default(self, settings: Settings) -> None:
+        # Empty payload still works (slice 1 contract preserved): the
+        # first call from the LLM has no context, the handler treats
+        # ``answers=None`` as "probe state, return schema or
+        # profile_exists".
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate({})
+        assert inp.answers is None
+
+    @pytest.mark.asyncio
+    async def test_handler_returns_profile_exists_when_profile_saved(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # Re-run path: the operator already onboarded once, comes
+        # back later. The handler must surface the existing profile
+        # so the LLM can ask "what would you like to update?"
+        # rather than starting from scratch (per §M15.4 spec).
+        from datetime import UTC, datetime, timedelta
+
+        from yadirect_agent.models.business_profile import BusinessProfile
+        from yadirect_agent.services.business_profile_store import (
+            BusinessProfileStore,
+        )
+
+        now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
+        self._save_token(obtained_at=now, expires_at=now + timedelta(days=365))
+
+        # Seed a profile on the same path the handler reads from.
+        store_path = settings.audit_log_path.parent / "business_profile.json"
+        BusinessProfileStore(store_path).save(
+            BusinessProfile(
+                niche="Plumbing services in Moscow",
+                monthly_budget_rub=120_000,
+                target_cpa_rub=2_000,
+            ),
+        )
+
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate({})
+        result = await tool.handler(inp, tool_context)
+
+        assert result["status"] == "profile_exists"
+        assert result["profile"]["niche"] == "Plumbing services in Moscow"
+        assert result["profile"]["monthly_budget_rub"] == 120_000
+        assert result["profile"]["target_cpa_rub"] == 2_000
+
+    @pytest.mark.asyncio
+    async def test_handler_returns_incomplete_profile_on_partial_answers(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # The LLM submits niche but forgot the budget. We must NOT
+        # save a partial profile and must NOT advance to
+        # policy_proposal — return errors so the LLM knows what's
+        # left to ask.
+        from datetime import UTC, datetime, timedelta
+
+        now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
+        self._save_token(obtained_at=now, expires_at=now + timedelta(days=365))
+
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate({"answers": {"niche": "ok"}})
+        result = await tool.handler(inp, tool_context)
+
+        assert result["status"] == "incomplete_profile"
+        assert isinstance(result["errors"], list)
+        assert result["errors"]  # non-empty
+        # Pin: at least one error references ``monthly_budget_rub``
+        # so the LLM can ask the right next question.
+        flat_locs = [str(err.get("loc", ())) for err in result["errors"]]
+        assert any("monthly_budget_rub" in loc for loc in flat_locs)
+
+        # Pin: nothing got persisted on a partial submit.
+        store_path = settings.audit_log_path.parent / "business_profile.json"
+        assert not store_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_handler_returns_incomplete_profile_on_invalid_answers(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # All required fields present but ``monthly_budget_rub=100``
+        # is below the 1000-RUB floor. Same incomplete_profile shape
+        # — the LLM reads the error and re-asks.
+        from datetime import UTC, datetime, timedelta
+
+        now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
+        self._save_token(obtained_at=now, expires_at=now + timedelta(days=365))
+
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate(
+            {"answers": {"niche": "ok", "monthly_budget_rub": 100}},
+        )
+        result = await tool.handler(inp, tool_context)
+
+        assert result["status"] == "incomplete_profile"
+        flat_locs = [str(err.get("loc", ())) for err in result["errors"]]
+        assert any("monthly_budget_rub" in loc for loc in flat_locs)
+
+    @pytest.mark.asyncio
+    async def test_handler_saves_full_profile_and_advances(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # Happy path: full valid profile → save + advance to
+        # ``ready_for_policy_proposal`` (slice 3 placeholder).
+        from datetime import UTC, datetime, timedelta
+
+        from yadirect_agent.services.business_profile_store import (
+            BusinessProfileStore,
+        )
+
+        now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
+        self._save_token(obtained_at=now, expires_at=now + timedelta(days=365))
+
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate(
+            {
+                "answers": {
+                    "niche": "Online courses on woodworking",
+                    "monthly_budget_rub": 50_000,
+                    "target_cpa_rub": 1_500,
+                },
+            },
+        )
+        result = await tool.handler(inp, tool_context)
+
+        assert result["status"] == "ready_for_policy_proposal"
+        assert result["profile"]["niche"] == "Online courses on woodworking"
+        assert result["profile"]["monthly_budget_rub"] == 50_000
+
+        # Pin: the profile actually landed on disk so slice 3 can
+        # read it back. Otherwise the "advance" status would be
+        # a lie.
+        store_path = settings.audit_log_path.parent / "business_profile.json"
+        saved = BusinessProfileStore(store_path).load()
+        assert saved is not None
+        assert saved.niche == "Online courses on woodworking"
+        assert saved.target_cpa_rub == 1_500
+
+    @pytest.mark.asyncio
+    async def test_handler_overwrites_existing_profile_on_full_submit(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # Re-run with a fresh full submit → overwrite. The store's
+        # save is atomic; we pin the end-to-end behaviour through
+        # the tool to make sure no caller-level merge logic
+        # silently kept stale fields.
+        from datetime import UTC, datetime, timedelta
+
+        from yadirect_agent.models.business_profile import BusinessProfile
+        from yadirect_agent.services.business_profile_store import (
+            BusinessProfileStore,
+        )
+
+        now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
+        self._save_token(obtained_at=now, expires_at=now + timedelta(days=365))
+
+        store_path = settings.audit_log_path.parent / "business_profile.json"
+        BusinessProfileStore(store_path).save(
+            BusinessProfile(
+                niche="old niche",
+                monthly_budget_rub=10_000,
+                target_cpa_rub=500,
+            ),
+        )
+
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate(
+            {
+                "answers": {
+                    "niche": "new niche",
+                    "monthly_budget_rub": 80_000,
+                    # target_cpa_rub omitted — must end up as None,
+                    # NOT silently retained from the previous save.
+                },
+            },
+        )
+        result = await tool.handler(inp, tool_context)
+
+        assert result["status"] == "ready_for_policy_proposal"
+        saved = BusinessProfileStore(store_path).load()
+        assert saved is not None
+        assert saved.niche == "new niche"
+        assert saved.monthly_budget_rub == 80_000
+        assert saved.target_cpa_rub is None
+
+    @pytest.mark.asyncio
+    async def test_handler_oauth_check_takes_priority_over_answers(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # If OAuth is missing, even a valid full profile must NOT
+        # advance to policy_proposal — the agent has nothing to
+        # propose against without API access. Return needs_oauth
+        # first.
+        assert memory_keyring == {}  # sanity-check: no token
+
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate(
+            {
+                "answers": {
+                    "niche": "ok",
+                    "monthly_budget_rub": 50_000,
+                },
+            },
+        )
+        result = await tool.handler(inp, tool_context)
+
+        assert result["status"] == "needs_oauth"
+        # Pin: nothing got persisted because OAuth blocked the path.
+        store_path = settings.audit_log_path.parent / "business_profile.json"
+        assert not store_path.exists()
 
 
 # --------------------------------------------------------------------------
