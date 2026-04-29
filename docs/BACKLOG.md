@@ -55,11 +55,8 @@ demo-only, technically; it cannot be handed to a non-developer.
 - [x] ~~**M20 — Hard-required emission** (slice 2)~~ — shipped, see Done.
 - [x] ~~**M20 — `explain_decision` MCP tool** (slice 3)~~ — shipped,
       see Done.
-- [ ] **M20 — auto-populated `policy_slack`** (slice 4): every
-      check in the safety pipeline emits its slack (distance to
-      threshold) into ``CheckResult.details``; the decorator pulls
-      these out and merges into ``Rationale.policy_slack``
-      automatically. Today the caller fills it manually.
+- [x] ~~**M20 — auto-populated `policy_slack`** (slice 4)~~ — shipped,
+      see Done. **M20 closed architecturally** (4/4 slices).
 - [x] ~~**M21 — Cost tracking (slice 1)**~~ — shipped, see Done.
       Observability surface (per-call CostRecord, JSONL persistence,
       ``cost status`` CLI). Hard auto-degrade to ``--no-llm`` on
@@ -838,6 +835,75 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M20 — auto-populated `policy_slack` (slice 4)**
+      (§M20, Phase 0+1, release 0.2.0). Closes M20 architecturally
+      (4/4 slices). Every kill-switch in the safety pipeline now
+      emits ``CheckResult.details["policy_slack"]`` (distance to
+      threshold, signed: positive = headroom, negative =
+      overshoot magnitude); the pipeline harvests them onto
+      ``SafetyDecision.policy_slack``; the ``@requires_plan``
+      decorator merges that dict into ``Rationale.policy_slack``
+      before persistence. Operators reading shadow-week rationale
+      now see safety margins automatically — no caller-side
+      bookkeeping.
+
+      Three layers:
+
+      1. **All 7 KS checks emit slack into details.**
+         - **KS#1 budget_cap**: ``cap - projected_total`` (RUB,
+           account-level on OK; group-level on group-cap block).
+         - **KS#2 max_cpc**: ``min(cap_per_kw - max(new_bid))``
+           across constrained keywords; ``cap - violating_bid``
+           on block. KEY ABSENT when no constraint applies.
+         - **KS#3 negative_keyword_floor**: ``-len(missing)``;
+           zero on OK (every required present); negative on
+           block. KEY ABSENT when no required negatives configured.
+         - **KS#4 quality_score_guard**: ``min(qs - threshold)``
+           across keywords with explicit bid INCREASE; same on
+           block. KEY ABSENT when no qualifying increase.
+         - **KS#5 budget_balance_drift**: ``threshold - max_shift_pct``
+           (worst-shifted campaign).
+         - **KS#6 conversion_integrity**: ``ratio - min_ratio``
+           on the ratio path only; structural paths (counter
+           mismatch, missing goals, empty baseline) skip slack.
+         - **KS#7 query_drift**: ``threshold - new_share``.
+
+         Each check ``float(...)``-casts the value to keep
+         ``Rationale.policy_slack: dict[str, float]`` round-trip
+         consistent through ``model_dump_json`` /
+         ``model_validate_json``.
+
+      2. **Pipeline harvest.** ``SafetyDecision`` gains
+         ``policy_slack: dict[str, float]`` (default empty so
+         existing constructors stay green); ``_run_check`` now
+         harvests ``CheckResult.details["policy_slack"]`` into a
+         per-review dict keyed by check name. The harvest happens
+         BEFORE the OK-result drop in ``_run_check`` so OK-path
+         slack survives. Type guard ``isinstance(slack, (int,
+         float)) and not isinstance(slack, bool)`` rejects a
+         buggy ``policy_slack=True`` from a future check from
+         being silently coerced to 1.0.
+
+      3. **Decorator merge.** ``_emit_rationale`` gains
+         ``auto_slack: dict[str, float] | None`` keyword-only;
+         the wrapper passes ``decision.policy_slack``. Merge
+         semantics: ``{**auto_slack, **rationale.policy_slack}``
+         — caller wins on key collision (a caller with explicit
+         knowledge stays authoritative; the decorator only fills
+         keys the caller did NOT provide). Empty/falsy
+         ``auto_slack`` short-circuits so structural rejections
+         leave the persisted rationale untouched.
+
+      KS#5 test math correction landed in the same impl commit
+      as the slack-emission impl: the originally-RED tests for
+      KS#5 used a single-campaign account, which always has
+      share=1.0 regardless of budget magnitude — no shift would
+      ever register. Fixed to use a 2-campaign 50/50 baseline.
+      Contract being tested unchanged; test inputs were the bug.
+
+      948 tests green (22 new across test_safety, test_pipeline,
+      test_executor_rationale); mypy strict; ruff clean.
 
 - [x] **M20 — `explain_decision` MCP tool (slice 3)** (§M20.3,
       Phase 0+1, release 0.2.0). Closes the M20 read-back loop:
