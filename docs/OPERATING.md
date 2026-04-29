@@ -334,10 +334,10 @@ On Windows: `%APPDATA%\Claude\claude_desktop_config.json`.
 }
 ```
 
-In this mode the agent in Claude Desktop sees four tools:
-`list_campaigns`, `get_keywords`, `validate_phrases`, and
-`explain_decision`. **It cannot call any mutating tool** — they're
-not registered.
+In this mode the agent in Claude Desktop sees five tools:
+`list_campaigns`, `get_keywords`, `validate_phrases`,
+`explain_decision`, and `account_health`. **It cannot call any
+mutating tool** — they're not registered.
 
 `explain_decision(decision_id)` is the read-back tool for recorded
 rationales (M20). In chat: *"Почему ты вчера снизил budget на
@@ -347,6 +347,17 @@ turn or from `yadirect-agent rationale list`, calls
 The agent never fabricates a reason — when the `decision_id` is
 unknown the tool returns `{status: "not_found"}` and Claude says
 so honestly.
+
+`account_health(days=7, goal_id=None)` is the chat mirror of
+`yadirect-agent health` (M15.5). Deterministic, rule-based — no
+LLM involved on the rules side. In chat: *"проверь моё здоровье"*
+/ *"какие сейчас проблемы в кабинете?"* — Claude calls
+`account_health()`, receives a structured list of findings
+(burning campaigns, high-CPA, etc.) with severity / impact / RUB
+estimates, and renders them as a human-readable summary. When
+`YANDEX_METRIKA_COUNTER_ID` is not set, the tool returns
+`{status: "unconfigured"}` and Claude tells the user which env
+var to set rather than failing opaquely.
 
 Restart Claude Desktop after editing the config. The new tools
 appear under the slider icon in the chat input.

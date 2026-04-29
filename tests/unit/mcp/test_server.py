@@ -26,6 +26,11 @@ _READ_ONLY_TOOLS = {
     # the read-only catalogue exposed in default MCP mode without
     # operator opt-in.
     "explain_decision",
+    # ``account_health`` (M15.5) — rule-based account health check
+    # exposed in chat. Reuses ``HealthCheckService`` verbatim;
+    # reads Metrika + Direct, never mutates. Closes the Phase 0
+    # surface for "how is my account?" without operator opt-in.
+    "account_health",
 }
 _GATED_WRITE_TOOLS = {
     "pause_campaigns",
@@ -232,3 +237,62 @@ class TestMcpToolDispatch:
         assert result["rationale"]["decision_id"] == "dec-mcp-test"
         assert result["rationale"]["confidence"] == "medium"
         assert "Reduced budget" in result["rationale"]["summary"]
+
+    @pytest.mark.asyncio
+    async def test_account_health_dispatches_in_read_only_mode(
+        self, settings: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end through MCP for the M15.5 health check tool: the
+        operator's read-only Claude Desktop mode (the default) must
+        expose ``account_health`` and dispatch it correctly. Without
+        this, the Phase 0 chat surface for "how is my account?" only
+        works from the CLI, not from the operator's chat.
+        """
+        from datetime import date
+
+        from yadirect_agent.models.health import (
+            Finding,
+            HealthReport,
+            Severity,
+        )
+        from yadirect_agent.models.metrika import DateRange
+        from yadirect_agent.services.health_check import HealthCheckService
+
+        async def fake_check(
+            self: HealthCheckService,
+            *,
+            date_range: DateRange,
+            goal_id: int | None = None,
+        ) -> HealthReport:
+            return HealthReport(
+                date_range=DateRange(start=date(2026, 4, 22), end=date(2026, 4, 28)),
+                findings=[
+                    Finding(
+                        rule_id="burning_campaign",
+                        severity=Severity.HIGH,
+                        campaign_id=42,
+                        campaign_name="autumn collection",
+                        message="cost 1500 RUB, 0 conversions over 7 days",
+                        estimated_impact_rub=1500.0,
+                    ),
+                ],
+            )
+
+        monkeypatch.setattr(HealthCheckService, "run_account_check", fake_check)
+
+        handle = build_mcp_server(settings, allow_write=False)
+
+        # Pin: tool is in the read-only catalogue (no allow_write needed).
+        names = {t.name for t in handle.tools}
+        assert "account_health" in names
+
+        # Pin: dispatch returns the structured ok-shape verbatim.
+        result = await handle.dispatch("account_health", {"days": 7, "goal_id": 100})
+        assert result["status"] == "ok"
+        assert result["report"]["date_range"] == {
+            "start": "2026-04-22",
+            "end": "2026-04-28",
+        }
+        assert len(result["report"]["findings"]) == 1
+        assert result["report"]["findings"][0]["severity"] == "high"
+        assert result["report"]["findings"][0]["campaign_id"] == 42

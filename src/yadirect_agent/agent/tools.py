@@ -31,10 +31,13 @@ from ..audit import AuditSink, JsonlSink
 from ..clients.direct import DirectService
 from ..clients.wordstat import DirectKeywordsResearch
 from ..config import Settings
+from ..exceptions import ConfigError
+from ..models.health import default_window, health_report_to_jsonable_dict
 from ..models.rationale import Rationale
 from ..rollout import RolloutStateStore
 from ..services.bidding import BiddingService, BidUpdate
 from ..services.campaigns import CampaignService
+from ..services.health_check import HealthCheckService
 from .executor import PlanRejected, PlanRequired
 from .pipeline import SafetyPipeline
 from .plans import PendingPlansStore
@@ -413,6 +416,35 @@ class _ExplainDecisionInput(BaseModel):
         return v
 
 
+class _AccountHealthInput(BaseModel):
+    model_config = _STRICT
+
+    days: int = Field(
+        default=7,
+        ge=1,
+        le=90,
+        description=(
+            "Window length in days, ending YESTERDAY (Metrika in-flight-day "
+            "data is incomplete and lags by hours; rule decisions on partial "
+            "data tend to false-positive). Default 7 mirrors the CLI default "
+            "and matches the operator's natural 'how was last week' question. "
+            "Cap at 90 because longer windows dilute today's signals into "
+            "noise."
+        ),
+    )
+    goal_id: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Metrika goal id to count conversions against. Without it, "
+            "conversion-based rules (high-CPA, etc.) silently skip — they "
+            "have no reference to compute against. Get the id from "
+            "``yadirect-agent doctor`` or the operator's Metrika dashboard. "
+            "Optional — runs cost-only rules without it."
+        ),
+    )
+
+
 # --------------------------------------------------------------------------
 # Standard tool factories.
 #
@@ -764,6 +796,71 @@ def _make_explain_decision_tool(settings: Settings) -> Tool:
     )
 
 
+def _make_account_health_tool(settings: Settings) -> Tool:
+    """Rule-based account-health check exposed over MCP (M15.5).
+
+    Mirrors the existing ``yadirect-agent health`` CLI: deterministic
+    rules over Metrika + Direct data, no LLM involved. Reuses
+    ``HealthCheckService`` verbatim — no new readers, no new rules.
+    Read-only by definition; joins the read-only catalogue exposed
+    in default MCP mode without operator opt-in.
+    """
+
+    async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
+        inp: _AccountHealthInput = raw  # type: ignore[assignment]
+        date_range = default_window(days=inp.days)
+        try:
+            async with HealthCheckService(settings) as svc:
+                report = await svc.run_account_check(
+                    date_range=date_range,
+                    goal_id=inp.goal_id,
+                )
+        except ConfigError as exc:
+            # Most common deployment-time failure: ``YANDEX_METRIKA_COUNTER_ID``
+            # not set. Surface as structured data the LLM can act on
+            # (tell the user which env var to set) instead of letting
+            # the exception bubble up as a generic tool error.
+            ctx.logger.info(
+                "tool.account_health.unconfigured",
+                reason=str(exc),
+            )
+            return {"status": "unconfigured", "reason": str(exc)}
+
+        ctx.logger.info(
+            "tool.account_health.ok",
+            findings=len(report.findings),
+            days=inp.days,
+            goal_id=inp.goal_id,
+        )
+        # Findings returned in their natural order — the LLM can
+        # sort / group as needed. CLI-side sorting (severity desc,
+        # impact desc, campaign id asc) lives in
+        # ``cli/health.py:render_report_json`` for terminal scanning.
+        return {"status": "ok", "report": health_report_to_jsonable_dict(report)}
+
+    return Tool(
+        name="account_health",
+        description=(
+            "Run a deterministic, rule-based health check on the Yandex.Direct "
+            "account and return a structured list of findings (burning campaigns "
+            "with no conversions, high-CPA campaigns above target, more rules "
+            "as M15.5 grows). NO LLM involved — purely Metrika + Direct data. "
+            "Use this when the user asks 'how is my account?', 'what should I "
+            "fix?', 'any warnings?', or after a config change. Returns "
+            "{status: 'ok', report: {date_range: {start, end}, findings: "
+            "[{rule_id, severity, campaign_id, campaign_name, message, "
+            "estimated_impact_rub}]}}; or {status: 'unconfigured', reason: "
+            "...} when YANDEX_METRIKA_COUNTER_ID is not set (tell the user "
+            "to set it). ``goal_id`` (Metrika goal) is optional — without it, "
+            "conversion-based rules silently skip. Default 7-day window, "
+            "ending yesterday."
+        ),
+        input_model=_AccountHealthInput,
+        is_write=False,
+        handler=handler,
+    )
+
+
 # --------------------------------------------------------------------------
 # Public factory.
 # --------------------------------------------------------------------------
@@ -966,6 +1063,7 @@ _PLAIN_FACTORIES: list[_PlainFactory] = [
     _make_get_keywords_tool,
     _make_validate_phrases_tool,
     _make_explain_decision_tool,
+    _make_account_health_tool,
 ]
 
 

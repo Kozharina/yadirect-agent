@@ -69,13 +69,17 @@ demo-only, technically; it cannot be handed to a non-developer.
 - [x] ~~**M6 (basic) — Metrika reporting**~~ — shipped, see Done.
 - [x] ~~**M15.5.1 — Account health check (basic rules)**~~ — shipped,
       see Done. Two rules + ``yadirect-agent health`` CLI.
-- [ ] **M15.5.2-6 — Health check rule expansion**: low-CTR rule
-      (needs impressions from Direct reports), rejected-ads /
+- [x] ~~**M15.5 — `account_health()` MCP tool mirror**~~ — shipped,
+      see Done. Closes the Phase 0 chat surface for "how is my
+      account?".
+- [ ] **M15.5.2-5 — Health check rule expansion** (remaining from
+      the original M15.5.2-6 bundle): low-CTR rule (needs
+      impressions from Direct reports), rejected-ads /
       rejected-keywords rule (needs Direct ad/keyword status
       readers), CTR-drift rule (needs week-over-week comparison
-      = small history store), MCP tool ``account_health()`` mirror,
-      ``@requires_llm`` decorator pattern for tools that gate on
-      Anthropic key presence. Each is a separate small PR.
+      = small history store), ``@requires_llm`` decorator pattern
+      for tools that gate on Anthropic key presence. Each is a
+      separate small PR.
 
 ### 🛡️ Phase 2 (Assist) — release 0.3.0
 
@@ -835,6 +839,68 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M15.5 — `account_health()` MCP tool mirror** (§M15.5,
+      Phase 0+1, release 0.2.0). Closes the Phase 0 chat surface
+      for "how is my account?". Mirrors the existing
+      ``yadirect-agent health`` CLI as an MCP tool so a Claude
+      Desktop chat can ask *«проверь моё здоровье»* / *«какие
+      сейчас проблемы в кабинете?»* and receive the same
+      rule-based findings the operator gets in the terminal.
+
+      Three pieces:
+
+      1. ``models/health.py`` — refactor: extract the JSON-
+         friendly serialisation shape into
+         ``health_report_to_jsonable_dict``. Pure structural
+         move (no behaviour change); CLI ``--json`` output and
+         the new MCP tool now share one source of truth for the
+         wire shape. Layer-clean: ``agent/tools.py`` cannot
+         import from peer-adapter ``cli/`` per ARCHITECTURE.md,
+         so the helper lives in the foundation layer.
+      2. ``_AccountHealthInput`` — pydantic model with two
+         fields: ``days: int = 7`` (``ge=1, le=90`` mirroring
+         the CLI bounds — 7-day window matches "how was last
+         week", 90+ dilutes today's signals into noise) and
+         ``goal_id: int | None = None`` (``ge=1``, optional
+         Metrika goal). ``extra="forbid"`` rejects unknown
+         fields.
+      3. ``_make_account_health_tool`` — read-only handler.
+         Constructs ``HealthCheckService(settings)`` per call
+         (stateless, async-context manager pattern matching
+         the CLI), invokes
+         ``run_account_check(date_range=default_window(days=...),
+         goal_id=...)``. Returns ``{status: "ok", report:
+         {...}}`` via the model-layer helper. ``ConfigError`` →
+         ``{status: "unconfigured", reason: ...}`` so missing
+         ``YANDEX_METRIKA_COUNTER_ID`` surfaces as actionable
+         data the LLM can act on (tell the user to set the env
+         var) instead of bubbling up as a generic tool error.
+
+      Tool description written for the LLM: WHEN to call
+      ("how is my account?", "what should I fix?", "any warnings?",
+      "after a config change"); pins NO LLM involvement on the
+      rules side; enumerates the response shape so the LLM can
+      build coherent chat output without inspecting the schema.
+
+      Registered in ``_PLAIN_FACTORIES`` so
+      ``build_default_registry`` exposes the tool by default.
+      ``is_write=False`` means it joins the read-only catalogue
+      (now 5 tools: ``list_campaigns`` / ``get_keywords`` /
+      ``validate_phrases`` / ``explain_decision`` /
+      ``account_health``) in default MCP mode without operator
+      opt-in.
+
+      968 tests green (11 new — 5 input validation, 3 handler
+      shape, 1 MCP read-only catalogue, 1 MCP dispatch end-to-end,
+      1 default-tool-count assertion update); mypy strict; ruff
+      clean.
+
+      Out of scope (deferred, in Active queue as M15.5.2-5):
+      low-CTR rule (needs Direct impressions reader), rejected-
+      ads / rejected-keywords rule (needs Direct ad/keyword
+      status reader), CTR-drift rule (needs week-over-week
+      history store), ``@requires_llm`` decorator pattern.
 
 - [x] **M20 — auto-populated `policy_slack` (slice 4)**
       (§M20, Phase 0+1, release 0.2.0). Closes M20 architecturally

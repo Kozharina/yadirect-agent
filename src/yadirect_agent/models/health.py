@@ -28,6 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date
 from enum import StrEnum
+from typing import Any
 
 from .metrika import DateRange
 
@@ -112,3 +113,38 @@ def default_window(days: int = 7) -> DateRange:
     end = today - timedelta(days=1)
     start = end - timedelta(days=days - 1)
     return DateRange(start=start, end=end)
+
+
+def health_report_to_jsonable_dict(report: HealthReport) -> dict[str, Any]:
+    """Serialise a HealthReport into a JSON-friendly dict.
+
+    Single source of truth for the wire shape: both
+    ``cli/health.py:render_report_json`` (CLI ``--json`` output)
+    and ``agent/tools.py:_make_account_health_tool`` (MCP tool
+    response) consume this. Without it, the same field set lives
+    inline in two places and a future ``Finding`` field reaches
+    one surface but not the other.
+
+    Date objects render as ISO strings, ``Severity`` enum renders
+    as its string value (``"high"`` / ``"warning"`` / ``"info"``).
+    Findings are returned in the order they appear in
+    ``report.findings`` — caller-side sorting (e.g. CLI's
+    severity-then-impact ordering) is the caller's responsibility.
+    """
+    return {
+        "date_range": {
+            "start": report.date_range.start.isoformat(),
+            "end": report.date_range.end.isoformat(),
+        },
+        "findings": [
+            {
+                "rule_id": f.rule_id,
+                "severity": f.severity.value,
+                "campaign_id": f.campaign_id,
+                "campaign_name": f.campaign_name,
+                "message": f.message,
+                "estimated_impact_rub": f.estimated_impact_rub,
+            }
+            for f in report.findings
+        ],
+    }
