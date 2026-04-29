@@ -383,6 +383,19 @@ class SafetyDecision:
     blocking_checks: list[CheckResult] = field(default_factory=list)
     warnings: list[CheckResult] = field(default_factory=list)
     skipped_checks: list[str] = field(default_factory=list)
+    policy_slack: dict[str, float] = field(default_factory=dict)
+    """M20 slice 4: distance to each kill-switch threshold the
+    pipeline encountered, keyed by check name (``budget_cap``,
+    ``max_cpc``, ...). Positive = headroom, negative = magnitude
+    of overshoot. Populated automatically from
+    ``CheckResult.details["policy_slack"]`` on every check that
+    has a numeric threshold semantic; absent for structural
+    paths (counter mismatch, missing goals, dup-id rejection).
+
+    The ``@requires_plan`` decorator merges this into
+    ``Rationale.policy_slack`` before persistence, so shadow-week
+    calibration sees safety margins without callers populating
+    the field manually."""
 
     @property
     def requires_confirmation(self) -> bool:
@@ -519,6 +532,11 @@ class SafetyPipeline:
         blocking: list[CheckResult] = []
         warnings: list[CheckResult] = []
         skipped: list[str] = []
+        # M20 slice 4: every ``_run_check`` call appends to this dict
+        # if the check populated ``details["policy_slack"]``. The
+        # decorator-side merge into ``Rationale.policy_slack`` reads
+        # ``decision.policy_slack`` verbatim.
+        policy_slack: dict[str, float] = {}
 
         self._run_check(
             "conversion_integrity",
@@ -534,6 +552,7 @@ class SafetyPipeline:
             blocking,
             warnings,
             skipped,
+            policy_slack,
         )
         self._run_check(
             "query_drift",
@@ -548,6 +567,7 @@ class SafetyPipeline:
             blocking,
             warnings,
             skipped,
+            policy_slack,
         )
 
         if blocking:
@@ -557,6 +577,7 @@ class SafetyPipeline:
                 blocking_checks=blocking,
                 warnings=warnings,
                 skipped_checks=skipped,
+                policy_slack=policy_slack,
             )
 
         # 4. Per-operation checks. Only run the ones whose data is
@@ -571,6 +592,7 @@ class SafetyPipeline:
             blocking,
             warnings,
             skipped,
+            policy_slack,
         )
         self._run_check(
             "max_cpc",
@@ -582,6 +604,7 @@ class SafetyPipeline:
             blocking,
             warnings,
             skipped,
+            policy_slack,
         )
         self._run_check(
             "negative_keyword_floor",
@@ -593,6 +616,7 @@ class SafetyPipeline:
             blocking,
             warnings,
             skipped,
+            policy_slack,
         )
         self._run_check(
             "quality_score_guard",
@@ -604,6 +628,7 @@ class SafetyPipeline:
             blocking,
             warnings,
             skipped,
+            policy_slack,
         )
         self._run_check(
             "budget_balance_drift",
@@ -619,6 +644,7 @@ class SafetyPipeline:
             blocking,
             warnings,
             skipped,
+            policy_slack,
         )
 
         # 5. Cross-call TOCTOU guard (KS#4 follow-up). A bid increase
@@ -637,6 +663,7 @@ class SafetyPipeline:
                 blocking_checks=blocking,
                 warnings=warnings,
                 skipped_checks=skipped,
+                policy_slack=policy_slack,
             )
 
         # 6. Approval tier — does the action need human confirmation?
@@ -649,6 +676,7 @@ class SafetyPipeline:
                 ),
                 warnings=warnings,
                 skipped_checks=skipped,
+                policy_slack=policy_slack,
             )
 
         # 7. (Session-bid register is updated by the executor via
@@ -661,6 +689,7 @@ class SafetyPipeline:
             reason="all checks passed",
             warnings=warnings,
             skipped_checks=skipped,
+            policy_slack=policy_slack,
         )
 
     def on_applied(self, context: ReviewContext) -> None:
@@ -695,18 +724,28 @@ class SafetyPipeline:
         blocking: list[CheckResult],
         warnings: list[CheckResult],
         skipped: list[str],
+        policy_slack: dict[str, float],
     ) -> None:
         """Dispatch to a single check; route result into the right bucket.
 
         A ``None`` return means "data missing — skip" and the check name is
         added to ``skipped``. Otherwise the ``CheckResult`` is routed by
         status: ``blocked`` → blocking list, ``warn`` → warnings list,
-        ``ok`` → dropped (only non-ok results surface to callers).
+        ``ok`` → dropped from the result lists (only non-ok results surface
+        to callers).
+
+        M20 slice 4: regardless of status, if the check populated
+        ``details["policy_slack"]`` with a numeric value, harvest it
+        into ``policy_slack[name]``. The decorator merges this dict
+        into ``Rationale.policy_slack`` before persistence.
         """
         result = runner()
         if result is None:
             skipped.append(name)
             return
+        slack = result.details.get("policy_slack")
+        if isinstance(slack, (int, float)) and not isinstance(slack, bool):
+            policy_slack[name] = float(slack)
         if result.status == "blocked":
             blocking.append(result)
         elif result.status == "warn":

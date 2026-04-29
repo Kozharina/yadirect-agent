@@ -2467,3 +2467,256 @@ class TestLoadPolicyBackwardsCompat:
         path.write_text("max_new_query_share: 0.2\n", encoding="utf-8")
         p = load_query_drift_policy(path)
         assert p.max_new_query_share == 0.2
+
+
+# --------------------------------------------------------------------------
+# M20 slice 4 — every kill-switch emits ``policy_slack`` (distance to
+# threshold) into ``CheckResult.details`` so the @requires_plan decorator
+# can auto-populate ``Rationale.policy_slack``. The decorator-side merge
+# is tested in tests/unit/agent/test_executor_rationale.py; this section
+# pins the per-check emission contract.
+#
+# Sign convention pinned across all checks: positive = headroom (we are
+# below / inside the threshold by that amount); negative = we are over
+# the threshold by that magnitude. Operators reading shadow-week
+# rationale see "max_cpc: 12.5 RUB headroom" (ok) vs "max_cpc: -2.5 RUB
+# over cap" (blocked) without consulting separate ok/blocked context.
+# --------------------------------------------------------------------------
+
+
+class TestKs1BudgetCapEmitsPolicySlack:
+    """KS#1: ``slack = account_cap - projected_total`` (RUB)."""
+
+    def test_ok_path_emits_positive_slack_equal_to_headroom(self) -> None:
+        check = BudgetCapCheck(_policy(account_cap=10_000))
+        snapshot = AccountBudgetSnapshot(campaigns=[_campaign(1, 5_000)])
+
+        result = check.check(snapshot, [BudgetChange(campaign_id=1, new_daily_budget_rub=8_500)])
+
+        assert result.status == "ok"
+        # 10_000 cap - 8_500 projected = 1_500 RUB headroom.
+        assert result.details["policy_slack"] == pytest.approx(1_500.0)
+
+    def test_blocked_path_emits_negative_slack_equal_to_overshoot(self) -> None:
+        # The whole point of slack: same number on both sides of the
+        # threshold, sign tells the story. A regression that emits 0
+        # or omitted on the blocked path would silently destroy the
+        # "how close were we" signal that shadow-week calibration
+        # depends on.
+        check = BudgetCapCheck(_policy(account_cap=10_000))
+        snapshot = AccountBudgetSnapshot(campaigns=[_campaign(1, 5_000)])
+
+        result = check.check(snapshot, [BudgetChange(campaign_id=1, new_daily_budget_rub=12_000)])
+
+        assert result.status == "blocked"
+        # 10_000 - 12_000 = -2_000 (we'd exceed by 2_000 RUB).
+        assert result.details["policy_slack"] == pytest.approx(-2_000.0)
+
+
+class TestKs2MaxCpcEmitsPolicySlack:
+    """KS#2: ``slack = min(cap_per_kw - max(new_bids))`` across constrained
+    keywords (RUB). When no keyword in the batch has a configured cap,
+    slack is undefined and the key is absent."""
+
+    def test_ok_path_emits_positive_slack_for_constrained_keyword(self) -> None:
+        check = MaxCpcCheck(_cpc_policy({100: 50.0}))
+        snapshot = AccountBidSnapshot(keywords=[_keyword(1, campaign_id=100, search=10.0)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_search_bid_rub=30.0)],
+        )
+
+        assert result.status == "ok"
+        # cap 50 - bid 30 = 20 RUB headroom on the only constrained kw.
+        assert result.details["policy_slack"] == pytest.approx(20.0)
+
+    def test_blocked_path_emits_negative_slack_for_overshooting_keyword(self) -> None:
+        check = MaxCpcCheck(_cpc_policy({100: 50.0}))
+        snapshot = AccountBidSnapshot(keywords=[_keyword(1, campaign_id=100, search=10.0)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_search_bid_rub=60.0)],
+        )
+
+        assert result.status == "blocked"
+        # 50 - 60 = -10 (over cap by 10 RUB).
+        assert result.details["policy_slack"] == pytest.approx(-10.0)
+
+    def test_no_constrained_keyword_omits_slack(self) -> None:
+        # A campaign with no entry in campaign_max_cpc_rub is
+        # unconstrained by KS#2; slack is undefined. Decorator must
+        # gracefully skip the missing key (tested decorator-side).
+        check = MaxCpcCheck(_cpc_policy({}))
+        snapshot = AccountBidSnapshot(keywords=[_keyword(1, campaign_id=100, search=10.0)])
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_search_bid_rub=30.0)],
+        )
+
+        assert result.status == "ok"
+        assert "policy_slack" not in result.details
+
+
+class TestKs3NegativeKeywordFloorEmitsPolicySlack:
+    """KS#3: ``slack = -len(missing)`` (count). Zero when the campaign has
+    every required negative; negative when phrases are missing. Same
+    sign convention as the others: zero / positive = safe."""
+
+    def test_ok_path_emits_zero_slack_when_all_required_present(self) -> None:
+        check = NegativeKeywordFloorCheck(_nk_policy(["foo", "bar"]))
+        snapshot = AccountBudgetSnapshot(
+            campaigns=[_campaign_with_kw(1, negatives=["foo", "bar", "baz"])],
+        )
+
+        result = check.check(
+            snapshot,
+            [BudgetChange(campaign_id=1, new_state="ON")],
+        )
+
+        assert result.status == "ok"
+        # Zero missing → zero slack. The campaign has exactly the
+        # required floor (plus extras); operator sees "no headroom
+        # but no violation" — accurate.
+        assert result.details["policy_slack"] == pytest.approx(0.0)
+
+    def test_blocked_path_emits_negative_slack_equal_to_minus_missing_count(self) -> None:
+        check = NegativeKeywordFloorCheck(_nk_policy(["foo", "bar", "baz"]))
+        snapshot = AccountBudgetSnapshot(
+            campaigns=[_campaign_with_kw(1, negatives=["foo"])],
+        )
+
+        result = check.check(
+            snapshot,
+            [BudgetChange(campaign_id=1, new_state="ON")],
+        )
+
+        assert result.status == "blocked"
+        # Two phrases missing → slack=-2.
+        assert result.details["policy_slack"] == pytest.approx(-2.0)
+
+
+class TestKs4QualityScoreGuardEmitsPolicySlack:
+    """KS#4: ``slack = min(current_qs - threshold)`` across keywords with
+    an explicit bid INCREASE. Decreases / no-op bids are unaffected by
+    the QS guard, so they don't contribute to the slack window."""
+
+    def test_ok_path_emits_positive_slack_for_increase_above_threshold(self) -> None:
+        check = QualityScoreGuardCheck(_qs_policy(threshold=5))
+        snapshot = AccountBidSnapshot(
+            keywords=[_kw_with_qs(1, qs=8, search=5.0)],
+        )
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_search_bid_rub=10.0)],  # increase
+        )
+
+        assert result.status == "ok"
+        # qs 8 - threshold 5 = 3 QS points headroom.
+        assert result.details["policy_slack"] == pytest.approx(3.0)
+
+    def test_blocked_path_emits_negative_slack_for_low_qs_increase(self) -> None:
+        check = QualityScoreGuardCheck(_qs_policy(threshold=5))
+        snapshot = AccountBidSnapshot(
+            keywords=[_kw_with_qs(1, qs=3, search=5.0)],
+        )
+
+        result = check.check(
+            snapshot,
+            [ProposedBidChange(keyword_id=1, new_search_bid_rub=10.0)],  # increase
+        )
+
+        assert result.status == "blocked"
+        # qs 3 - threshold 5 = -2.
+        assert result.details["policy_slack"] == pytest.approx(-2.0)
+
+
+class TestKs5BudgetBalanceDriftEmitsPolicySlack:
+    """KS#5: ``slack = max_shift_pct - actual_shift_pct``. Both sides
+    in PCT (0..1). KS#5 measures share-of-account drift, so a
+    multi-campaign account is needed to get a non-zero shift."""
+
+    def test_ok_path_emits_positive_slack_for_small_drift(self) -> None:
+        check = BudgetBalanceDriftCheck(_bbd_policy(max_shift=0.3))
+        # baseline: 50/50 (1k+1k=2k total); snapshot: 40/60 (800+1200=2k).
+        # Each campaign's share moves 10pp.
+        baseline = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 1_000), _ab_campaign(2, 1_000)])
+        snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 800), _ab_campaign(2, 1_200)])
+
+        # max_shift = 0.1, threshold 0.3 → 0.2 headroom.
+        result = check.check(baseline, snapshot, [])
+
+        assert result.status == "ok"
+        assert result.details["policy_slack"] == pytest.approx(0.2)
+
+    def test_blocked_path_emits_negative_slack_for_large_drift(self) -> None:
+        check = BudgetBalanceDriftCheck(_bbd_policy(max_shift=0.3))
+        # baseline: 50/50; snapshot: 10/90 (200+1800=2k). Each share moves 40pp.
+        baseline = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 1_000), _ab_campaign(2, 1_000)])
+        snapshot = AccountBudgetSnapshot(campaigns=[_ab_campaign(1, 200), _ab_campaign(2, 1_800)])
+
+        # max_shift = 0.4, threshold 0.3 → -0.1 (over by 10pp).
+        result = check.check(baseline, snapshot, [])
+
+        assert result.status == "blocked"
+        assert result.details["policy_slack"] == pytest.approx(-0.1)
+
+
+class TestKs6ConversionIntegrityEmitsPolicySlack:
+    """KS#6: ``slack = ratio - min_ratio``. Emit on the ratio path only;
+    counter-mismatch / missing-goals / empty-baseline paths skip slack
+    (the failure mode is structural, not a numeric distance)."""
+
+    def test_ok_path_emits_positive_slack_for_healthy_ratio(self) -> None:
+        check = ConversionIntegrityCheck(_ci_policy(min_total=0, min_ratio=0.5))
+        baseline = _snap(_goals((1, 100)))
+        current = _snap(_goals((1, 80)))  # ratio 0.8
+
+        result = check.check(baseline, current)
+
+        assert result.status == "ok"
+        # 0.8 - 0.5 = 0.3 ratio headroom.
+        assert result.details["policy_slack"] == pytest.approx(0.3)
+
+    def test_ratio_blocked_path_emits_negative_slack(self) -> None:
+        check = ConversionIntegrityCheck(_ci_policy(min_total=0, min_ratio=0.5))
+        baseline = _snap(_goals((1, 100)))
+        current = _snap(_goals((1, 20)))  # ratio 0.2
+
+        result = check.check(baseline, current)
+
+        assert result.status == "blocked"
+        # 0.2 - 0.5 = -0.3.
+        assert result.details["policy_slack"] == pytest.approx(-0.3)
+
+
+class TestKs7QueryDriftEmitsPolicySlack:
+    """KS#7: ``slack = max_new_query_share - actual_new_share`` (both
+    in 0..1 PCT)."""
+
+    def test_ok_path_emits_positive_slack_for_low_drift(self) -> None:
+        check = QueryDriftCheck(_qd_policy(max_share=0.4))
+        baseline = _queries("a", "b", "c", "d", "e")
+        # 1 of 5 queries new = 20% share, well under 40%.
+        current = _queries("a", "b", "c", "d", "NEW")
+
+        result = check.check(baseline, current)
+
+        assert result.status == "ok"
+        # 0.4 - 0.2 = 0.2 share headroom.
+        assert result.details["policy_slack"] == pytest.approx(0.2)
+
+    def test_blocked_path_emits_negative_slack_for_high_drift(self) -> None:
+        check = QueryDriftCheck(_qd_policy(max_share=0.4))
+        baseline = _queries("a", "b", "c", "d", "e")
+        # 4 of 5 new = 80% share, above 40%.
+        current = _queries("X", "Y", "Z", "W", "e")
+
+        result = check.check(baseline, current)
+
+        assert result.status == "blocked"
+        # 0.4 - 0.8 = -0.4.
+        assert result.details["policy_slack"] == pytest.approx(-0.4)

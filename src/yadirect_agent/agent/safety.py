@@ -246,6 +246,9 @@ class BudgetCapCheck:
                 "account daily budget cap would be exceeded",
                 projected_rub=account_total,
                 cap_rub=account_cap,
+                # M20 slice 4: positive = headroom, negative = overshoot.
+                # account_total > cap on this branch ⇒ slack < 0.
+                policy_slack=float(account_cap - account_total),
             )
 
         for group, group_cap in self._policy.campaign_group_caps_rub.items():
@@ -256,11 +259,14 @@ class BudgetCapCheck:
                     group=group,
                     projected_rub=group_total,
                     cap_rub=group_cap,
+                    # Slack reflects the violated cap (group, not account).
+                    policy_slack=float(group_cap - group_total),
                 )
 
         return CheckResult.ok_result(
             projected_total_rub=account_total,
             account_cap_rub=account_cap,
+            policy_slack=float(account_cap - account_total),
         )
 
     @staticmethod
@@ -474,6 +480,14 @@ class MaxCpcCheck:
                 duplicates=duplicates,
             )
 
+        # M20 slice 4: track the tightest cap-vs-bid distance across
+        # constrained keywords. min_slack is the metric the operator
+        # cares about ("how close were we to the ceiling on any
+        # keyword?"). Updates that hit no cap (no entry in the policy)
+        # don't contribute — slack stays None, decorator skips the
+        # absent key.
+        min_slack: float | None = None
+
         for u in updates:
             kw = snapshot.find(u.keyword_id)
             if kw is None:
@@ -495,6 +509,8 @@ class MaxCpcCheck:
                     bid_type="search",
                     proposed_rub=u.new_search_bid_rub,
                     cap_rub=cap,
+                    # Negative on this branch (over cap by that much).
+                    policy_slack=float(cap - u.new_search_bid_rub),
                 )
             if u.new_network_bid_rub is not None and u.new_network_bid_rub > cap:
                 return CheckResult.blocked_result(
@@ -504,9 +520,19 @@ class MaxCpcCheck:
                     bid_type="network",
                     proposed_rub=u.new_network_bid_rub,
                     cap_rub=cap,
+                    policy_slack=float(cap - u.new_network_bid_rub),
                 )
 
-        return CheckResult.ok_result()
+            # OK so far for this update; track headroom.
+            for proposed in (u.new_search_bid_rub, u.new_network_bid_rub):
+                if proposed is None:
+                    continue
+                gap = float(cap - proposed)
+                min_slack = gap if min_slack is None else min(min_slack, gap)
+
+        if min_slack is None:
+            return CheckResult.ok_result()
+        return CheckResult.ok_result(policy_slack=min_slack)
 
 
 # --------------------------------------------------------------------------
@@ -633,6 +659,9 @@ class NegativeKeywordFloorCheck:
 
         required = {_normalize_keyword(p) for p in self._policy.required_negative_keywords}
         if not required:
+            # No required floor configured ⇒ slack undefined. Skip
+            # emission so the decorator doesn't surface a meaningless
+            # zero.
             return CheckResult.ok_result()
 
         by_id = {c.id: c for c in snapshot.campaigns}
@@ -662,9 +691,18 @@ class NegativeKeywordFloorCheck:
                     ),
                     campaign_id=campaign.id,
                     missing=missing,
+                    # M20 slice 4: zero or negative — KS#3 has no
+                    # "headroom" semantic (every required must be
+                    # present). The slack here counts the deficit.
+                    policy_slack=float(-len(missing)),
                 )
 
-        return CheckResult.ok_result()
+        # All resumes (if any) cleared the floor. Emit zero — the
+        # decorator surfaces it as ``policy_slack["negative_keyword_floor"]:
+        # 0``, which truthfully says "you have exactly what's required,
+        # no more no less". Distinguishable from "unconfigured" (key
+        # absent above).
+        return CheckResult.ok_result(policy_slack=0.0)
 
 
 # --------------------------------------------------------------------------
@@ -753,17 +791,37 @@ class QualityScoreGuardCheck:
 
         threshold = self._policy.min_quality_score_for_bid_increase
 
+        # M20 slice 4: track the tightest QS-vs-threshold gap across
+        # keywords with an explicit bid INCREASE. Decreases / no-op
+        # bids don't trigger KS#4, so they don't contribute to the
+        # slack window. min_slack stays None when no qualifying
+        # update exists (no bid increase, or QS unknown) — decorator
+        # skips the absent key.
+        min_slack: float | None = None
+
         for u in updates:
             kw = snapshot.find(u.keyword_id)
             if kw is None:
                 continue
             if kw.quality_score is None:
                 continue
-            if kw.quality_score >= threshold:
+
+            has_increase = self._is_increase(
+                u.new_search_bid_rub, kw.current_search_bid_rub
+            ) or self._is_increase(u.new_network_bid_rub, kw.current_network_bid_rub)
+            if not has_increase:
                 continue
 
-            # QS strictly below threshold — inspect each bid field for
-            # an increase.
+            gap = float(kw.quality_score - threshold)
+
+            if kw.quality_score >= threshold:
+                # Bid increase on a healthy-QS keyword — track gap and
+                # continue.
+                min_slack = gap if min_slack is None else min(min_slack, gap)
+                continue
+
+            # QS strictly below threshold AND a bid increase — block.
+            # Negative gap is the slack on this branch.
             if self._is_increase(u.new_search_bid_rub, kw.current_search_bid_rub):
                 return CheckResult.blocked_result(
                     (
@@ -777,6 +835,7 @@ class QualityScoreGuardCheck:
                     bid_type="search",
                     current_rub=kw.current_search_bid_rub,
                     proposed_rub=u.new_search_bid_rub,
+                    policy_slack=gap,
                 )
             if self._is_increase(u.new_network_bid_rub, kw.current_network_bid_rub):
                 return CheckResult.blocked_result(
@@ -791,9 +850,12 @@ class QualityScoreGuardCheck:
                     bid_type="network",
                     current_rub=kw.current_network_bid_rub,
                     proposed_rub=u.new_network_bid_rub,
+                    policy_slack=gap,
                 )
 
-        return CheckResult.ok_result()
+        if min_slack is None:
+            return CheckResult.ok_result()
+        return CheckResult.ok_result(policy_slack=min_slack)
 
     @staticmethod
     def _is_increase(new: float | None, current: float | None) -> bool:
@@ -939,11 +1001,19 @@ class BudgetBalanceDriftCheck:
             if c.state == "ON"
         }
 
+        # M20 slice 4: track the worst drift across campaigns. The
+        # operator-meaningful slack is "how close was the most-
+        # rebalanced campaign to the threshold?". An empty share-set
+        # leaves max_shift at 0, so slack defaults to threshold (full
+        # headroom).
+        max_shift = 0.0
         all_ids = sorted(baseline_active.keys() | projected_active.keys())
         for cid in all_ids:
             before = baseline_active.get(cid, 0.0)
             after = projected_active.get(cid, 0.0)
             shift = abs(after - before)
+            if shift > max_shift:
+                max_shift = shift
             # IEEE 754: values that should mathematically equal
             # threshold often come out slightly above due to
             # rounding (e.g. 0.8-0.5 ≈ 0.30000000000000004).
@@ -968,11 +1038,13 @@ class BudgetBalanceDriftCheck:
                     threshold=threshold,
                     baseline_share=before,
                     projected_share=after,
+                    policy_slack=float(threshold - shift),
                 )
 
         return CheckResult.ok_result(
             baseline_total_rub=baseline_total,
             projected_total_rub=projected_total,
+            policy_slack=float(threshold - max_shift),
         )
 
 
@@ -1166,20 +1238,30 @@ class ConversionIntegrityCheck:
                 baseline_total=baseline_total,
                 ratio=ratio,
                 min_ratio=self._policy.min_ratio_vs_baseline,
+                # M20 slice 4: ratio gap. Negative = collapse, positive
+                # = healthy. Emit on the ratio-driven block; structural
+                # paths (counter mismatch / goals missing) skip slack.
+                policy_slack=float(ratio - self._policy.min_ratio_vs_baseline),
             )
 
         # (3) Missing goals. Only checked when the operator wants it.
         if self._policy.require_all_baseline_goals_present:
             missing = sorted(baseline.goal_ids() - current.goal_ids())
             if missing:
+                # No slack: this is a structural/identity failure
+                # (a goal disappeared), not a numeric distance.
                 return CheckResult.blocked_result(
                     (f"baseline goals missing in current snapshot: {missing}"),
                     missing_goal_ids=missing,
                 )
 
+        # OK path: slack = ratio - min_ratio. min_ratio == 0 means the
+        # operator disabled the ratio check; slack still meaningful as
+        # "current ratio above zero" (full headroom).
         return CheckResult.ok_result(
             baseline_total=baseline_total,
             current_total=current_total,
+            policy_slack=float(ratio - self._policy.min_ratio_vs_baseline),
         )
 
 
@@ -1337,12 +1419,17 @@ class QueryDriftCheck:
                 baseline_size=len(baseline_set),
                 new_count=new_count,
                 new_queries_sample=sample,
+                # M20 slice 4: negative on this branch (over by that
+                # share). Operator reads "query_drift: -0.40" → "we
+                # were 40 PCT-points over the new-query ceiling".
+                policy_slack=float(threshold - new_share),
             )
 
         return CheckResult.ok_result(
             new_share=new_share,
             baseline_size=len(baseline_set),
             current_size=current_size,
+            policy_slack=float(threshold - new_share),
         )
 
 

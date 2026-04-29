@@ -394,3 +394,99 @@ class TestRationaleNotReEmittedOnApply:
         # No new rationale persisted by the apply-plan re-entry.
         loaded = list(rationale_store._collapse_by_id().values())
         assert loaded == []
+
+
+# --------------------------------------------------------------------------
+# M20 slice 4 — auto-populate Rationale.policy_slack from
+# SafetyDecision.policy_slack the pipeline harvested.
+# --------------------------------------------------------------------------
+
+
+class TestPolicySlackAutoPopulate:
+    async def test_decision_slack_merges_into_persisted_rationale(
+        self,
+        store: PendingPlansStore,
+        rationale_store: RationaleStore,
+    ) -> None:
+        # The pipeline harvested two slack values (budget_cap and
+        # max_cpc) from CheckResults; the decorator must merge them
+        # into the rationale BEFORE persistence so the operator's
+        # ``rationale show`` / ``explain_decision`` read-back surfaces
+        # the safety margins automatically — no caller-side bookkeeping.
+        pipe = _StubPipeline(
+            next_decision=SafetyDecision(
+                status="allow",
+                reason="ok",
+                policy_slack={"budget_cap": 1_500.0, "max_cpc": 12.5},
+            ),
+        )
+        svc = _FakeServiceWithRationale(pipe, store, rationale_store)
+
+        await svc.set_daily_budget(1, 200, rationale=_build_rationale())
+
+        # Pull the persisted rationale (decision_id == plan.plan_id).
+        plan = pipe.review_calls[0][0]
+        recorded = rationale_store.get(plan.plan_id)
+
+        assert recorded is not None
+        assert recorded.policy_slack == {
+            "budget_cap": 1_500.0,
+            "max_cpc": 12.5,
+        }
+
+    async def test_caller_provided_slack_wins_on_key_collision(
+        self,
+        store: PendingPlansStore,
+        rationale_store: RationaleStore,
+    ) -> None:
+        # Caller-wins on conflict: a caller that pre-fills
+        # ``policy_slack`` with explicit knowledge (rare today, but the
+        # contract leaves the door open) is authoritative. Decorator
+        # only fills in the keys the caller did NOT provide.
+        pipe = _StubPipeline(
+            next_decision=SafetyDecision(
+                status="allow",
+                reason="ok",
+                policy_slack={"budget_cap": 1_500.0, "max_cpc": 12.5},
+            ),
+        )
+        svc = _FakeServiceWithRationale(pipe, store, rationale_store)
+        # Caller pre-fills ``budget_cap`` with a different value.
+        rationale_with_slack = _build_rationale().model_copy(
+            update={"policy_slack": {"budget_cap": 999.0}}
+        )
+
+        await svc.set_daily_budget(1, 200, rationale=rationale_with_slack)
+
+        plan = pipe.review_calls[0][0]
+        recorded = rationale_store.get(plan.plan_id)
+
+        assert recorded is not None
+        # ``budget_cap`` keeps the caller's 999.0 (NOT the decision's
+        # 1_500.0). ``max_cpc`` is filled in by the decorator since
+        # the caller didn't provide it.
+        assert recorded.policy_slack == {
+            "budget_cap": 999.0,
+            "max_cpc": 12.5,
+        }
+
+    async def test_empty_decision_slack_leaves_rationale_unchanged(
+        self,
+        store: PendingPlansStore,
+        rationale_store: RationaleStore,
+    ) -> None:
+        # Pipeline that ran no slack-emitting checks (e.g. a structural
+        # rejection path that never reaches ``_run_check`` for those
+        # KS) ⇒ empty ``decision.policy_slack``. Persisted rationale's
+        # ``policy_slack`` is whatever the caller gave (today: empty
+        # dict from the standard ``_build_handler_rationale`` helper).
+        pipe = _StubPipeline()  # default empty policy_slack
+        svc = _FakeServiceWithRationale(pipe, store, rationale_store)
+
+        await svc.set_daily_budget(1, 200, rationale=_build_rationale())
+
+        plan = pipe.review_calls[0][0]
+        recorded = rationale_store.get(plan.plan_id)
+
+        assert recorded is not None
+        assert recorded.policy_slack == {}

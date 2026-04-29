@@ -17,6 +17,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import cast
 
+import pytest
 from pydantic import ValidationError
 
 from yadirect_agent.agent.pipeline import (
@@ -578,6 +579,74 @@ class TestDecisionShape:
         d = SafetyDecision(status="reject", reason="blocked")
         assert d.allowed is False
         assert d.requires_confirmation is False
+
+    def test_policy_slack_default_empty(self) -> None:
+        # M20 slice 4: ``policy_slack`` is a new field on SafetyDecision.
+        # Default is empty so existing constructors that don't pass it
+        # keep working — the rest of the slice's plumbing populates it
+        # at pipeline time, not at decision-construction time.
+        d = SafetyDecision(status="allow", reason="ok")
+        assert d.policy_slack == {}
+
+
+class TestPolicySlackHarvest:
+    """M20 slice 4: pipeline collects ``policy_slack`` from each
+    check that emitted one into ``CheckResult.details``. Surfaced on
+    ``SafetyDecision.policy_slack`` keyed by the check name; the
+    decorator merges this into ``Rationale.policy_slack`` so shadow-
+    week calibration sees safety margins without callers having to
+    populate the field manually.
+    """
+
+    def test_budget_cap_slack_surfaces_on_decision(self) -> None:
+        pipe = SafetyPipeline(_policy(account_cap=10_000))
+        snap = AccountBudgetSnapshot(
+            campaigns=[CampaignBudget(id=1, name="c1", daily_budget_rub=5_000, state="ON")]
+        )
+
+        result = pipe.review(
+            _plan("set_campaign_budget"),
+            _ctx(
+                budget_snapshot=snap,
+                budget_changes=[BudgetChange(campaign_id=1, new_daily_budget_rub=7_000)],
+            ),
+        )
+
+        # 10_000 cap - 7_000 projected = 3_000 RUB headroom.
+        assert "budget_cap" in result.policy_slack
+        assert result.policy_slack["budget_cap"] == pytest.approx(3_000.0)
+
+    def test_blocked_check_still_surfaces_slack(self) -> None:
+        # A regression that only harvested OK paths would silently lose
+        # the "how close were we" signal on the most operator-relevant
+        # path (the rejection).
+        pipe = SafetyPipeline(_policy(account_cap=10_000))
+        snap = AccountBudgetSnapshot(
+            campaigns=[CampaignBudget(id=1, name="c1", daily_budget_rub=5_000, state="ON")]
+        )
+
+        result = pipe.review(
+            _plan("set_campaign_budget"),
+            _ctx(
+                budget_snapshot=snap,
+                budget_changes=[BudgetChange(campaign_id=1, new_daily_budget_rub=15_000)],
+            ),
+        )
+
+        assert result.status == "reject"
+        # 10_000 - 15_000 = -5_000 (overshoot by 5_000 RUB).
+        assert result.policy_slack["budget_cap"] == pytest.approx(-5_000.0)
+
+    def test_check_without_slack_omits_key(self) -> None:
+        # Read-only short-circuit doesn't run any checks → no
+        # policy_slack at all. A regression that surfaced spurious
+        # zero-valued keys would suggest "we ran the check and were at
+        # zero headroom", which is a different (false) signal.
+        pipe = SafetyPipeline(_policy(account_cap=10_000))
+
+        result = pipe.review(_plan("list_campaigns"), _ctx())
+
+        assert result.policy_slack == {}
 
 
 # --------------------------------------------------------------------------
