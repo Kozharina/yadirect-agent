@@ -928,19 +928,79 @@ cron). Каждый — точка отвала. M15 убирает все, кр
 
 ### M15.4 Conversational onboarding via MCP
 
-- MCP-tool `start_onboarding()`:
-  - проверяет статус OAuth (если нет — триггерит M15.3);
-  - собирает `BusinessProfile` через серию вопросов (ниша, ICP,
-    бюджет, цели, запрещённые формулировки);
-  - предлагает разумные дефолты для policy на основе текущего
-    состояния аккаунта (например: budget cap = 1.2× от текущего
-    суммарного дневного бюджета);
-  - делает baseline snapshot (M19);
-  - запускает первый health-check (M15.5) и возвращает отчёт.
-- Tool возвращает структурированный + читаемый результат, чтобы
-  Claude Desktop мог показать его в чате как нормальный ответ.
-- Шаги — re-runnable: повторный вызов с уже настроенным
-  BusinessProfile спрашивает, что обновить, не начинает с нуля.
+> **Status: shipped (PRs #57, #59, #60, #62, #63).** Implementation
+> diverged from the original spec phrasing in three places worth
+> recording here before we forget why; see Done section of
+> `docs/BACKLOG.md` for per-slice rationale.
+
+- MCP-tool `start_onboarding()` — pure-function contract over its
+  input (`answers: dict[str, Any] | None`), no internal state
+  machine. The LLM owns the conversation, the tool owns
+  validation + persistence + read-only state probes.
+- Branches the tool returns:
+  1. `{status: "needs_oauth", action: "yadirect-agent auth login",
+     reason}` when the OS keychain has no valid token. **The tool
+     does NOT trigger M15.3 directly** — an MCP server runs as a
+     background subprocess of Claude Desktop and cannot legally
+     open a browser on the operator's machine. The actionable
+     next-step points at the CLI command, the operator runs it
+     in their own terminal, and the OAuth flow owns the
+     browser-launch decision.
+  2. `{status: "ready_for_profile_qa", schema, collected,
+     missing}` when the keychain is OK and no profile is saved.
+     `schema` is `BusinessProfile.model_json_schema()` — the LLM
+     reads field descriptions, asks the operator naturally, then
+     submits the whole profile via `answers={...}`.
+  3. `{status: "incomplete_profile", errors}` when `answers` are
+     missing required fields or violate validation. Pydantic's
+     error list is returned verbatim; nothing is persisted.
+  4. `{status: "policy_proposed", profile, proposal:
+     {policy_yaml, summary}, account_summary, health}` when a
+     valid profile exists (either freshly saved or loaded from
+     a previous onboarding). This is the re-runnable path: a
+     second call with an already-saved profile lands here too,
+     so the operator gets full state + a fresh proposal in one
+     response without ping-ponging tool calls.
+- `BusinessProfile` shipped with three fields — `niche`,
+  `monthly_budget_rub`, `target_cpa_rub` — chosen as the minimum
+  required by the slice 3 policy generator and the existing
+  M15.5.1 high-CPA rule. **`icp` and `forbidden_phrasings`
+  deliberately deferred** until M8 (creatives) has a real
+  consumer for them; adding them now would design for a
+  hypothetical future requirement (CLAUDE.md non-negotiable).
+- Policy proposal: cap = `ceil_to_100(max(1.2 × current daily
+  total, monthly_budget_rub / 30))`. The `monthly/30` fallback
+  covers fresh / sandbox accounts where current=0; the spec's
+  1.2× formula alone would yield 0 there. YAML carries a
+  provenance header (inputs + formula + tool name) and seeds
+  `rollout_stage: shadow` so an operator who skips reading the
+  YAML still lands in read-only mode. The tool returns the
+  YAML as text — the operator copies it into
+  `settings.agent_policy_path` themselves; the tool does NOT
+  write to the filesystem (mutation of operator env requires
+  explicit operator consent, CLAUDE.md non-negotiable).
+- "baseline snapshot (M19)" reduced to an
+  `onboarding_completed` audit event in the existing
+  `audit.jsonl`. The full snapshot file was infrastructure for
+  M19's rollback contract — a consumer that doesn't exist
+  today (M19 is in Phase 2). The audit event answers "when did
+  onboarding finish and what was the state?" using existing
+  infra; M19, when it lands, will write its own snapshots in
+  its own format and the onboarding handler will gain one line
+  of `await snapshot_service.take("onboarding")`.
+- First health check uses `HealthCheckService.run_account_check`
+  (M15.5, shipped) with a 7-day window and no `goal_id` (the
+  profile doesn't carry a Metrika goal id; conversion-based
+  rules silently skip while cost-only signals like
+  burning_campaign still run). The report folds into the
+  `policy_proposed` response as `health: {status: "ok",
+  report}` or `health: {status: "unconfigured", reason}` when
+  the Metrika counter env var is unset — onboarding succeeds
+  visibly even on a Metrika-less install.
+- Re-runnable per spec: a second call with `answers=None` and a
+  saved profile lands in the same `policy_proposed` shape with
+  CURRENT health, not findings frozen at original onboarding
+  time.
 
 ### M15.5 `--no-llm` rule-based mode
 
