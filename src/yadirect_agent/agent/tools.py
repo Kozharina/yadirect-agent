@@ -31,6 +31,7 @@ from ..audit import AuditSink, JsonlSink
 from ..clients.direct import DirectService
 from ..clients.wordstat import DirectKeywordsResearch
 from ..config import Settings
+from ..models.rationale import Rationale
 from ..rollout import RolloutStateStore
 from ..services.bidding import BiddingService, BidUpdate
 from ..services.campaigns import CampaignService
@@ -240,6 +241,56 @@ class _ListCampaignsInput(BaseModel):
     )
 
 
+_REASON_FIELD_DESCRIPTION = (
+    "REQUIRED: one-to-two-sentence reason for THIS action. Explain WHY, "
+    "not WHAT (the args already cover what). The reason is recorded as "
+    "the rationale summary the operator can read back later "
+    "('why did you do X yesterday?') — be specific and grounded in the "
+    "data you observed. Examples: 'CTR < 0.5% over last 7 days, no "
+    "conversions.' / 'CPA below target for 5 consecutive days, scaling.' "
+    "/ 'Top-converting keyword, raising bid by 10%.'"
+)
+
+# Placeholder ``decision_id`` the handler stamps onto each Rationale.
+# The @requires_plan decorator overwrites it with ``plan.plan_id`` at
+# emit time (see ``executor._emit_rationale``). Pinned here as a
+# constant so a future "let me trace the placeholder through the
+# pipeline" debugger has one greppable surface; the validator on
+# ``Rationale.decision_id`` requires non-whitespace + non-empty,
+# which this satisfies.
+_RATIONALE_PLACEHOLDER_ID = "pending"
+
+
+def _build_handler_rationale(
+    *,
+    action: str,
+    resource_type: str,
+    resource_ids: list[int],
+    reason: str,
+) -> Rationale:
+    """Build a Rationale from a tool handler's input ``reason``.
+
+    The handler holds the agent's articulated reason at the call
+    site; everything else (action, resource_type, resource_ids)
+    mirrors the @requires_plan configuration verbatim so a future
+    ``rationale list --action=set_campaign_budget`` query lines up
+    with the operator-facing identifiers in ``plans list``.
+
+    ``inputs``, ``alternatives_considered``, and ``policy_slack``
+    stay empty in slice 2 — slice 4 auto-populates ``policy_slack``
+    from ``CheckResult.details`` inside the safety pipeline; the
+    other two stay empty until a future agent-loop slice surfaces
+    structured reasoning artefacts.
+    """
+    return Rationale(
+        decision_id=_RATIONALE_PLACEHOLDER_ID,
+        action=action,
+        resource_type=resource_type,
+        resource_ids=resource_ids,
+        summary=reason,
+    )
+
+
 class _IdListInput(BaseModel):
     model_config = _STRICT
 
@@ -247,6 +298,12 @@ class _IdListInput(BaseModel):
         ...,
         min_length=1,
         description="One or more campaign ids.",
+    )
+    reason: str = Field(
+        ...,
+        min_length=10,
+        max_length=500,
+        description=_REASON_FIELD_DESCRIPTION,
     )
 
 
@@ -258,6 +315,12 @@ class _SetCampaignBudgetInput(BaseModel):
         ...,
         ge=300,
         description="New daily budget in rubles. Minimum 300 RUB (Direct's own floor).",
+    )
+    reason: str = Field(
+        ...,
+        min_length=10,
+        max_length=500,
+        description=_REASON_FIELD_DESCRIPTION,
     )
 
 
@@ -295,6 +358,12 @@ class _SetKeywordBidsInput(BaseModel):
             "Per-keyword bid changes. Ceiling: +50% per single call is enforced "
             "by the bidding service; violations are rejected."
         ),
+    )
+    reason: str = Field(
+        ...,
+        min_length=10,
+        max_length=500,
+        description=_REASON_FIELD_DESCRIPTION,
     )
 
 
@@ -354,9 +423,15 @@ def _make_pause_campaigns_tool(
 ) -> Tool:
     async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
         inp: _IdListInput = raw  # type: ignore[assignment]
+        rationale = _build_handler_rationale(
+            action="pause_campaigns",
+            resource_type="campaign",
+            resource_ids=list(inp.ids),
+            reason=inp.reason,
+        )
         svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=audit_sink)
         try:
-            await svc.pause(inp.ids)
+            await svc.pause(inp.ids, rationale=rationale)
         except PlanRequired as exc:
             ctx.logger.info("tool.pause_campaigns.pending", ids=inp.ids, plan_id=exc.plan_id)
             return _pending_response(exc)
@@ -388,9 +463,15 @@ def _make_resume_campaigns_tool(
 ) -> Tool:
     async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
         inp: _IdListInput = raw  # type: ignore[assignment]
+        rationale = _build_handler_rationale(
+            action="resume_campaigns",
+            resource_type="campaign",
+            resource_ids=list(inp.ids),
+            reason=inp.reason,
+        )
         svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=audit_sink)
         try:
-            await svc.resume(inp.ids)
+            await svc.resume(inp.ids, rationale=rationale)
         except PlanRequired as exc:
             ctx.logger.info("tool.resume_campaigns.pending", ids=inp.ids, plan_id=exc.plan_id)
             return _pending_response(exc)
@@ -424,9 +505,15 @@ def _make_set_campaign_budget_tool(
 ) -> Tool:
     async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
         inp: _SetCampaignBudgetInput = raw  # type: ignore[assignment]
+        rationale = _build_handler_rationale(
+            action="set_campaign_budget",
+            resource_type="campaign",
+            resource_ids=[inp.campaign_id],
+            reason=inp.reason,
+        )
         svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=audit_sink)
         try:
-            await svc.set_daily_budget(inp.campaign_id, inp.budget_rub)
+            await svc.set_daily_budget(inp.campaign_id, inp.budget_rub, rationale=rationale)
         except PlanRequired as exc:
             ctx.logger.info(
                 "tool.set_campaign_budget.pending",
@@ -503,6 +590,12 @@ def _make_set_keyword_bids_tool(
 ) -> Tool:
     async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
         inp: _SetKeywordBidsInput = raw  # type: ignore[assignment]
+        rationale = _build_handler_rationale(
+            action="set_keyword_bids",
+            resource_type="keyword",
+            resource_ids=[u.keyword_id for u in inp.updates],
+            reason=inp.reason,
+        )
         svc = BiddingService(settings, pipeline=pipeline, store=store, audit_sink=audit_sink)
         updates = [
             BidUpdate(
@@ -513,7 +606,7 @@ def _make_set_keyword_bids_tool(
             for u in inp.updates
         ]
         try:
-            await svc.apply(updates)
+            await svc.apply(updates, rationale=rationale)
         except PlanRequired as exc:
             ctx.logger.info(
                 "tool.set_keyword_bids.pending",

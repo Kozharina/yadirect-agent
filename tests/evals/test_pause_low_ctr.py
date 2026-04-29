@@ -92,7 +92,10 @@ async def test_pause_campaigns_below_ctr_threshold(
                     text_block("Pausing campaigns 2 and 3, both below 0.5% CTR."),
                     tool_use(
                         "pause_campaigns",
-                        {"ids": [2, 3]},
+                        {
+                            "ids": [2, 3],
+                            "reason": "CTR < 0.5% over the last 7 days — pausing.",
+                        },
                         id="tu_pause",
                     ),
                 ],

@@ -71,7 +71,8 @@ async def test_bid_change_returns_pending_and_relays_apply_plan(
                         {
                             "updates": [
                                 {"keyword_id": 42, "new_search_bid_rub": 5.0},
-                            ]
+                            ],
+                            "reason": "Top-converting keyword — incremental bid raise.",
                         },
                         id="tu_bid",
                     ),

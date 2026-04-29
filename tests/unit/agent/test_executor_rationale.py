@@ -280,29 +280,67 @@ class TestRationaleSkippedOnReject:
 
 
 # --------------------------------------------------------------------------
-# Backward compat & soft-optional behaviour.
+# Hard-required rationale contract (M20 slice 2).
 # --------------------------------------------------------------------------
 
 
-class TestRationaleSoftOptional:
-    async def test_no_rationale_kwarg_warns_but_continues(
+class TestRationaleHardRequired:
+    async def test_no_rationale_kwarg_raises_typeerror(
         self,
         store: PendingPlansStore,
         rationale_store: RationaleStore,
-        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        # Service with rationale store, but caller didn't pass
-        # rationale=. Soft-optional contract: warn, don't raise.
+        # M20 slice 2 flipped the kwarg from soft-optional to
+        # hard-required. A caller that omits ``rationale=`` now
+        # gets a clear TypeError up front — not a structlog
+        # warning that disappears into log volume. Without this
+        # raise, shadow-week calibration silently degrades to
+        # "rationale.missing" warnings, which is the failure mode
+        # the slice exists to eliminate.
         pipe = _StubPipeline()
         svc = _FakeServiceWithRationale(pipe, store, rationale_store)
 
-        with caplog.at_level(logging.WARNING):
-            result = await svc.set_daily_budget(1, 200)
+        with pytest.raises(TypeError, match="rationale"):
+            await svc.set_daily_budget(1, 200)
 
-        assert result == "ok"
-        # Empty file = no rationale recorded.
-        loaded = list(rationale_store._collapse_by_id().values())
-        assert loaded == []
+    async def test_typeerror_raised_before_pipeline_review(
+        self,
+        store: PendingPlansStore,
+        rationale_store: RationaleStore,
+    ) -> None:
+        # The TypeError must fire BEFORE the pipeline runs. Otherwise
+        # an attempted mutation could pass the safety pipeline, fail
+        # at the rationale gate, and leave the operator confused
+        # about what actually got reviewed.
+        pipe = _StubPipeline()
+        svc = _FakeServiceWithRationale(pipe, store, rationale_store)
+
+        with pytest.raises(TypeError):
+            await svc.set_daily_budget(1, 200)
+
+        # Pipeline.review was never called; no plan persisted.
+        assert pipe.review_calls == []
+        assert store.list_pending() == []
+
+    async def test_apply_plan_bypass_does_not_require_rationale(
+        self,
+        store: PendingPlansStore,
+        rationale_store: RationaleStore,
+    ) -> None:
+        # The apply-plan re-entry path passes ``_applying_plan_id`` and
+        # short-circuits the wrapper. Rationale was already recorded
+        # when the plan was first proposed; re-passing it on apply
+        # would duplicate (worst) or contradict (worse) the original
+        # record. So the apply-plan path MUST keep working without
+        # ``rationale=``, even after the slice 2 hard-required flip.
+        pipe = _StubPipeline()
+        svc = _FakeServiceWithRationale(pipe, store, rationale_store)
+
+        # No rationale kwarg, but _applying_plan_id is set —
+        # bypass path runs, no TypeError.
+        await svc.set_daily_budget(1, 200, _applying_plan_id="plan-from-cli")
+
+        assert svc.calls == [{"campaign_id": 1, "new_budget_rub": 200}]
 
     async def test_rationale_without_store_warns_but_continues(
         self,
@@ -310,7 +348,11 @@ class TestRationaleSoftOptional:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         # Service that doesn't expose _resolve_rationale_store at all.
-        # Backward-compat: must keep working as before M20.
+        # Slice 2 changed the rationale-missing contract; the
+        # store-missing contract is unchanged: warn, continue. Some
+        # legacy services (or future M14 multi-account variants) may
+        # not have a rationale store wired up and we don't want to
+        # block their mutations on that.
         pipe = _StubPipeline()
         svc = _FakeServiceNoRationale(pipe, store)
         rationale = _build_rationale()

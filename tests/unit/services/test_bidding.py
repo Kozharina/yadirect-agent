@@ -20,7 +20,26 @@ import pytest
 from yadirect_agent.clients import direct as direct_module
 from yadirect_agent.config import Settings
 from yadirect_agent.models.keywords import Keyword, KeywordBid
+from yadirect_agent.models.rationale import Rationale
 from yadirect_agent.services.bidding import BiddingService, BidUpdate, _build_bid_context
+
+
+def _test_rationale(*, resource_ids: list[int] | None = None) -> Rationale:
+    """Minimal valid Rationale for tests focused on bid-decision mechanics.
+
+    M20 slice 2 made ``rationale=`` hard-required on ``BiddingService.apply``;
+    tests that exercise pipeline branching / kill-switch behaviour
+    pass this stub. Tests on rationale shape itself live in
+    ``test_executor_rationale.py``.
+    """
+    return Rationale(
+        decision_id="test-placeholder",
+        action="set_keyword_bids",
+        resource_type="keyword",
+        resource_ids=resource_ids if resource_ids is not None else [1],
+        summary="test rationale — exercising bid-decision mechanics, not rationale content.",
+    )
+
 
 # --------------------------------------------------------------------------
 # In-memory DirectService stub.
@@ -204,7 +223,10 @@ async def test_apply_without_safety_pair_raises_runtime_error(
     """
     svc = BiddingService(settings)
     with pytest.raises(RuntimeError, match="SafetyPipeline"):
-        await svc.apply([BidUpdate(keyword_id=1, new_search_bid_rub=10.0)])
+        await svc.apply(
+            [BidUpdate(keyword_id=1, new_search_bid_rub=10.0)],
+            rationale=_test_rationale(),
+        )
 
 
 @pytest.mark.asyncio
@@ -246,6 +268,7 @@ async def test_apply_through_decorator_persists_confirm_plan(
     with pytest.raises(PlanRequired) as exc:
         await svc.apply(
             [BidUpdate(keyword_id=42, new_search_bid_rub=10.0)],
+            rationale=_test_rationale(resource_ids=[42]),
         )
 
     plan = store.get(exc.value.plan_id)
@@ -298,7 +321,10 @@ async def test_apply_rollout_stage_shadow_rejects_bid_changes(
     svc = BiddingService(settings, pipeline=pipeline, store=store, audit_sink=sink)
 
     with pytest.raises(PlanRejected):
-        await svc.apply([BidUpdate(keyword_id=42, new_search_bid_rub=10.0)])
+        await svc.apply(
+            [BidUpdate(keyword_id=42, new_search_bid_rub=10.0)],
+            rationale=_test_rationale(resource_ids=[42]),
+        )
 
     # No mutating call reached DirectService.
     assert fake_direct.set_keyword_bids_calls == []
@@ -337,7 +363,9 @@ async def test_resolve_safety_requires_audit_sink(settings: Settings, tmp_path: 
     svc = BiddingService(settings, pipeline=pipeline, store=store)
     # No audit_sink. Mutating call without bypass → RuntimeError.
     with pytest.raises(RuntimeError, match="AuditSink"):
-        await svc.apply([BidUpdate(keyword_id=1, new_search_bid_rub=5.0)])
+        await svc.apply(
+            [BidUpdate(keyword_id=1, new_search_bid_rub=5.0)], rationale=_test_rationale()
+        )
 
 
 # --------------------------------------------------------------------------
@@ -567,7 +595,10 @@ async def test_apply_blocks_when_search_bid_exceeds_campaign_max_cpc(
 
     # Bid 15 RUB > campaign cap 10 RUB on campaign 7 → KS#2 blocks.
     with pytest.raises(PlanRejected):
-        await svc.apply([BidUpdate(keyword_id=42, new_search_bid_rub=15.0)])
+        await svc.apply(
+            [BidUpdate(keyword_id=42, new_search_bid_rub=15.0)],
+            rationale=_test_rationale(resource_ids=[42]),
+        )
 
     # No mutating call reached DirectService.
     assert fake_direct.set_keyword_bids_calls == []
@@ -605,7 +636,10 @@ async def test_apply_blocks_bid_increase_on_low_quality_score(
     svc = BiddingService(settings, pipeline=pipeline, store=store, audit_sink=sink)
 
     with pytest.raises(PlanRejected):
-        await svc.apply([BidUpdate(keyword_id=42, new_search_bid_rub=8.0)])
+        await svc.apply(
+            [BidUpdate(keyword_id=42, new_search_bid_rub=8.0)],
+            rationale=_test_rationale(resource_ids=[42]),
+        )
 
     assert fake_direct.set_keyword_bids_calls == []
 
@@ -643,6 +677,9 @@ async def test_apply_allows_bid_decrease_on_low_quality_score(
     # 5 < 10 → decrease, KS#4 must NOT block. Pipeline returns confirm
     # because there's no auto_approve_bid_change knob.
     with pytest.raises(PlanRequired):
-        await svc.apply([BidUpdate(keyword_id=42, new_search_bid_rub=5.0)])
+        await svc.apply(
+            [BidUpdate(keyword_id=42, new_search_bid_rub=5.0)],
+            rationale=_test_rationale(resource_ids=[42]),
+        )
 
     assert fake_direct.set_keyword_bids_calls == []

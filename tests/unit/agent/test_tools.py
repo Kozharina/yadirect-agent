@@ -145,6 +145,85 @@ class TestDefaultRegistry:
         with pytest.raises(ValidationError):
             tool.input_model.model_validate({"_probe_unknown_field": "x"})
 
+    @pytest.mark.parametrize(
+        ("tool_name", "args"),
+        [
+            ("pause_campaigns", {"ids": [1]}),
+            ("resume_campaigns", {"ids": [1]}),
+            ("set_campaign_budget", {"campaign_id": 1, "budget_rub": 500}),
+            (
+                "set_keyword_bids",
+                {"updates": [{"keyword_id": 1, "new_search_bid_rub": 5.0}]},
+            ),
+        ],
+    )
+    def test_mutating_tool_inputs_require_reason_field(
+        self, settings: Settings, tool_name: str, args: dict[str, Any]
+    ) -> None:
+        # M20 slice 2: ``reason`` is hard-required on every mutating
+        # tool input. The decorator emits a Rationale at decision
+        # time using ``inp.reason`` as the summary; a missing reason
+        # at the boundary means we cannot honour M20.3 ("the agent
+        # retrieves recorded rationale, doesn't fabricate on demand")
+        # — so we refuse the tool call up front, BEFORE any safety
+        # pipeline runs.
+        from pydantic import ValidationError
+
+        reg = build_default_registry(settings)
+        tool = reg.get(tool_name)
+        with pytest.raises(ValidationError, match="reason"):
+            tool.input_model.model_validate(args)
+
+    @pytest.mark.parametrize(
+        ("tool_name", "args"),
+        [
+            ("pause_campaigns", {"ids": [1]}),
+            ("resume_campaigns", {"ids": [1]}),
+            ("set_campaign_budget", {"campaign_id": 1, "budget_rub": 500}),
+            (
+                "set_keyword_bids",
+                {"updates": [{"keyword_id": 1, "new_search_bid_rub": 5.0}]},
+            ),
+        ],
+    )
+    def test_mutating_tool_inputs_reject_short_reason(
+        self, settings: Settings, tool_name: str, args: dict[str, Any]
+    ) -> None:
+        # ``min_length=10`` catches "ok", "yes", "do it" — none of
+        # which are useful rationale for shadow-week calibration.
+        # The threshold is deliberately low (≈ two short words)
+        # because we don't want to force the LLM to artificially
+        # pad reasons to hit a higher bar.
+        from pydantic import ValidationError
+
+        reg = build_default_registry(settings)
+        tool = reg.get(tool_name)
+        with pytest.raises(ValidationError, match="at least 10"):
+            tool.input_model.model_validate({**args, "reason": "ok"})
+
+    @pytest.mark.parametrize(
+        "tool_name",
+        ["list_campaigns", "get_keywords", "validate_phrases"],
+    )
+    def test_read_only_tool_inputs_do_not_require_reason(
+        self, settings: Settings, tool_name: str
+    ) -> None:
+        # Read-only tools have no decision attached, so a reason
+        # would be ceremonial. Pin the asymmetry: only mutating
+        # tools demand articulated rationale.
+        from pydantic import ValidationError
+
+        reg = build_default_registry(settings)
+        tool = reg.get(tool_name)
+        # The minimum payload differs per read-only tool; instead of
+        # spelling each out, assert that passing an unexpected
+        # ``reason`` field IS rejected (extra="forbid" still
+        # applies). If the field were silently accepted, that would
+        # hint a future drift toward also requiring reason on read
+        # tools.
+        with pytest.raises(ValidationError):
+            tool.input_model.model_validate({"reason": "this should be rejected here"})
+
     def test_build_safety_pair_called_once_per_registry(
         self, settings: Settings, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -168,6 +247,124 @@ class TestDefaultRegistry:
         monkeypatch.setattr(tools_mod, "build_safety_pair", _counting)
         build_default_registry(settings)
         assert call_count == 1
+
+
+# --------------------------------------------------------------------------
+# M20 slice 2 — handlers construct a ``Rationale`` from ``inp.reason``
+# and pass it via ``rationale=`` to the underlying service method.
+# The decorator overwrites ``decision_id`` with ``plan.plan_id`` and
+# persists; the test patches at the service level (so the decorator
+# is bypassed) and verifies the kwarg shape directly.
+# --------------------------------------------------------------------------
+
+
+class TestHandlersPassRationaleToService:
+    @pytest.mark.parametrize(
+        (
+            "tool_name",
+            "args",
+            "service_class_name",
+            "method_name",
+            "expected_action",
+            "expected_rt",
+            "expected_ids",
+        ),
+        [
+            (
+                "pause_campaigns",
+                {"ids": [1, 2], "reason": "CTR < 0.5% over the last 7 days."},
+                "CampaignService",
+                "pause",
+                "pause_campaigns",
+                "campaign",
+                [1, 2],
+            ),
+            (
+                "resume_campaigns",
+                {"ids": [3], "reason": "Refreshed creatives, resuming campaign."},
+                "CampaignService",
+                "resume",
+                "resume_campaigns",
+                "campaign",
+                [3],
+            ),
+            (
+                "set_campaign_budget",
+                {
+                    "campaign_id": 5,
+                    "budget_rub": 700,
+                    "reason": "Strong ROAS this week, scaling spend.",
+                },
+                "CampaignService",
+                "set_daily_budget",
+                "set_campaign_budget",
+                "campaign",
+                [5],
+            ),
+            (
+                "set_keyword_bids",
+                {
+                    "updates": [{"keyword_id": 9, "new_search_bid_rub": 8.0}],
+                    "reason": "Top converter, raising bid by 10%.",
+                },
+                "BiddingService",
+                "apply",
+                "set_keyword_bids",
+                "keyword",
+                [9],
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_handler_constructs_rationale_with_reason_as_summary(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        monkeypatch: pytest.MonkeyPatch,
+        tool_name: str,
+        args: dict[str, Any],
+        service_class_name: str,
+        method_name: str,
+        expected_action: str,
+        expected_rt: str,
+        expected_ids: list[int],
+    ) -> None:
+        from yadirect_agent.services.bidding import BiddingService
+        from yadirect_agent.services.campaigns import CampaignService
+
+        captured: dict[str, Any] = {}
+
+        async def _fake(self: Any, *_args: Any, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        target_class = (
+            CampaignService if service_class_name == "CampaignService" else BiddingService
+        )
+        monkeypatch.setattr(target_class, method_name, _fake)
+
+        tool = build_default_registry(settings).get(tool_name)
+        inp = tool.input_model.model_validate(args)
+        await tool.handler(inp, tool_context)
+
+        # Handler MUST pass ``rationale=`` so the decorator can persist
+        # it. Without this, M20 slice 2 collapses to the same
+        # ``rationale.missing`` warning the soft-optional path used
+        # to emit — the operator still gets no record of the reason.
+        assert "rationale" in captured, (
+            f"{tool_name} handler did not pass rationale= to {service_class_name}.{method_name}"
+        )
+        rat = captured["rationale"]
+        # Summary IS the reason verbatim — the args are already in
+        # ``plan.preview`` / ``plan.args``, no need to duplicate them
+        # into the summary.
+        assert rat.summary == args["reason"]
+        # Action / resource_type / resource_ids mirror the
+        # ``@requires_plan(...)`` configuration so a future read-back
+        # query like ``rationale list --action=set_campaign_budget``
+        # finds this record.
+        assert rat.action == expected_action
+        assert rat.resource_type == expected_rt
+        assert rat.resource_ids == expected_ids
 
 
 # --------------------------------------------------------------------------
@@ -496,13 +693,15 @@ async def test_pause_campaigns_delegates_and_echoes_ids(
 
     captured: list[list[int]] = []
 
-    async def fake_pause(self: CampaignService, ids: list[int]) -> None:
+    async def fake_pause(self: CampaignService, ids: list[int], **_: Any) -> None:
         captured.append(list(ids))
 
     monkeypatch.setattr(CampaignService, "pause", fake_pause)
 
     tool = build_default_registry(settings).get("pause_campaigns")
-    inp = tool.input_model.model_validate({"ids": [1, 2]})
+    inp = tool.input_model.model_validate(
+        {"ids": [1, 2], "reason": "CTR below 0.5% over the last 7 days."}
+    )
     result = await tool.handler(inp, tool_context)
 
     assert captured == [[1, 2]]
@@ -519,13 +718,15 @@ async def test_resume_campaigns_delegates_and_echoes_ids(
 ) -> None:
     from yadirect_agent.services.campaigns import CampaignService
 
-    async def fake_resume(self: CampaignService, ids: list[int]) -> None:
+    async def fake_resume(self: CampaignService, ids: list[int], **_: Any) -> None:
         return None
 
     monkeypatch.setattr(CampaignService, "resume", fake_resume)
 
     tool = build_default_registry(settings).get("resume_campaigns")
-    inp = tool.input_model.model_validate({"ids": [7]})
+    inp = tool.input_model.model_validate(
+        {"ids": [7], "reason": "Manually un-paused after creative refresh."}
+    )
     result = await tool.handler(inp, tool_context)
 
     assert result == {"status": "applied", "resumed": [7]}
@@ -533,8 +734,14 @@ async def test_resume_campaigns_delegates_and_echoes_ids(
 
 def test_set_campaign_budget_rejects_below_minimum(settings: Settings) -> None:
     tool = build_default_registry(settings).get("set_campaign_budget")
-    with pytest.raises(ValidationError):
-        tool.input_model.model_validate({"campaign_id": 1, "budget_rub": 299})
+    with pytest.raises(ValidationError, match="budget_rub"):
+        tool.input_model.model_validate(
+            {
+                "campaign_id": 1,
+                "budget_rub": 299,
+                "reason": "Lower budget after weak ROI analysis.",
+            }
+        )
 
 
 @pytest.mark.asyncio
@@ -547,13 +754,21 @@ async def test_set_campaign_budget_passes_through(
 
     captured: list[tuple[int, int]] = []
 
-    async def fake_set_budget(self: CampaignService, campaign_id: int, budget_rub: int) -> None:
+    async def fake_set_budget(
+        self: CampaignService, campaign_id: int, budget_rub: int, **_: Any
+    ) -> None:
         captured.append((campaign_id, budget_rub))
 
     monkeypatch.setattr(CampaignService, "set_daily_budget", fake_set_budget)
 
     tool = build_default_registry(settings).get("set_campaign_budget")
-    inp = tool.input_model.model_validate({"campaign_id": 42, "budget_rub": 500})
+    inp = tool.input_model.model_validate(
+        {
+            "campaign_id": 42,
+            "budget_rub": 500,
+            "reason": "Increase budget after CPA stayed below target for 5 days.",
+        }
+    )
     result = await tool.handler(inp, tool_context)
 
     # Status field added in M2.2 part 3b1: handlers now distinguish
@@ -576,7 +791,9 @@ async def test_set_campaign_budget_returns_pending_on_plan_required(
     from yadirect_agent.agent.executor import PlanRequired
     from yadirect_agent.services.campaigns import CampaignService
 
-    async def fake_set_budget(self: CampaignService, campaign_id: int, budget_rub: int) -> None:
+    async def fake_set_budget(
+        self: CampaignService, campaign_id: int, budget_rub: int, **_: Any
+    ) -> None:
         raise PlanRequired(
             plan_id="abc123",
             preview="set daily budget on campaign 42 to 800 RUB",
@@ -586,7 +803,13 @@ async def test_set_campaign_budget_returns_pending_on_plan_required(
     monkeypatch.setattr(CampaignService, "set_daily_budget", fake_set_budget)
 
     tool = build_default_registry(settings).get("set_campaign_budget")
-    inp = tool.input_model.model_validate({"campaign_id": 42, "budget_rub": 800})
+    inp = tool.input_model.model_validate(
+        {
+            "campaign_id": 42,
+            "budget_rub": 800,
+            "reason": "Plan to scale spend after positive shadow-week signal.",
+        }
+    )
     result = await tool.handler(inp, tool_context)
 
     assert result["status"] == "pending"
@@ -608,7 +831,9 @@ async def test_set_campaign_budget_returns_rejected_on_plan_rejected(
     from yadirect_agent.agent.safety import CheckResult
     from yadirect_agent.services.campaigns import CampaignService
 
-    async def fake_set_budget(self: CampaignService, campaign_id: int, budget_rub: int) -> None:
+    async def fake_set_budget(
+        self: CampaignService, campaign_id: int, budget_rub: int, **_: Any
+    ) -> None:
         raise PlanRejected(
             reason="exceeds account cap",
             blocking=[CheckResult(status="blocked", reason="budget_cap: account total > 100000")],
@@ -617,7 +842,13 @@ async def test_set_campaign_budget_returns_rejected_on_plan_rejected(
     monkeypatch.setattr(CampaignService, "set_daily_budget", fake_set_budget)
 
     tool = build_default_registry(settings).get("set_campaign_budget")
-    inp = tool.input_model.model_validate({"campaign_id": 42, "budget_rub": 800})
+    inp = tool.input_model.model_validate(
+        {
+            "campaign_id": 42,
+            "budget_rub": 800,
+            "reason": "Increase budget under positive ROAS trend.",
+        }
+    )
     result = await tool.handler(inp, tool_context)
 
     assert result["status"] == "rejected"
@@ -643,7 +874,9 @@ async def test_set_campaign_budget_redacts_private_keys_from_blocking(
     from yadirect_agent.agent.safety import CheckResult
     from yadirect_agent.services.campaigns import CampaignService
 
-    async def fake_set_budget(self: CampaignService, campaign_id: int, budget_rub: int) -> None:
+    async def fake_set_budget(
+        self: CampaignService, campaign_id: int, budget_rub: int, **_: Any
+    ) -> None:
         raise PlanRejected(
             reason="query drift exceeds threshold",
             blocking=[
@@ -665,7 +898,13 @@ async def test_set_campaign_budget_redacts_private_keys_from_blocking(
     monkeypatch.setattr(CampaignService, "set_daily_budget", fake_set_budget)
 
     tool = build_default_registry(settings).get("set_campaign_budget")
-    inp = tool.input_model.model_validate({"campaign_id": 42, "budget_rub": 800})
+    inp = tool.input_model.model_validate(
+        {
+            "campaign_id": 42,
+            "budget_rub": 800,
+            "reason": "Increase budget on growing query mix.",
+        }
+    )
     result = await tool.handler(inp, tool_context)
 
     blocking_details = result["blocking"][0]["details"]
@@ -703,7 +942,7 @@ async def test_resume_campaigns_redacts_ks3_missing_phrases_from_blocking(
     from yadirect_agent.agent.safety import CheckResult
     from yadirect_agent.services.campaigns import CampaignService
 
-    async def fake_resume(self: CampaignService, campaign_ids: list[int]) -> None:
+    async def fake_resume(self: CampaignService, campaign_ids: list[int], **_: Any) -> None:
         raise PlanRejected(
             reason="negative_keyword_floor failed",
             blocking=[
@@ -721,7 +960,9 @@ async def test_resume_campaigns_redacts_ks3_missing_phrases_from_blocking(
     monkeypatch.setattr(CampaignService, "resume", fake_resume)
 
     tool = build_default_registry(settings).get("resume_campaigns")
-    inp = tool.input_model.model_validate({"ids": [42]})
+    inp = tool.input_model.model_validate(
+        {"ids": [42], "reason": "Resuming after creative refresh and budget bump."}
+    )
     result = await tool.handler(inp, tool_context)
 
     blocking_details = result["blocking"][0]["details"]
@@ -780,14 +1021,17 @@ async def test_set_keyword_bids_converts_and_forwards(
 
     captured: list[list[BidUpdate]] = []
 
-    async def fake_apply(self: BiddingService, updates: list[BidUpdate]) -> None:
+    async def fake_apply(self: BiddingService, updates: list[BidUpdate], **_: Any) -> None:
         captured.append(list(updates))
 
     monkeypatch.setattr(BiddingService, "apply", fake_apply)
 
     tool = build_default_registry(settings).get("set_keyword_bids")
     inp = tool.input_model.model_validate(
-        {"updates": [{"keyword_id": 1, "new_search_bid_rub": 10.0}]}
+        {
+            "updates": [{"keyword_id": 1, "new_search_bid_rub": 10.0}],
+            "reason": "Raise bid on top-converting keyword.",
+        }
     )
     result = await tool.handler(inp, tool_context)
 

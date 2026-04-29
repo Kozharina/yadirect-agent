@@ -41,6 +41,26 @@ from yadirect_agent.agent.safety import (
     CampaignBudget,
     CheckResult,
 )
+from yadirect_agent.models.rationale import Rationale
+
+
+def _test_rationale(action: str = "set_campaign_budget") -> Rationale:
+    """Minimal valid Rationale for tests that don't care about content.
+
+    M20 slice 2 made ``rationale=`` hard-required on every
+    @requires_plan call site. Tests focused on the decorator /
+    executor mechanics — not on rationale shape — pass this stub.
+    Tests that DO exercise rationale shape live in
+    ``test_executor_rationale.py`` and build their own.
+    """
+    return Rationale(
+        decision_id="test-placeholder",
+        action=action,
+        resource_type="campaign",
+        resource_ids=[1],
+        summary="test rationale — exercising decorator mechanics, not content.",
+    )
+
 
 # --------------------------------------------------------------------------
 # Stubs.
@@ -153,7 +173,7 @@ class TestRequiresPlanAllow:
         pipe = _StubPipeline()  # default: allow
         svc = _FakeService(pipe, store)
 
-        result = await svc.set_daily_budget(1, 200)
+        result = await svc.set_daily_budget(1, 200, rationale=_test_rationale())
 
         assert result == "ok"
         assert svc.calls == [{"campaign_id": 1, "new_budget_rub": 200}]
@@ -168,7 +188,7 @@ class TestRequiresPlanAllow:
         # records against the originally-approved ceiling.
         pipe = _StubPipeline()
         svc = _FakeService(pipe, store)
-        await svc.set_daily_budget(1, 200)
+        await svc.set_daily_budget(1, 200, rationale=_test_rationale())
         review_ctx = pipe.review_calls[0][1]
         applied_ctx = pipe.on_applied_calls[0]
         assert applied_ctx is review_ctx
@@ -184,7 +204,7 @@ class TestRequiresPlanConfirm:
         svc = _FakeService(pipe, store)
 
         with pytest.raises(PlanRequired) as exc:
-            await svc.set_daily_budget(1, 200)
+            await svc.set_daily_budget(1, 200, rationale=_test_rationale())
 
         # Exception carries enough metadata for the CLI to tell the
         # operator what to do next.
@@ -215,7 +235,7 @@ class TestRequiresPlanReject:
         svc = _FakeService(pipe, store)
 
         with pytest.raises(PlanRejected) as exc:
-            await svc.set_daily_budget(1, 200)
+            await svc.set_daily_budget(1, 200, rationale=_test_rationale())
 
         assert "cap" in exc.value.reason
         # blocking is the raw CheckResult list — surfaces reason + details
@@ -276,7 +296,7 @@ async def _seed_pending_plan(store: PendingPlansStore, pipe: _StubPipeline) -> s
     pipe.next_decision = SafetyDecision(status="confirm", reason="needs confirm")
     svc = _FakeService(pipe, store)
     try:
-        await svc.set_daily_budget(1, 200)
+        await svc.set_daily_budget(1, 200, rationale=_test_rationale())
     except PlanRequired as exc:
         pipe.review_calls.clear()
         pipe.on_applied_calls.clear()

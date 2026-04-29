@@ -193,42 +193,27 @@ def _resolve_rationale_store(self: object) -> RationaleStore | None:
 def _emit_rationale(
     self: object,
     plan: OperationPlan,
-    rationale: Rationale | None,
+    rationale: Rationale,
 ) -> None:
-    """Persist ``rationale`` under ``plan.plan_id`` if both sides cooperate.
+    """Persist ``rationale`` under ``plan.plan_id``.
 
-    Soft-optional contract during the M20 rollout:
+    M20 slice 2 contract — the wrapper has already enforced that
+    ``rationale`` is non-None before reaching this helper, so the
+    ``rationale-missing`` branches the M20.1 soft-optional version
+    carried are gone. The remaining asymmetry is the
+    ``rationale_store``: legacy services that don't implement
+    ``_resolve_rationale_store`` still have a graceful path
+    (warn + continue) so a deployment without a wired-up store does
+    not block mutations on cosmetics.
 
-    - rationale present + store present: persist with decision_id
-      overwritten to plan.plan_id (caller-provided ids cannot diverge).
-    - rationale present + no store: warn, continue (legacy services
-      that don't implement ``_resolve_rationale_store`` keep working).
-    - rationale absent + store present: warn, continue (caller didn't
-      explain themselves yet; hard requirement is a follow-up).
-    - rationale absent + no store: silent (rationale not configured
-      end-to-end on this surface).
+    decision_id alignment: the caller-provided id is overwritten
+    with ``plan.plan_id``. Without this, a buggy or malicious
+    caller could persist multiple rationales under the same string
+    id, or worse, overwrite an existing decision's record. Forcing
+    the alignment here means the rationale store is always
+    indexable by the same identifier as the plan.
     """
     rationale_store = _resolve_rationale_store(self)
-
-    if rationale is None and rationale_store is None:
-        return
-
-    if rationale is None:
-        # Tag the warning so a future log aggregator can alert on
-        # systematic suppression (auditor M20 LOW-6). The
-        # ``will_be_hard_required_in`` field signals that this
-        # warning becomes an error in M20 slice 2.
-        _log.warning(
-            "rationale.missing",
-            plan_id=plan.plan_id,
-            action=plan.action,
-            resource_type=plan.resource_type,
-            resource_ids=plan.resource_ids,
-            severity="warn",
-            will_be_hard_required_in="M20-slice2",
-        )
-        return
-
     if rationale_store is None:
         _log.warning(
             "rationale.store_missing",
@@ -238,11 +223,6 @@ def _emit_rationale(
         )
         return
 
-    # Overwrite caller-provided decision_id with plan_id. Without this,
-    # a buggy or malicious caller could persist multiple rationales
-    # under the same string id, or worse, overwrite an existing
-    # decision's record. Forcing the alignment here means the rationale
-    # store is always indexable by the same identifier as the plan.
     aligned = rationale.model_copy(update={"decision_id": plan.plan_id})
     rationale_store.append(aligned)
 
@@ -308,6 +288,24 @@ def requires_plan(
             # kwarg here. The CLI's apply-plan path doesn't pass one.
             if _applying_plan_id is not None:
                 return await fn(self, *args, **kwargs)
+
+            # M20 slice 2: rationale is hard-required on the
+            # main (non-bypass) path. A caller that omits it now
+            # gets a clear TypeError up front rather than a
+            # structlog warning that vanishes into log volume.
+            # The raise fires BEFORE pipeline.review so an
+            # operator inspecting half-formed plans cannot confuse
+            # a rationale-gate failure with a safety-pipeline
+            # rejection.
+            if rationale is None:
+                msg = (
+                    f"@requires_plan({action!r}) requires rationale=...; got None. "
+                    "M20 slice 2 made the kwarg hard-required so shadow-week "
+                    "calibration always has a record of every decision. "
+                    "Construct a Rationale at the call site (or use the "
+                    "_build_handler_rationale helper in agent/tools.py)."
+                )
+                raise TypeError(msg)
 
             pipeline, store = self._resolve_safety()
             context = await context_builder(self, *args, **kwargs)
