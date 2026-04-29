@@ -1182,7 +1182,11 @@ _PLAIN_FACTORIES: list[_PlainFactory] = [
 
 
 def build_default_registry(settings: Settings) -> ToolRegistry:
-    """Registry with the seven M1 tools bound to a Settings instance.
+    """Registry with the standard tool set bound to a Settings instance.
+
+    The set grows over time as new milestones add tools; the
+    enumeration lives in ``_GATED_FACTORIES`` and ``_PLAIN_FACTORIES``
+    above so this docstring doesn't go stale every release.
 
     Builds a single ``SafetyPipeline`` + ``PendingPlansStore`` pair
     shared by every CampaignService-backed handler so the pipeline's
