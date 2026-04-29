@@ -52,14 +52,7 @@ demo-only, technically; it cannot be handed to a non-developer.
 - [x] ~~**M20 — Human-readable rationale (slice 1)**~~ — shipped,
       see Done. Model + store + soft-optional emission +
       ``yadirect-agent rationale show/list`` CLI.
-- [ ] **M20 — Hard-required emission** (slice 2): flip the
-      ``@requires_plan`` rationale kwarg from soft-optional to
-      hard-required (caller MUST pass ``rationale=``, otherwise the
-      decorator raises). Land after every existing
-      ``@requires_plan`` caller (CampaignService.set_daily_budget,
-      pause/resume, BiddingService.apply) is updated to pass a
-      meaningful Rationale. Without this, shadow-week calibration
-      remains optional rather than guaranteed.
+- [x] ~~**M20 — Hard-required emission** (slice 2)~~ — shipped, see Done.
 - [ ] **M20 — `explain_decision` MCP tool** (slice 3): mirror of
       ``rationale show`` exposed over MCP so a Claude Desktop / Code
       session can ask "why did you do X?" and get the recorded
@@ -837,6 +830,78 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M20 — Hard-required rationale emission (slice 2)**
+      (§M20.2, Phase 0+1, release 0.2.0). Flips the @requires_plan
+      ``rationale=`` kwarg from soft-optional to hard-required.
+      The decorator now raises ``TypeError`` (with a message that
+      names the missing kwarg + a hint at the helper) when a
+      non-bypass call site forgets it; the M20.1 ``rationale.missing``
+      structlog warning is gone.
+
+      Five layers:
+
+      1. ``agent/tools.py`` — three mutating tool input models gain
+         a required ``reason: str`` field (``min_length=10,
+         max_length=500``). The Anthropic tool-use schema renders
+         ``description`` directly into the LLM prompt, so a shared
+         ``_REASON_FIELD_DESCRIPTION`` constant carries grounded
+         examples ("CTR < 0.5% over last 7 days, no conversions.")
+         to nudge the LLM toward useful summaries rather than
+         padded minimums. ``_IdListInput`` covers pause + resume;
+         ``_SetCampaignBudgetInput`` and ``_SetKeywordBidsInput``
+         each get their own. Read-only tools (``list_campaigns``,
+         ``get_keywords``, ``validate_phrases``) explicitly do NOT
+         take ``reason`` — the asymmetry is pinned by tests.
+      2. Each of the four mutating tool handlers builds a
+         ``Rationale`` from ``inp.reason`` via a single
+         ``_build_handler_rationale`` helper and passes it via
+         ``rationale=`` to the underlying service method. The
+         decorator's M20.1 ``decision_id`` overwrite continues to
+         enforce that the persisted record's id matches
+         ``plan.plan_id`` regardless of caller.
+      3. ``agent/executor.py`` raises ``TypeError`` when ``rationale
+         is None`` on the non-bypass path. The raise fires AFTER
+         the apply-plan bypass check (so re-entry on
+         ``_applying_plan_id`` keeps working) and BEFORE
+         ``pipeline.review`` runs (so an operator inspecting
+         half-formed plans cannot confuse a rationale-gate failure
+         with a safety-pipeline rejection). ``_emit_rationale``
+         simplifies — the M20.1 ``rationale-missing`` branches
+         collapse; the ``rationale_store is None`` branch stays
+         as the M20.1-grandfathered "warn, continue" path for
+         legacy services that don't implement
+         ``_resolve_rationale_store``.
+      4. ``agent/prompts.py`` — one bullet under "Transparency"
+         telling the LLM the four mutating tools require ``reason``
+         and how to phrase it. Belt + braces with the per-input
+         description; system-prompt cost is small (~5 lines, on
+         every agent turn).
+      5. Test refactors across ``test_executor.py``,
+         ``test_campaigns.py``, ``test_bidding.py`` (helper
+         ``_test_rationale()`` per file) plus eval mocks updated
+         to include ``reason`` in the FakeAnthropic ``tool_use``
+         payloads. ``test_executor_rationale.py`` swaps
+         ``TestRationaleSoftOptional`` for ``TestRationaleHardRequired``
+         pinning the new contract: TypeError fires before
+         pipeline.review, the apply-plan bypass keeps working
+         without ``rationale=``, and the store-missing
+         legacy-service path stays soft.
+
+      The change closes the M20.1 promise: shadow-week calibration
+      now sees a recorded rationale for EVERY decision; "the agent
+      doesn't fabricate on demand" (§M20.3) is physically realisable
+      because the LLM is forced to commit a reason at decision
+      time, before the safety pipeline even runs.
+
+      917 tests green (12 new — 4 require-reason × 4 tools
+      parametrised, 4 reject-short-reason × 4, 3 read-only
+      asymmetry, 4 handler-passes-rationale, 3 hard-required
+      contract). mypy strict; ruff clean.
+
+      Out of scope (deferred to slices 3-4): MCP
+      ``explain_decision`` tool, auto-populated ``policy_slack``
+      from ``CheckResult.details``.
 
 - [x] **M15.3 — Standard OAuth flow with keyring** (§M15.3, Phase 0+1,
       release 0.2.0). Public-client PKCE flow ships end-to-end —
