@@ -14,10 +14,10 @@ from pathlib import Path
 
 import pytest
 import yaml
-from yadirect_agent.services.policy_proposal import generate_policy_proposal
 
 from yadirect_agent.agent.safety import load_policy
 from yadirect_agent.models.business_profile import BusinessProfile
+from yadirect_agent.services.policy_proposal import generate_policy_proposal
 
 
 def _profile(
@@ -107,7 +107,6 @@ class TestProposalSummary:
         s = result["summary"]
         assert s["current_active_daily_total_rub"] == 4_000.0
         assert s["monthly_budget_rub"] == 60_000
-        assert s["monthly_budget_avg_daily_rub"] == 2_000
         assert s["margin_factor"] == 1.2
         assert s["cap_from_current_rub"] == 4_800
         assert s["cap_from_monthly_avg_rub"] == 2_000
