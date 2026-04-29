@@ -1248,6 +1248,242 @@ class TestStartOnboardingTool:
         store_path = settings.audit_log_path.parent / "business_profile.json"
         assert not store_path.exists()
 
+    # ----------------------------------------------------------------
+    # M15.4 slice 4: ``onboarding_completed`` audit event on fresh
+    # save. Re-run probe and incomplete profile do NOT emit (no state
+    # change). Replaces the originally-planned baseline-snapshot file
+    # — see backlog for the trade-off.
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    def _read_audit_events(settings: Settings) -> list[dict[str, Any]]:
+        """Read every JSON line from the audit log."""
+        if not settings.audit_log_path.exists():
+            return []
+        import json as json_mod
+
+        return [
+            json_mod.loads(line)
+            for line in settings.audit_log_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_handler_emits_onboarding_completed_event_on_fresh_save(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        memory_keyring: dict[tuple[str, str], str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Slice 4: a fresh-save path emits exactly one structured
+        # ``onboarding_completed`` event into the audit log so an
+        # operator-side investigation can answer "when did Anna
+        # complete setup, and what was the account state?".
+        from datetime import UTC, datetime, timedelta
+
+        from yadirect_agent.services.campaigns import (
+            CampaignService,
+            CampaignSummary,
+        )
+
+        now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
+        self._save_token(obtained_at=now, expires_at=now + timedelta(days=365))
+
+        async def fake_list_active(
+            self: CampaignService, limit: int = 200
+        ) -> list[CampaignSummary]:
+            del self, limit
+            return [
+                CampaignSummary(
+                    id=1,
+                    name="c1",
+                    state="ON",
+                    status="ACCEPTED",
+                    type="TEXT_CAMPAIGN",
+                    daily_budget_rub=4_000.0,
+                ),
+            ]
+
+        monkeypatch.setattr(CampaignService, "list_active", fake_list_active)
+
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate(
+            {
+                "answers": {
+                    "niche": "Online courses on woodworking",
+                    "monthly_budget_rub": 60_000,
+                    "target_cpa_rub": 1_500,
+                },
+            },
+        )
+        result = await tool.handler(inp, tool_context)
+        assert result["status"] == "policy_proposed"
+
+        events = self._read_audit_events(settings)
+        completion_events = [e for e in events if e.get("action") == "onboarding_completed"]
+        assert len(completion_events) == 1, events
+        ev = completion_events[0]
+
+        # Pin envelope.
+        assert ev["actor"] == "agent"
+        assert ev["resource"] == "onboarding:business_profile"
+        # ``ts`` must be ISO-8601 with timezone — the audit shape
+        # requires aware datetimes; a regression that wrote naive
+        # ``datetime.now()`` would surface as a missing offset here.
+        assert "+" in ev["ts"] or ev["ts"].endswith("Z")
+
+        # Pin payload shape (in ``result``).
+        payload = ev["result"]
+        assert payload["profile_summary"] == {
+            "niche": "Online courses on woodworking",
+            "monthly_budget_rub": 60_000,
+            "target_cpa_rub_set": True,
+        }
+        assert payload["account_summary"] == {
+            "on_campaigns_count": 1,
+            "active_daily_total_rub": 4_000.0,
+        }
+        # 1.2 * 4000 = 4800; monthly/30 = 2000; max = 4800.
+        assert payload["proposal_summary"] == {
+            "chosen_account_daily_budget_cap_rub": 4_800,
+        }
+
+    @pytest.mark.asyncio
+    async def test_handler_does_not_emit_event_on_re_run_probe(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        memory_keyring: dict[tuple[str, str], str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Re-run probe (``answers=None`` + saved profile) does NOT
+        # emit a fresh ``onboarding_completed`` event. Otherwise
+        # every "помоги настроить" chat would litter the audit log
+        # with duplicates.
+        from datetime import UTC, datetime, timedelta
+
+        from yadirect_agent.models.business_profile import BusinessProfile
+        from yadirect_agent.services.business_profile_store import (
+            BusinessProfileStore,
+        )
+        from yadirect_agent.services.campaigns import (
+            CampaignService,
+            CampaignSummary,
+        )
+
+        now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
+        self._save_token(obtained_at=now, expires_at=now + timedelta(days=365))
+
+        # Seed a profile (slice 2 store path).
+        BusinessProfileStore(
+            settings.audit_log_path.parent / "business_profile.json",
+        ).save(
+            BusinessProfile(niche="ok", monthly_budget_rub=50_000),
+        )
+
+        async def fake_list_active(
+            self: CampaignService, limit: int = 200
+        ) -> list[CampaignSummary]:
+            del self, limit
+            return []
+
+        monkeypatch.setattr(CampaignService, "list_active", fake_list_active)
+
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate({})
+        result = await tool.handler(inp, tool_context)
+        assert result["status"] == "policy_proposed"  # re-run path
+
+        events = self._read_audit_events(settings)
+        completion_events = [e for e in events if e.get("action") == "onboarding_completed"]
+        assert completion_events == []
+
+    @pytest.mark.asyncio
+    async def test_handler_does_not_emit_event_on_incomplete_profile(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # Incomplete answers → no save, no event. The completion
+        # signal is "we have a usable profile to plan against",
+        # which a partial submit doesn't satisfy.
+        from datetime import UTC, datetime, timedelta
+
+        now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
+        self._save_token(obtained_at=now, expires_at=now + timedelta(days=365))
+
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate({"answers": {"niche": "ok"}})
+        result = await tool.handler(inp, tool_context)
+        assert result["status"] == "incomplete_profile"
+
+        events = self._read_audit_events(settings)
+        completion_events = [e for e in events if e.get("action") == "onboarding_completed"]
+        assert completion_events == []
+
+    @pytest.mark.asyncio
+    async def test_handler_emits_event_on_profile_overwrite(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        memory_keyring: dict[tuple[str, str], str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Updating an existing profile (full re-submit with
+        # corrections) IS a state change — it emits a fresh event,
+        # so an operator can trace "when did Anna change her
+        # monthly budget from 30k to 80k?". Two events end up in
+        # the log over the course of two onboarding cycles.
+        from datetime import UTC, datetime, timedelta
+
+        from yadirect_agent.models.business_profile import BusinessProfile
+        from yadirect_agent.services.business_profile_store import (
+            BusinessProfileStore,
+        )
+        from yadirect_agent.services.campaigns import (
+            CampaignService,
+            CampaignSummary,
+        )
+
+        now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
+        self._save_token(obtained_at=now, expires_at=now + timedelta(days=365))
+
+        BusinessProfileStore(
+            settings.audit_log_path.parent / "business_profile.json",
+        ).save(
+            BusinessProfile(niche="old", monthly_budget_rub=30_000),
+        )
+
+        async def fake_list_active(
+            self: CampaignService, limit: int = 200
+        ) -> list[CampaignSummary]:
+            del self, limit
+            return []
+
+        monkeypatch.setattr(CampaignService, "list_active", fake_list_active)
+
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate(
+            {
+                "answers": {
+                    "niche": "new",
+                    "monthly_budget_rub": 80_000,
+                },
+            },
+        )
+        result = await tool.handler(inp, tool_context)
+        assert result["status"] == "policy_proposed"
+
+        events = self._read_audit_events(settings)
+        completion_events = [e for e in events if e.get("action") == "onboarding_completed"]
+        assert len(completion_events) == 1
+        # Pin: the event reflects the NEW profile (80k), not the
+        # old (30k). A regression that snapshotted before-save
+        # would put the wrong number into the audit trail.
+        assert completion_events[0]["result"]["profile_summary"]["monthly_budget_rub"] == 80_000
+
 
 # --------------------------------------------------------------------------
 # M2.4 — Daily-budget hard guard (env backstop).
