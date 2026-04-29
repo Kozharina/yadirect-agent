@@ -46,11 +46,7 @@ demo-only, technically; it cannot be handed to a non-developer.
         — shipped, see Done.
   - [x] ~~**slice 2 — BusinessProfile collection**~~ — shipped,
         see Done.
-  - [ ] **slice 3 — policy proposal**: read current account
-        state (campaigns / daily-budget sum), propose
-        ``agent_policy.yml`` (e.g. budget cap = 1.2× of current
-        sum), return the YAML as a string for the operator to
-        review + drop into ``settings.agent_policy_path``.
+  - [x] ~~**slice 3 — policy proposal**~~ — shipped, see Done.
   - [ ] **slice 4 — onboarding baseline snapshot**: minimal
         single-shot snapshot of campaign budgets + statuses +
         strategies. **Precedes M19.1**: M19.1 is per-run
@@ -179,49 +175,7 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-- [ ] **M15.4 slice 3 — policy proposal** (§M15.4, Phase 0+1,
-      release 0.2.0). Replaces slice 2's
-      ``ready_for_policy_proposal`` placeholder + the
-      ``profile_exists`` branch with a concrete
-      ``policy_proposed`` payload: a generated
-      ``agent_policy.yml`` text + numeric summary.
-
-      Three pieces:
-
-      1. ``services/policy_proposal.py`` —
-         ``generate_policy_proposal(*, profile,
-         current_active_daily_total_rub) -> dict`` pure
-         function. Computes ``account_daily_budget_cap_rub =
-         ceil_to_100(max(1.2 × current_active_daily_total,
-         monthly_budget_rub / 30))``: 1.2× factor matches the
-         spec phrase "budget cap = 1.2× от текущего суммарного";
-         the monthly/30 fallback covers fresh / sandbox accounts
-         where current=0 (the spec formula alone would yield 0,
-         leaving the agent unable to do anything). Round up to
-         the nearest 100 for operator-readable numbers.
-         Returns ``{"policy_yaml": str, "summary": dict}``
-         where ``summary`` carries the inputs and the chosen
-         formula so the LLM can explain the number without
-         re-deriving it.
-      2. ``start_onboarding`` handler swap:
-         - Slice 2's ``ready_for_policy_proposal`` happy path
-           → ``policy_proposed`` with ``proposal: {policy_yaml,
-           summary}`` appended.
-         - Slice 2's ``profile_exists`` branch → also
-           ``policy_proposed`` (re-run path: profile exists,
-           propose against current state). Status name
-           ``profile_exists`` retired.
-         - All branches that need account state read it via
-           ``CampaignService.list_active`` and sum
-           ``daily_budget_rub`` over ON campaigns. Sandbox /
-           empty account → 0 → fallback to monthly/30 kicks in.
-      3. **Deliberately NOT done in slice 3**: writing the
-         YAML to ``settings.agent_policy_path`` from the tool.
-         That's a mutation of the operator's environment
-         (CLAUDE.md non-negotiable #3); the operator copies
-         the YAML themselves after reviewing. Slice 5 may add
-         a ``confirm_proposal`` flag if oprator-feedback says
-         the copy step is friction.
+*(empty — nothing checked out right now)*
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
@@ -900,6 +854,75 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M15.4 slice 3 — policy proposal** (§M15.4, Phase 0+1,
+      release 0.2.0). Replaces slice 2's
+      ``ready_for_policy_proposal`` placeholder + the
+      ``profile_exists`` re-run branch with a single concrete
+      ``policy_proposed`` payload — operator gets profile +
+      fresh proposal in one response regardless of how they
+      got here.
+
+      Two pieces:
+
+      1. ``services/policy_proposal.py`` —
+         ``generate_policy_proposal(*, profile,
+         current_active_daily_total_rub) -> {policy_yaml,
+         summary}``. Pure function, no I/O. Cap formula:
+         ``ceil_to_100(max(1.2 * current, monthly / 30))``.
+         The 1.2 factor matches the spec phrase "budget cap =
+         1.2x current daily sum"; the monthly/30 fallback
+         covers sandbox / fresh accounts where current=0 (spec
+         formula alone yields 0, leaving the agent unable to
+         do anything). The summary carries both candidate
+         numbers + the chosen one so the LLM can explain the
+         cap to the operator without re-deriving it. Pinned by
+         tests round-tripping through the LIVE
+         ``agent.safety.load_policy`` so a YAML the operator
+         pastes into ``agent_policy.yml`` MUST parse cleanly
+         through the runtime loader. Provenance header
+         comment + ``rollout_stage: shadow`` seeded by default
+         (defence-in-depth: even if the operator skips reading
+         the YAML, they land in read-only mode).
+      2. ``start_onboarding`` handler:
+         - New helper ``_build_policy_proposed_response``
+           reads account state via ``CampaignService.list_active``
+           (read-only path, no SafetyPipeline / store needed —
+           slice 1's plain factory carries forward), sums
+           ``daily_budget_rub`` over campaigns in state ``ON``
+           ONLY (SUSPENDED would inflate; None contributes 0),
+           calls ``generate_policy_proposal``, and returns the
+           same payload from both call sites.
+         - Slice 2's ``ready_for_policy_proposal`` happy path
+           → ``policy_proposed`` with proposal payload.
+         - Slice 2's ``profile_exists`` re-run branch → also
+           ``policy_proposed``. ``profile_exists`` retired —
+           re-run = "I already onboarded, help me set up";
+           the LLM gets full state + proposal in one response
+           rather than ping-ponging tool calls.
+
+      Tool description rewritten to enumerate the new
+      contract: ``proposal.policy_yaml`` is the YAML the
+      operator copy-pastes into AGENT_POLICY_PATH after review
+      (deliberately NOT written to disk per CLAUDE.md
+      non-negotiable #3 — that's a mutation of the operator's
+      environment). ``proposal.summary`` carries inputs +
+      chosen cap + formula so the LLM explains the number in
+      chat without re-deriving it.
+
+      1011 tests green (+18 new — 11 ``policy_proposal`` helper
+      cases covering formula, summary, YAML round-trip,
+      provenance header, rollout_stage seed, negative-input
+      rejection; 4 handler updates from slice 2 contract; 1
+      regression-pin that proposal counts ON-only campaigns
+      with non-None ``daily_budget_rub``); mypy strict; ruff
+      clean.
+
+      Out of scope (deferred): writing the YAML to
+      ``settings.agent_policy_path`` from the tool. May land
+      as a ``confirm_proposal`` flag in slice 5 if operator
+      feedback says the copy step is friction; deliberately
+      not designed-for now.
 
 - [x] **M15.4 slice 2 — BusinessProfile collection** (§M15.4,
       Phase 0+1, release 0.2.0). Extends slice 1's read-only
