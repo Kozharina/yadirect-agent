@@ -1484,6 +1484,225 @@ class TestStartOnboardingTool:
         # would put the wrong number into the audit trail.
         assert completion_events[0]["result"]["profile_summary"]["monthly_budget_rub"] == 80_000
 
+    # ----------------------------------------------------------------
+    # M15.4 slice 5: first ``account_health`` rollup folded into the
+    # ``policy_proposed`` response. Mirrors the existing
+    # ``account_health`` MCP tool envelope so the LLM sees one shape
+    # across two surfaces. ``ConfigError`` (Metrika counter unset)
+    # degrades visibly without failing the rest of onboarding.
+    # ----------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_handler_response_includes_health_rollup_on_fresh_save(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        memory_keyring: dict[tuple[str, str], str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Pin the slice 5 contract: the fresh-save response carries
+        # an ``health`` field with the same envelope the existing
+        # ``account_health`` MCP tool returns. Operator gets profile +
+        # proposal + first health findings in ONE response.
+        from datetime import UTC, datetime, timedelta
+
+        from yadirect_agent.models.health import (
+            Finding,
+            HealthReport,
+            Severity,
+        )
+        from yadirect_agent.models.metrika import DateRange
+        from yadirect_agent.services.campaigns import (
+            CampaignService,
+            CampaignSummary,
+        )
+        from yadirect_agent.services.health_check import HealthCheckService
+
+        now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
+        self._save_token(obtained_at=now, expires_at=now + timedelta(days=365))
+
+        async def fake_list_active(
+            self: CampaignService, limit: int = 200
+        ) -> list[CampaignSummary]:
+            del self, limit
+            return []
+
+        async def fake_check(
+            self: HealthCheckService,
+            *,
+            date_range: DateRange,
+            goal_id: int | None = None,
+        ) -> HealthReport:
+            del self, goal_id
+            return HealthReport(
+                date_range=date_range,
+                findings=[
+                    Finding(
+                        rule_id="burning_campaign",
+                        severity=Severity.HIGH,
+                        campaign_id=42,
+                        campaign_name="autumn collection",
+                        message="cost 1500 RUB, 0 conversions over 7 days",
+                        estimated_impact_rub=1500.0,
+                    ),
+                ],
+            )
+
+        monkeypatch.setattr(CampaignService, "list_active", fake_list_active)
+        monkeypatch.setattr(HealthCheckService, "run_account_check", fake_check)
+
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate(
+            {
+                "answers": {
+                    "niche": "ok",
+                    "monthly_budget_rub": 50_000,
+                },
+            },
+        )
+        result = await tool.handler(inp, tool_context)
+
+        assert result["status"] == "policy_proposed"
+        assert result["health"]["status"] == "ok"
+        # Pin: report follows the same JSON-friendly shape the
+        # ``account_health`` MCP tool emits — one source of truth
+        # for the LLM to read.
+        report = result["health"]["report"]
+        assert "date_range" in report
+        assert len(report["findings"]) == 1
+        assert report["findings"][0]["rule_id"] == "burning_campaign"
+        assert report["findings"][0]["campaign_id"] == 42
+
+    @pytest.mark.asyncio
+    async def test_handler_response_health_unconfigured_when_metrika_counter_unset(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        memory_keyring: dict[tuple[str, str], str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Most common deployment-time failure: operator hasn't set
+        # ``YANDEX_METRIKA_COUNTER_ID`` yet. The health rollup
+        # surfaces as ``{status: "unconfigured", reason}`` so the
+        # LLM can tell the operator which env var to set; onboarding
+        # SUCCEEDS — profile / proposal / audit event still land.
+        from datetime import UTC, datetime, timedelta
+
+        from yadirect_agent.exceptions import ConfigError
+        from yadirect_agent.models.metrika import DateRange
+        from yadirect_agent.services.campaigns import (
+            CampaignService,
+            CampaignSummary,
+        )
+        from yadirect_agent.services.health_check import HealthCheckService
+
+        now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
+        self._save_token(obtained_at=now, expires_at=now + timedelta(days=365))
+
+        async def fake_list_active(
+            self: CampaignService, limit: int = 200
+        ) -> list[CampaignSummary]:
+            del self, limit
+            return []
+
+        async def fake_check(
+            self: HealthCheckService,
+            *,
+            date_range: DateRange,
+            goal_id: int | None = None,
+        ) -> object:
+            del self, date_range, goal_id
+            raise ConfigError(
+                "Metrika counter_id is not configured — set YANDEX_METRIKA_COUNTER_ID",
+            )
+
+        monkeypatch.setattr(CampaignService, "list_active", fake_list_active)
+        monkeypatch.setattr(HealthCheckService, "run_account_check", fake_check)
+
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate(
+            {
+                "answers": {
+                    "niche": "ok",
+                    "monthly_budget_rub": 30_000,
+                },
+            },
+        )
+        result = await tool.handler(inp, tool_context)
+
+        # Onboarding still succeeds — the proposal lands.
+        assert result["status"] == "policy_proposed"
+        assert "profile" in result
+        assert "proposal" in result
+        assert "account_summary" in result
+        # Health degraded visibly.
+        assert result["health"]["status"] == "unconfigured"
+        assert "YANDEX_METRIKA_COUNTER_ID" in result["health"]["reason"]
+
+    @pytest.mark.asyncio
+    async def test_handler_response_includes_health_rollup_on_re_run(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        memory_keyring: dict[tuple[str, str], str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The re-run path (``answers=None`` + saved profile) returns
+        # the same shape as fresh-save, including ``health``. An
+        # operator running ``start_onboarding`` weeks later sees
+        # CURRENT health — not stale findings frozen at original
+        # onboarding time.
+        from datetime import UTC, datetime, timedelta
+
+        from yadirect_agent.models.business_profile import BusinessProfile
+        from yadirect_agent.models.health import HealthReport
+        from yadirect_agent.models.metrika import DateRange
+        from yadirect_agent.services.business_profile_store import (
+            BusinessProfileStore,
+        )
+        from yadirect_agent.services.campaigns import (
+            CampaignService,
+            CampaignSummary,
+        )
+        from yadirect_agent.services.health_check import HealthCheckService
+
+        now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
+        self._save_token(obtained_at=now, expires_at=now + timedelta(days=365))
+
+        BusinessProfileStore(
+            settings.audit_log_path.parent / "business_profile.json",
+        ).save(
+            BusinessProfile(niche="ok", monthly_budget_rub=50_000),
+        )
+
+        async def fake_list_active(
+            self: CampaignService, limit: int = 200
+        ) -> list[CampaignSummary]:
+            del self, limit
+            return []
+
+        async def fake_check(
+            self: HealthCheckService,
+            *,
+            date_range: DateRange,
+            goal_id: int | None = None,
+        ) -> HealthReport:
+            del self, goal_id
+            return HealthReport(date_range=date_range, findings=[])
+
+        monkeypatch.setattr(CampaignService, "list_active", fake_list_active)
+        monkeypatch.setattr(HealthCheckService, "run_account_check", fake_check)
+
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate({})
+        result = await tool.handler(inp, tool_context)
+
+        assert result["status"] == "policy_proposed"
+        assert result["health"]["status"] == "ok"
+        # The "silence is success" case — empty findings is the
+        # honest report for a clean account.
+        assert result["health"]["report"]["findings"] == []
+
 
 # --------------------------------------------------------------------------
 # M2.4 — Daily-budget hard guard (env backstop).
