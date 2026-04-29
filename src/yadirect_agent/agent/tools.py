@@ -885,10 +885,37 @@ def _make_account_health_tool(settings: Settings) -> Tool:
     )
 
 
+async def _build_health_payload(settings: Settings) -> dict[str, Any]:
+    """First health-check rollup for the policy_proposed response (M15.4 slice 5).
+
+    Mirrors the existing ``account_health`` MCP tool envelope —
+    ``{status: "ok", report: {...}}`` or ``{status:
+    "unconfigured", reason: ...}`` — so the LLM sees one shape
+    across two surfaces and doesn't learn a second schema.
+
+    Default 7-day window, no goal_id (the BusinessProfile
+    doesn't carry a Metrika goal id; conversion-based rules
+    silently skip without it, leaving cost-only signals like
+    burning_campaign).
+
+    ``ConfigError`` (Metrika counter unset) is the most-common
+    deployment failure and surfaces as ``unconfigured`` so the
+    LLM can tell the operator which env var to set. Onboarding
+    succeeds visibly; the rest of the response (profile,
+    proposal, audit event) lands normally.
+    """
+    try:
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=default_window(days=7))
+    except ConfigError as exc:
+        return {"status": "unconfigured", "reason": str(exc)}
+    return {"status": "ok", "report": health_report_to_jsonable_dict(report)}
+
+
 async def _build_policy_proposed_response(
     *, settings: Settings, profile: BusinessProfile
 ) -> dict[str, Any]:
-    """Read account state, derive a policy proposal, build the response.
+    """Read account state, derive a policy proposal, roll up health, build the response.
 
     Shared between the slice 3 re-run path (``answers=None`` +
     saved profile) and the fresh-save path (valid full
@@ -909,6 +936,15 @@ async def _build_policy_proposed_response(
     triple here would carry the slice 1 design forward
     needlessly.
 
+    Slice 5 folds in a first ``account_health`` rollup under
+    the ``health`` field — same envelope as the existing
+    ``account_health`` MCP tool. Re-runs see CURRENT health,
+    not findings frozen at original onboarding time.
+    ``ConfigError`` (Metrika counter unset) surfaces as
+    ``health.unconfigured`` and does NOT take the rest of the
+    response down — onboarding succeeds even on a Metrika-less
+    install.
+
     The response carries ``account_summary`` (count + total) so
     the LLM can describe the current state in chat alongside
     the proposal, and so the slice 4 audit emitter on
@@ -923,6 +959,7 @@ async def _build_policy_proposed_response(
         profile=profile,
         current_active_daily_total_rub=float(on_total),
     )
+    health = await _build_health_payload(settings)
     return {
         "status": "policy_proposed",
         "profile": profile.model_dump(mode="json"),
@@ -931,6 +968,7 @@ async def _build_policy_proposed_response(
             "on_campaigns_count": len(on_campaigns),
             "active_daily_total_rub": float(on_total),
         },
+        "health": health,
     }
 
 
@@ -1157,15 +1195,21 @@ def _make_start_onboarding_tool(settings: Settings) -> Tool:
             "question.\n\n"
             "Once a profile exists (either freshly submitted or loaded from "
             "a previous onboarding), the tool returns {status: "
-            "'policy_proposed', profile, proposal: {policy_yaml, summary}}. "
-            "``proposal.policy_yaml`` is the YAML the operator copy-pastes "
-            "into AGENT_POLICY_PATH after review (the tool deliberately "
-            "does NOT write it to disk — that's the operator's call). "
-            "``proposal.summary`` carries the inputs (current active daily "
-            "total, monthly budget) and the chosen cap so you can explain "
-            "the number in chat without re-deriving it. The operator can "
-            "either accept and copy the YAML, or update the profile by "
-            "submitting fresh ``answers``."
+            "'policy_proposed', profile, proposal: {policy_yaml, summary}, "
+            "account_summary, health}. ``proposal.policy_yaml`` is the YAML "
+            "the operator copy-pastes into AGENT_POLICY_PATH after review "
+            "(the tool deliberately does NOT write it to disk — that's the "
+            "operator's call). ``proposal.summary`` carries the inputs "
+            "(current active daily total, monthly budget) and the chosen "
+            "cap so you can explain the number in chat without re-deriving "
+            "it. ``account_summary`` (on_campaigns_count, "
+            "active_daily_total_rub) lets you describe current account "
+            "state. ``health`` is the same envelope ``account_health`` "
+            "returns: {status: 'ok', report: {...}} or {status: "
+            "'unconfigured', reason: ...} when YANDEX_METRIKA_COUNTER_ID "
+            "is not set — surface the missing config to the operator. "
+            "The operator can either accept and copy the YAML, or update "
+            "the profile by submitting fresh ``answers``."
         ),
         input_model=_StartOnboardingInput,
         is_write=False,
