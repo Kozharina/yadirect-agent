@@ -44,13 +44,8 @@ demo-only, technically; it cannot be handed to a non-developer.
       contract is "five distinct phases", each test-isolatable):
   - [x] ~~**slice 1 — `start_onboarding()` skeleton + OAuth state probe**~~
         — shipped, see Done.
-  - [ ] **slice 2 — BusinessProfile Q&A**: pydantic
-        ``BusinessProfile`` schema (niche, ICP, budget, goals,
-        forbidden phrasings) + Q&A-state-machine inputs
-        (``answers: dict[str, Any]`` to ``start_onboarding``)
-        + JSONL persistence next to ``audit.jsonl``. Re-runnable
-        per spec — second call with already-saved profile asks
-        what to update, not start from scratch.
+  - [x] ~~**slice 2 — BusinessProfile collection**~~ — shipped,
+        see Done.
   - [ ] **slice 3 — policy proposal**: read current account
         state (campaigns / daily-budget sum), propose
         ``agent_policy.yml`` (e.g. budget cap = 1.2× of current
@@ -863,6 +858,84 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M15.4 slice 2 — BusinessProfile collection** (§M15.4,
+      Phase 0+1, release 0.2.0). Extends slice 1's read-only
+      OAuth probe with a single-submit profile-collection
+      contract: pure-function tool, no state machine in code.
+
+      Three pieces:
+
+      1. ``models/business_profile.py`` — pydantic frozen
+         ``BusinessProfile`` with three fields: ``niche``
+         (str, 2-200 chars, non-blank after strip),
+         ``monthly_budget_rub`` (int, ≥1000),
+         ``target_cpa_rub`` (int | None, ≥1 when present).
+         Floor at 1000 RUB/month because below that slice 3's
+         policy proposal would derive a daily cap below
+         Direct's own minimum. ``frozen=True`` +
+         ``extra="forbid"`` pin the store contract.
+         **Deliberately omitted**: ``icp`` and
+         ``forbidden_phrasings``. Both only matter once M8
+         (creatives) lands; adding them now would design for
+         a hypothetical future requirement (CLAUDE.md).
+      2. ``services/business_profile_store.py`` — atomic
+         single-JSON-file store. ``save`` writes to a sibling
+         tempfile in the same directory and finalises with
+         ``os.replace`` (POSIX atomic rename, same on Windows
+         since Python 3.3). Failed rename cleans the tempfile
+         and re-raises so the caller knows the save did not
+         happen. ``load`` collapses missing-file / corrupt
+         JSON / schema-invalid into one ``None`` return —
+         same shape as ``KeyringTokenStore`` because all three
+         resolve via the same operator action (re-run
+         onboarding). ``delete`` is idempotent. Single JSON
+         file rather than JSONL: the historical-changes use
+         case has no consumer in the code today (git of the
+         file + audit log cover it).
+      3. ``_StartOnboardingInput.answers: dict[str, Any] |
+         None`` extends the input. Handler gains four branches
+         after the slice 1 OAuth probe (which still takes
+         priority — without API access nothing is meaningful):
+         - ``answers=None`` + no profile →
+           ``{status: "ready_for_profile_qa", schema, collected,
+           missing}`` where ``schema`` is
+           ``BusinessProfile.model_json_schema()`` and
+           ``missing`` lists only required fields.
+         - ``answers=None`` + profile exists →
+           ``{status: "profile_exists", profile}`` for the
+           re-run path per §M15.4 spec.
+         - ``answers`` invalid / partial →
+           ``{status: "incomplete_profile", errors}``.
+           Pydantic's ``ValidationError.errors(include_url=False)``
+           filtered to drop the docs ``url`` field. NOTHING
+           gets persisted on this path — a half-baked save
+           would strand the operator at policy_proposal with
+           no usable profile.
+         - ``answers`` valid →
+           ``{status: "ready_for_policy_proposal", profile}``
+           after atomic save.
+
+      Why no state machine in code: the LLM is already a
+      better dialogue state machine than any code we'd write.
+      Pure-function tool + LLM-owned conversation is simpler
+      to reason about and more flexible (the LLM can paraphrase,
+      batch questions, recover from operator confusion in ways
+      no coded state machine would).
+
+      Tool description rewritten to enumerate the four branches
+      explicitly + pin the contract ("YOU own the conversation,
+      this tool is a pure function") so an LLM driven by the
+      old slice 1 description doesn't ping-pong looking for a
+      "next question" field that never existed.
+
+      999 tests green (+34 new — 12 model, 12 store, 9 handler
+      branches + input model, +1 dispatch path through the MCP
+      server stays unchanged); mypy strict; ruff clean.
+
+      Out of scope (deferred to slice 3): the actual
+      ``agent_policy.yml`` proposal generator that consumes
+      the saved profile.
 
 - [x] **M15.4 slice 1 — `start_onboarding()` skeleton + OAuth probe**
       (§M15.4, Phase 0+1, release 0.2.0). First read-only cut of
