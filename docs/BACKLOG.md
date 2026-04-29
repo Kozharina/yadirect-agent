@@ -47,13 +47,22 @@ demo-only, technically; it cannot be handed to a non-developer.
   - [x] ~~**slice 2 — BusinessProfile collection**~~ — shipped,
         see Done.
   - [x] ~~**slice 3 — policy proposal**~~ — shipped, see Done.
-  - [ ] **slice 4 — onboarding baseline snapshot**: minimal
-        single-shot snapshot of campaign budgets + statuses +
-        strategies. **Precedes M19.1**: M19.1 is per-run
-        snapshotting, this is one onboarding-time snapshot. The
-        snapshot writer itself (``services/snapshot/take.py``)
-        is shared — when M19.1 lands it reuses this; for now it
-        only has one call site.
+  - [ ] **slice 4 — onboarding-completed audit event** (was
+        "baseline snapshot"; **scope reduced**). The original
+        plan was a dedicated snapshot file precading M19.1. On
+        review I caught it as designing for a hypothetical
+        future requirement (CLAUDE.md non-negotiable): no
+        consumer in the code today, and M19 (the would-be
+        consumer) is months out in Phase 2. Instead, slice 4
+        emits a structured ``onboarding_completed`` event into
+        the existing ``audit.jsonl`` on fresh-save (not on
+        re-run probe — that doesn't change state). Payload:
+        profile summary (niche, monthly budget), account
+        summary (on-campaigns count, active daily total),
+        proposal summary (chosen cap). When M19.1 lands, its
+        dedicated snapshot service will write its own files in
+        its own format; the onboarding handler will gain one
+        line of ``await snapshot_service.take("onboarding")``.
   - [ ] **slice 5 — first health check + result delivery**:
         invokes ``account_health`` (M15.5, shipped) inline and
         rolls up the four prior slices into one onboarding
@@ -175,7 +184,45 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **M15.4 slice 4 — onboarding_completed audit event**
+      (§M15.4, Phase 0+1, release 0.2.0). Scope reduced from
+      the original "full baseline snapshot file" plan because
+      the dedicated snapshot would be infrastructure for a
+      consumer that doesn't exist (M19 is months out in
+      Phase 2; today nothing in the code reads onboarding
+      baselines). Instead:
+
+      1. ``start_onboarding`` handler emits one structured
+         ``onboarding_completed`` ``AuditEvent`` into
+         ``settings.audit_log_path`` after a fresh-save (the
+         post-validation, post-store path). Re-run probe
+         (``answers=None`` + profile exists) does NOT emit —
+         it doesn't change state and a re-onboarding flood of
+         events would just be noise.
+      2. Event payload (in ``result``):
+         - ``profile_summary``: ``{niche, monthly_budget_rub,
+           target_cpa_rub_set}`` (target_cpa flagged as bool
+           rather than echoed — no need to leak the number
+           into the audit log).
+         - ``account_summary``: ``{on_campaigns_count,
+           active_daily_total_rub}`` — already computed by
+           ``_build_policy_proposed_response``; reuse the
+           figures rather than reading account state twice.
+         - ``proposal_summary``: ``{chosen_account_daily_budget_cap_rub}``
+           — single number, the actionable output.
+      3. When M19.1 lands its dedicated snapshot service, the
+         onboarding handler will gain one line of
+         ``await snapshot_service.take("onboarding")``. The
+         audit event stays — it answers a different question
+         ("when did onboarding complete?") than the snapshot
+         ("what was the account state?").
+
+      Trade-off accepted: M19.1 will need to read full account
+      state at its own snapshot time, which is an extra HTTP
+      round-trip then. Saving it today would amortise that,
+      but only against a hypothetical future use — pre-empting
+      that round-trip is exactly the non-negotiable I'm
+      avoiding.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
