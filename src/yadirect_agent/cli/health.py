@@ -13,14 +13,17 @@ on argument parsing and lifecycle.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
-from typing import Any
 
 from rich.console import Console
 from rich.markup import escape as _rich_escape
 from rich.table import Table
 
-from ..models.health import Finding, HealthReport, Severity
+from ..models.health import (
+    Finding,
+    HealthReport,
+    Severity,
+    health_report_to_jsonable_dict,
+)
 
 # Severity ordering for rendering: HIGH first (most urgent), then
 # warnings, then info — same order an operator scans for action items.
@@ -106,18 +109,16 @@ def render_report_text(console: Console, report: HealthReport) -> None:
 
 
 def render_report_json(report: HealthReport) -> str:
-    """Serialise the report to JSON for downstream tools / piping."""
-    payload: dict[str, Any] = {
-        "date_range": {
-            "start": report.date_range.start.isoformat(),
-            "end": report.date_range.end.isoformat(),
-        },
-        "findings": [
-            {
-                **{k: v for k, v in asdict(f).items() if k != "severity"},
-                "severity": f.severity.value,
-            }
-            for f in sorted(report.findings, key=_sort_key)
-        ],
-    }
-    return json.dumps(payload, ensure_ascii=False)
+    """Serialise the report to JSON for downstream tools / piping.
+
+    Sorts findings by ``_sort_key`` (severity desc, impact desc,
+    campaign id asc) for the CLI's reading order. The model-layer
+    ``health_report_to_jsonable_dict`` is the single source of
+    truth for field shape; we wrap a sorted-findings view of the
+    report through it.
+    """
+    sorted_report = HealthReport(
+        date_range=report.date_range,
+        findings=sorted(report.findings, key=_sort_key),
+    )
+    return json.dumps(health_report_to_jsonable_dict(sorted_report), ensure_ascii=False)
