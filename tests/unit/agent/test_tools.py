@@ -89,10 +89,10 @@ class TestRegistry:
 
 
 class TestDefaultRegistry:
-    def test_exposes_seven_named_tools(self, settings: Settings) -> None:
+    def test_exposes_eight_named_tools(self, settings: Settings) -> None:
         reg = build_default_registry(settings)
 
-        assert len(reg) == 7
+        assert len(reg) == 8
         assert set(reg.names()) == {
             "list_campaigns",
             "pause_campaigns",
@@ -101,6 +101,7 @@ class TestDefaultRegistry:
             "get_keywords",
             "set_keyword_bids",
             "validate_phrases",
+            "explain_decision",
         }
 
     @pytest.mark.parametrize(
@@ -113,6 +114,7 @@ class TestDefaultRegistry:
             ("get_keywords", False),
             ("set_keyword_bids", True),
             ("validate_phrases", False),
+            ("explain_decision", False),
         ],
     )
     def test_write_flags_match_spec(self, settings: Settings, name: str, is_write: bool) -> None:
@@ -129,6 +131,7 @@ class TestDefaultRegistry:
             "get_keywords",
             "set_keyword_bids",
             "validate_phrases",
+            "explain_decision",
         ],
     )
     def test_input_models_reject_unknown_fields(self, settings: Settings, tool_name: str) -> None:
@@ -365,6 +368,130 @@ class TestHandlersPassRationaleToService:
         assert rat.action == expected_action
         assert rat.resource_type == expected_rt
         assert rat.resource_ids == expected_ids
+
+
+# --------------------------------------------------------------------------
+# M20 slice 3 — ``explain_decision`` MCP tool.
+#
+# Closes the M20 read-back loop: slice 1 (``Rationale`` model + JSONL
+# store), slice 2 (hard-required emission so every plan has a recorded
+# rationale), slice 3 (this tool — exposes the rationale verbatim to
+# the LLM so a Claude Desktop chat can ask "why did you do X?" without
+# the agent fabricating after-the-fact reasoning).
+#
+# Read-only: the tool reads from ``rationale.jsonl`` and never mutates
+# anything. ``is_write=False`` means the tool is exposed in the
+# default read-only MCP mode without operator opt-in.
+# --------------------------------------------------------------------------
+
+
+class TestExplainDecisionTool:
+    def test_input_rejects_empty_decision_id(self, settings: Settings) -> None:
+        # Empty id has no semantic — there's no "the empty decision".
+        # Reject at the schema boundary so the LLM cannot accidentally
+        # call into a fallback that returns a misleading "not found".
+        tool = build_default_registry(settings).get("explain_decision")
+        with pytest.raises(ValidationError, match="decision_id"):
+            tool.input_model.model_validate({"decision_id": ""})
+
+    def test_input_rejects_whitespace_in_decision_id(self, settings: Settings) -> None:
+        # ``OperationPlan.plan_id`` and ``Rationale.decision_id`` both
+        # forbid whitespace (M20 MEDIUM-2). Pin the same constraint at
+        # the tool-input boundary so a query with stray whitespace
+        # fails up front rather than silently returning "not found".
+        tool = build_default_registry(settings).get("explain_decision")
+        with pytest.raises(ValidationError):
+            tool.input_model.model_validate({"decision_id": "abc 123"})
+
+    def test_input_rejects_unknown_field(self, settings: Settings) -> None:
+        # ``extra="forbid"`` on every tool input — defence in depth so
+        # an LLM hallucinating a side parameter fails cleanly.
+        tool = build_default_registry(settings).get("explain_decision")
+        with pytest.raises(ValidationError):
+            tool.input_model.model_validate({"decision_id": "x", "_evil": True})
+
+    @pytest.mark.asyncio
+    async def test_handler_returns_rationale_for_known_decision(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from datetime import UTC, datetime
+
+        from yadirect_agent.agent.rationale_store import RationaleStore
+        from yadirect_agent.models.rationale import Confidence, Rationale
+
+        # Settings already points ``audit_log_path`` at tmp_path/logs;
+        # the rationale store sits next to it.
+        rationale_path = settings.audit_log_path.parent / "rationale.jsonl"
+        store = RationaleStore(rationale_path)
+        recorded = Rationale(
+            decision_id="dec-known",
+            timestamp=datetime(2026, 4, 28, 12, 0, tzinfo=UTC),
+            action="set_campaign_budget",
+            resource_type="campaign",
+            resource_ids=[42],
+            summary="Scaling campaign 42 after CPA stayed below target for 5 days.",
+            confidence=Confidence.HIGH,
+        )
+        store.append(recorded)
+
+        tool = build_default_registry(settings).get("explain_decision")
+        inp = tool.input_model.model_validate({"decision_id": "dec-known"})
+        result = await tool.handler(inp, tool_context)
+
+        # Status is the structured signal the LLM checks; the LLM
+        # never has to inspect Python type / catch exceptions.
+        assert result["status"] == "found"
+        # Rationale fields surface verbatim — the operator's recorded
+        # words are what shows up in chat read-back.
+        rat = result["rationale"]
+        assert rat["decision_id"] == "dec-known"
+        assert rat["action"] == "set_campaign_budget"
+        assert rat["resource_ids"] == [42]
+        assert rat["confidence"] == "high"
+        assert "Scaling campaign 42" in rat["summary"]
+        # Timestamp lands as ISO string, not a Python datetime — MCP
+        # transports JSON-only payloads.
+        assert isinstance(rat["timestamp"], str)
+
+    @pytest.mark.asyncio
+    async def test_handler_returns_not_found_for_unknown_id(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+    ) -> None:
+        # Empty store (no file yet) — fresh deployment, the operator
+        # asks about a decision_id that has no record. Don't raise:
+        # the LLM treats {status: "not_found"} as actionable data
+        # ("I don't have a record of that decision"), whereas an
+        # exception would surface as a tool error and confuse the
+        # downstream conversation.
+        tool = build_default_registry(settings).get("explain_decision")
+        inp = tool.input_model.model_validate({"decision_id": "dec-unknown"})
+        result = await tool.handler(inp, tool_context)
+
+        assert result == {"status": "not_found", "decision_id": "dec-unknown"}
+
+    @pytest.mark.asyncio
+    async def test_handler_returns_not_found_when_store_file_missing(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+    ) -> None:
+        # Strict variant of the previous: we don't even create the
+        # rationale.jsonl file. ``RationaleStore.get`` already handles
+        # this gracefully; the tool inherits that contract.
+        rationale_path = settings.audit_log_path.parent / "rationale.jsonl"
+        assert not rationale_path.exists()  # sanity-check the fixture
+
+        tool = build_default_registry(settings).get("explain_decision")
+        inp = tool.input_model.model_validate({"decision_id": "anything"})
+        result = await tool.handler(inp, tool_context)
+
+        assert result["status"] == "not_found"
 
 
 # --------------------------------------------------------------------------
