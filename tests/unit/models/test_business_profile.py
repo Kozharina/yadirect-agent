@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import pytest
 from pydantic import ValidationError
+
 from yadirect_agent.models.business_profile import BusinessProfile
 
 
@@ -48,11 +49,11 @@ class TestBusinessProfile:
         # never "mutate then save". Frozen=True pins this at the
         # type level so a future caller cannot drift.
         profile = BusinessProfile(
-            niche="X",
+            niche="ok",
             monthly_budget_rub=1_000,
         )
         with pytest.raises(ValidationError):
-            profile.niche = "Y"  # type: ignore[misc]
+            profile.niche = "still ok"  # type: ignore[misc]
 
     def test_extra_field_rejected(self) -> None:
         # Defence-in-depth: a corrupt JSON file or future drift
