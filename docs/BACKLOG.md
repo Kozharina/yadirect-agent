@@ -44,13 +44,15 @@ demo-only, technically; it cannot be handed to a non-developer.
       contract is "five distinct phases", each test-isolatable):
   - [x] ~~**slice 1 — `start_onboarding()` skeleton + OAuth state probe**~~
         — shipped, see Done.
-  - [ ] **slice 2 — BusinessProfile Q&A**: pydantic
-        ``BusinessProfile`` schema (niche, ICP, budget, goals,
-        forbidden phrasings) + Q&A-state-machine inputs
-        (``answers: dict[str, Any]`` to ``start_onboarding``)
-        + JSONL persistence next to ``audit.jsonl``. Re-runnable
-        per spec — second call with already-saved profile asks
-        what to update, not start from scratch.
+  - [ ] **slice 2 — BusinessProfile collection**: pydantic
+        ``BusinessProfile`` (3 fields — niche, monthly budget,
+        optional target CPA; ICP/forbidden_phrasings deferred
+        to M8 when they have a consumer) + atomic single-JSON
+        store + ``_StartOnboardingInput.answers: dict[str, Any]
+        | None``. **No state machine in code** — LLM owns the
+        conversation; tool exposes schema + collected + missing
+        and accepts whole-profile submits. Re-runnable per
+        spec via the ``profile_exists`` branch.
   - [ ] **slice 3 — policy proposal**: read current account
         state (campaigns / daily-budget sum), propose
         ``agent_policy.yml`` (e.g. budget cap = 1.2× of current
@@ -184,7 +186,45 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **M15.4 slice 2 — BusinessProfile collection**
+      (§M15.4, Phase 0+1, release 0.2.0). Extends slice 1 with
+      a single-submit profile-collection contract: tool returns
+      schema + collected + missing; LLM owns the conversation
+      and submits ``answers={...}`` whole when it has everything.
+      No state machine in code — LLM is the state machine.
+
+      Three pieces:
+      1. ``models/business_profile.py`` — pydantic frozen
+         ``BusinessProfile``: ``niche`` (str, 2-200 chars),
+         ``monthly_budget_rub`` (int, ≥1000),
+         ``target_cpa_rub`` (int | None, ≥1). Three fields
+         total — minimum required by slice 3 (policy proposal
+         derives daily cap from monthly_budget) and the
+         existing M15.5.1 high-CPA rule.
+         **Deliberately omitted**: ``icp`` and
+         ``forbidden_phrasings`` — these only matter once M8
+         (creatives) lands; adding them now would design for
+         a hypothetical future requirement.
+      2. ``services/business_profile_store.py`` —
+         single-JSON-file store with atomic rewrite via
+         ``os.replace``. ``save`` / ``load`` / ``delete``.
+         Corrupt file → ``load`` returns ``None`` (same
+         contract as ``KeyringTokenStore``: missing /
+         corrupt / invalid all collapse to "operator action
+         required"). One file rather than JSONL because the
+         hypothetical "history of profile changes" need has
+         no consumer; audit log + git of the file cover it
+         today.
+      3. ``_StartOnboardingInput`` extended with
+         ``answers: dict[str, Any] | None = None``. Handler
+         gains four branches after the OAuth probe (slice 1
+         logic intact): ``answers=None`` + no profile →
+         ``ready_for_profile_qa`` with ``schema``,
+         ``collected: {}``, ``missing``; ``answers=None`` +
+         profile exists → ``profile_exists`` (re-run path);
+         ``answers`` invalid/partial → ``incomplete_profile``
+         with ``errors``; ``answers`` valid → save +
+         ``ready_for_policy_proposal`` (slice 3 placeholder).
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
