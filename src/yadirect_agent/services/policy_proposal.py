@@ -1,0 +1,158 @@
+"""``generate_policy_proposal`` — derive an ``agent_policy.yml`` proposal (M15.4).
+
+Pure function over the operator's ``BusinessProfile`` and the
+account's *current* active daily-budget total. Returns a dict
+with two keys:
+
+- ``policy_yaml`` (str): the YAML the operator copy-pastes into
+  ``settings.agent_policy_path``. Flat format (matches what
+  ``agent.safety.load_policy`` reads), with a provenance header
+  comment so the operator can trace "where did 12_000 come from?"
+  weeks later.
+- ``summary`` (dict): structured numbers and the formula. The
+  LLM uses this to explain the proposed cap in chat without
+  re-deriving it from scratch.
+
+The cap formula:
+
+    cap = ceil_to_100(max(margin_factor * current, monthly / 30))
+
+Why two formulas combined with ``max``:
+
+- ``margin_factor * current`` is the spec phrase "budget cap =
+  1.2x current daily sum". It honours the operator's current
+  spending intent.
+- ``monthly / 30`` is the fallback for sandbox / fresh accounts
+  where current is 0 (the spec formula alone would yield 0,
+  leaving the agent unable to do anything). It also wins when
+  the operator wants the agent to *grow* spending toward the
+  monthly target rather than match the historical average.
+- ``max`` picks the operator-friendlier number — never lower
+  than what they're already spending plus margin, never lower
+  than what their stated monthly intent works out to per day.
+
+We deliberately do NOT clamp to Direct's 300 RUB daily minimum;
+hiding an input/output mismatch (the operator chose a
+1000-RUB/month profile and we silently bumped it to 9000) would
+be a worse failure mode than a small visible number. The summary
+exposes both inputs so the operator can spot the mismatch.
+
+The proposal seeds ``rollout_stage: shadow`` so even an operator
+who skips reading the YAML lands in read-only mode by default;
+mutations require an explicit ``rollout promote``.
+
+This is a pure function — no I/O, no side effects, no Direct API
+calls. The caller (``start_onboarding`` handler) reads the
+account state and passes ``current_active_daily_total_rub`` in.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+import yaml
+
+from ..models.business_profile import BusinessProfile
+
+# 20% safety margin over the operator's current spending. Pinned
+# as a module constant so a future tuning pass has one greppable
+# surface; not exposed in the public signature because
+# slice-3-scope is "match the spec phrase exactly" rather than
+# "make every constant configurable".
+_MARGIN_FACTOR: float = 1.2
+
+# Round-up granularity for the proposed cap. 100 RUB matches the
+# operator's mental model (whole hundreds read more naturally
+# than 11_978 / 11_979). A future operator with a much larger
+# account could lift this to 1000 — keep as a constant for
+# discoverability when that happens.
+_CAP_ROUND_UP_TO: int = 100
+
+
+def _ceil_to_step(value: float, step: int) -> int:
+    """Round ``value`` up to the nearest multiple of ``step``."""
+    if step <= 0:
+        msg = "step must be positive"
+        raise ValueError(msg)
+    return math.ceil(value / step) * step
+
+
+def generate_policy_proposal(
+    *,
+    profile: BusinessProfile,
+    current_active_daily_total_rub: float,
+) -> dict[str, Any]:
+    """Build an ``agent_policy.yml`` proposal from profile + account state.
+
+    Pure function, no I/O. The caller passes in
+    ``current_active_daily_total_rub`` (sum of ``daily_budget_rub``
+    over ON campaigns in the operator's Direct account); zero is
+    a legitimate value (sandbox / fresh account).
+
+    Returns:
+        ``{"policy_yaml": str, "summary": dict[str, Any]}``
+
+    Raises:
+        ValueError: if ``current_active_daily_total_rub`` is negative.
+    """
+    if current_active_daily_total_rub < 0:
+        msg = (
+            "current_active_daily_total_rub must be non-negative; "
+            f"got {current_active_daily_total_rub!r}"
+        )
+        raise ValueError(msg)
+
+    # Compute both candidate caps so the summary can show the
+    # operator both numbers + which one was picked. Hiding the
+    # losing candidate would make "why this cap, not that?"
+    # impossible to answer from chat.
+    cap_from_current = _ceil_to_step(
+        _MARGIN_FACTOR * current_active_daily_total_rub,
+        _CAP_ROUND_UP_TO,
+    )
+    monthly_avg_daily = profile.monthly_budget_rub / 30
+    cap_from_monthly_avg = _ceil_to_step(monthly_avg_daily, _CAP_ROUND_UP_TO)
+    chosen_cap = max(cap_from_current, cap_from_monthly_avg)
+
+    # Flat YAML — matches the format ``load_policy`` accepts
+    # (one greppable shape for the operator to learn).
+    policy_dict = {
+        "account_daily_budget_cap_rub": chosen_cap,
+        # Defence-in-depth: even an operator who skips reading
+        # the YAML and just applies it stays in read-only mode
+        # until ``rollout promote`` is run.
+        "rollout_stage": "shadow",
+    }
+
+    header = (
+        f"# Generated by yadirect-agent onboarding\n"
+        f"# Inputs: monthly_budget_rub={profile.monthly_budget_rub}, "
+        f"current_active_daily_total_rub={current_active_daily_total_rub:.0f}\n"
+        f"# Formula: max({_MARGIN_FACTOR}*current, monthly_budget_rub/30), "
+        f"rounded up to {_CAP_ROUND_UP_TO} RUB\n"
+        f"# Drop into the path configured by AGENT_POLICY_PATH after review.\n"
+    )
+    body = yaml.safe_dump(policy_dict, sort_keys=False, allow_unicode=True)
+    policy_yaml = header + body
+
+    summary: dict[str, Any] = {
+        "current_active_daily_total_rub": current_active_daily_total_rub,
+        "monthly_budget_rub": profile.monthly_budget_rub,
+        "margin_factor": _MARGIN_FACTOR,
+        "cap_from_current_rub": cap_from_current,
+        "cap_from_monthly_avg_rub": cap_from_monthly_avg,
+        "chosen_account_daily_budget_cap_rub": chosen_cap,
+        "formula": (
+            f"max({_MARGIN_FACTOR}*current_active_daily_total, "
+            f"monthly_budget_rub/30), rounded up to {_CAP_ROUND_UP_TO}"
+        ),
+    }
+
+    return {
+        "policy_yaml": policy_yaml,
+        "summary": summary,
+    }
+
+
+__all__ = ["generate_policy_proposal"]
