@@ -45,11 +45,17 @@ demo-only, technically; it cannot be handed to a non-developer.
       policy YAML proposal, ``onboarding_completed`` audit
       event, first health-check rollup. M15.4 architecturally
       complete.
-- [ ] **M15.6 — Built-in scheduler**: ``yadirect-agent schedule
-      install`` cross-platform — LaunchAgent on macOS, systemd
-      timer on Linux, Task Scheduler on Windows. Daily run at 08:00
-      local + hourly health. Logs into ``audit_log_path``.
-      M15.5 ``--no-llm`` is shipped (M15.5.1).
+- [ ] **M15.6 — Built-in scheduler** (split into per-platform
+      slices because LaunchAgent / systemd timer / Task
+      Scheduler have nothing in common but the high-level
+      concept):
+  - [ ] **slice 1 — macOS LaunchAgent**: see In progress.
+  - [ ] **slice 2 — Linux systemd --user timer**: timer +
+        service unit pair, ``systemctl --user`` lifecycle.
+        Mirror the slice 1 contract (install / status / remove);
+        share the ``services/scheduler/__init__.py`` common types.
+  - [ ] **slice 3 — Windows Task Scheduler**: ``schtasks``
+        XML + create/query/delete. Same contract.
 - [x] ~~**M20 — Human-readable rationale (slice 1)**~~ — shipped,
       see Done. Model + store + soft-optional emission +
       ``yadirect-agent rationale show/list`` CLI.
@@ -161,7 +167,50 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **M15.6 slice 1 — macOS LaunchAgent scheduler**
+      (§M15.6, Phase 0+1, release 0.2.0). Cross-platform
+      scheduler reduced to per-platform slices because
+      ``LaunchAgent`` / ``systemd timer`` / ``Task Scheduler``
+      have nothing in common but the high-level concept; one
+      mega-PR would have given each platform 33% of the test
+      coverage and 33% of the review attention.
+
+      Slice 1 ships:
+      1. ``services/scheduler/__init__.py`` — common ``ScheduleSpec``
+         (daily 08:00 + hourly health) + ``Platform`` enum.
+         Pure dataclass; no I/O.
+      2. ``services/scheduler/macos.py`` — generates
+         ``com.yadirect-agent.daily.plist`` +
+         ``com.yadirect-agent.hourly-health.plist``,
+         installs to ``~/Library/LaunchAgents/`` (atomic via
+         tempfile + ``os.replace``), invokes
+         ``launchctl load -w`` to activate. ``status`` reads
+         the plist files back; ``remove`` ``launchctl unload``s
+         and deletes them. Uses ``load -w`` rather than
+         ``bootstrap`` for cross-version compatibility (Catalina
+         → Sequoia). All ``launchctl`` invocations go through
+         a ``run_launchctl`` indirection so tests can monkeypatch.
+      3. ``cli/schedule.py`` — operator-facing rendering
+         (Russian per language convention) for status text +
+         install summary.
+      4. ``schedule install / status / remove`` CLI commands
+         in ``cli/main.py`` as a typer sub-app. ``--platform``
+         defaults to ``auto`` (detected from ``sys.platform``);
+         Linux/Windows return a clear "shipping in slice
+         2/3" message rather than crashing.
+
+      Out of scope for slice 1:
+      - Linux ``systemd --user`` timer (slice 2).
+      - Windows Task Scheduler (slice 3).
+      - ``schedule pause`` (Apple's docs are split between
+        ``launchctl disable`` and the ``Disabled`` plist key;
+        ship after slice 2/3 settle the cross-platform contract).
+
+      Trade-off accepted: Anna on macOS gets full automation
+      this slice; Linux / Windows operators see a visible
+      "not yet supported" message. Better than a half-done
+      cross-platform release where one platform silently
+      no-ops.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
