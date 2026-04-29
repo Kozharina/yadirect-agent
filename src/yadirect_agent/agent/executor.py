@@ -194,6 +194,8 @@ def _emit_rationale(
     self: object,
     plan: OperationPlan,
     rationale: Rationale,
+    *,
+    auto_slack: dict[str, float] | None = None,
 ) -> None:
     """Persist ``rationale`` under ``plan.plan_id``.
 
@@ -212,6 +214,14 @@ def _emit_rationale(
     id, or worse, overwrite an existing decision's record. Forcing
     the alignment here means the rationale store is always
     indexable by the same identifier as the plan.
+
+    M20 slice 4 ``auto_slack``: the SafetyDecision's harvested
+    ``policy_slack`` dict (one entry per check that emitted
+    ``details["policy_slack"]``). Merged into the persisted
+    rationale's ``policy_slack`` field with caller-wins-on-conflict
+    semantics — a caller that pre-fills ``policy_slack`` with
+    explicit knowledge keeps its values; the decorator only fills
+    in keys the caller did NOT provide.
     """
     rationale_store = _resolve_rationale_store(self)
     if rationale_store is None:
@@ -223,7 +233,13 @@ def _emit_rationale(
         )
         return
 
-    aligned = rationale.model_copy(update={"decision_id": plan.plan_id})
+    update: dict[str, Any] = {"decision_id": plan.plan_id}
+    if auto_slack:
+        # Caller-wins on conflict: ``auto_slack`` first, ``rationale``
+        # last. ``dict`` merge keeps the LATER source's value when
+        # the same key appears in both.
+        update["policy_slack"] = {**auto_slack, **rationale.policy_slack}
+    aligned = rationale.model_copy(update=update)
     rationale_store.append(aligned)
 
 
@@ -339,7 +355,14 @@ def requires_plan(
             # still leaves the rationale on disk — operators can see
             # what the agent was *trying* to do even if execution
             # failed.
-            _emit_rationale(self, plan, rationale)
+            #
+            # M20 slice 4: pass ``decision.policy_slack`` as
+            # ``auto_slack`` so the decorator merges the pipeline's
+            # harvested per-check distance values into
+            # ``Rationale.policy_slack`` before persistence. Caller-
+            # wins on key collision (the ``_emit_rationale`` helper
+            # spells out the merge semantics).
+            _emit_rationale(self, plan, rationale, auto_slack=decision.policy_slack)
 
             if decision.status == "confirm":
                 persisted = plan.model_copy(
