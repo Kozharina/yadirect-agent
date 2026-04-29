@@ -179,7 +179,49 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **M15.4 slice 3 — policy proposal** (§M15.4, Phase 0+1,
+      release 0.2.0). Replaces slice 2's
+      ``ready_for_policy_proposal`` placeholder + the
+      ``profile_exists`` branch with a concrete
+      ``policy_proposed`` payload: a generated
+      ``agent_policy.yml`` text + numeric summary.
+
+      Three pieces:
+
+      1. ``services/policy_proposal.py`` —
+         ``generate_policy_proposal(*, profile,
+         current_active_daily_total_rub) -> dict`` pure
+         function. Computes ``account_daily_budget_cap_rub =
+         ceil_to_100(max(1.2 × current_active_daily_total,
+         monthly_budget_rub / 30))``: 1.2× factor matches the
+         spec phrase "budget cap = 1.2× от текущего суммарного";
+         the monthly/30 fallback covers fresh / sandbox accounts
+         where current=0 (the spec formula alone would yield 0,
+         leaving the agent unable to do anything). Round up to
+         the nearest 100 for operator-readable numbers.
+         Returns ``{"policy_yaml": str, "summary": dict}``
+         where ``summary`` carries the inputs and the chosen
+         formula so the LLM can explain the number without
+         re-deriving it.
+      2. ``start_onboarding`` handler swap:
+         - Slice 2's ``ready_for_policy_proposal`` happy path
+           → ``policy_proposed`` with ``proposal: {policy_yaml,
+           summary}`` appended.
+         - Slice 2's ``profile_exists`` branch → also
+           ``policy_proposed`` (re-run path: profile exists,
+           propose against current state). Status name
+           ``profile_exists`` retired.
+         - All branches that need account state read it via
+           ``CampaignService.list_active`` and sum
+           ``daily_budget_rub`` over ON campaigns. Sandbox /
+           empty account → 0 → fallback to monthly/30 kicks in.
+      3. **Deliberately NOT done in slice 3**: writing the
+         YAML to ``settings.agent_policy_path`` from the tool.
+         That's a mutation of the operator's environment
+         (CLAUDE.md non-negotiable #3); the operator copies
+         the YAML themselves after reviewing. Slice 5 may add
+         a ``confirm_proposal`` flag if oprator-feedback says
+         the copy step is friction.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
