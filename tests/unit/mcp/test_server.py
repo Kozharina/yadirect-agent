@@ -31,6 +31,13 @@ _READ_ONLY_TOOLS = {
     # reads Metrika + Direct, never mutates. Closes the Phase 0
     # surface for "how is my account?" without operator opt-in.
     "account_health",
+    # ``start_onboarding`` (M15.4 slice 1) — read-only OAuth-state
+    # probe. Returns ``needs_oauth`` (with the CLI command to run)
+    # or ``ready_for_profile_qa``; never mutates. Joins the
+    # read-only catalogue exposed by default — without it, the
+    # operator's first chat ("помоги настроить агента") has no
+    # tool to land on.
+    "start_onboarding",
 }
 _GATED_WRITE_TOOLS = {
     "pause_campaigns",
@@ -296,3 +303,48 @@ class TestMcpToolDispatch:
         assert len(result["report"]["findings"]) == 1
         assert result["report"]["findings"][0]["severity"] == "high"
         assert result["report"]["findings"][0]["campaign_id"] == 42
+
+    @pytest.mark.asyncio
+    async def test_start_onboarding_dispatches_in_read_only_mode(
+        self, settings: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end through MCP for the M15.4 slice 1 onboarding
+        probe: the operator's read-only Claude Desktop mode (the
+        default) must expose ``start_onboarding`` and dispatch it
+        correctly. Without this, the first chat the operator types
+        ("помоги настроить агента") has nothing to land on.
+        """
+        import keyring.errors
+
+        # In-memory keyring backend, identical to the agent-tools
+        # test fixture. Replicated to keep MCP tests independent of
+        # the agent-tests directory.
+        storage: dict[tuple[str, str], str] = {}
+
+        def set_password(service: str, username: str, password: str) -> None:
+            storage[(service, username)] = password
+
+        def get_password(service: str, username: str) -> str | None:
+            return storage.get((service, username))
+
+        def delete_password(service: str, username: str) -> None:
+            key = (service, username)
+            if key not in storage:
+                raise keyring.errors.PasswordDeleteError(f"no password for {key}")
+            del storage[key]
+
+        monkeypatch.setattr("keyring.set_password", set_password)
+        monkeypatch.setattr("keyring.get_password", get_password)
+        monkeypatch.setattr("keyring.delete_password", delete_password)
+
+        handle = build_mcp_server(settings, allow_write=False)
+
+        # Pin: tool is in the read-only catalogue (no allow_write needed).
+        names = {t.name for t in handle.tools}
+        assert "start_onboarding" in names
+
+        # Pin: dispatch on an empty keychain returns the ``needs_oauth``
+        # next-step. The operator's chat client renders this verbatim.
+        result = await handle.dispatch("start_onboarding", {})
+        assert result["status"] == "needs_oauth"
+        assert result["action"] == "yadirect-agent auth login"

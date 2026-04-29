@@ -89,10 +89,10 @@ class TestRegistry:
 
 
 class TestDefaultRegistry:
-    def test_exposes_nine_named_tools(self, settings: Settings) -> None:
+    def test_exposes_ten_named_tools(self, settings: Settings) -> None:
         reg = build_default_registry(settings)
 
-        assert len(reg) == 9
+        assert len(reg) == 10
         assert set(reg.names()) == {
             "list_campaigns",
             "pause_campaigns",
@@ -103,6 +103,7 @@ class TestDefaultRegistry:
             "validate_phrases",
             "explain_decision",
             "account_health",
+            "start_onboarding",
         }
 
     @pytest.mark.parametrize(
@@ -117,6 +118,7 @@ class TestDefaultRegistry:
             ("validate_phrases", False),
             ("explain_decision", False),
             ("account_health", False),
+            ("start_onboarding", False),
         ],
     )
     def test_write_flags_match_spec(self, settings: Settings, name: str, is_write: bool) -> None:
@@ -135,6 +137,7 @@ class TestDefaultRegistry:
             "validate_phrases",
             "explain_decision",
             "account_health",
+            "start_onboarding",
         ],
     )
     def test_input_models_reject_unknown_fields(self, settings: Settings, tool_name: str) -> None:
@@ -672,6 +675,181 @@ class TestAccountHealthTool:
 
         assert result["status"] == "unconfigured"
         assert "YANDEX_METRIKA_COUNTER_ID" in result["reason"]
+
+
+# --------------------------------------------------------------------------
+# M15.4 slice 1 — ``start_onboarding`` MCP tool. Read-only probe of
+# the onboarding state machine. The first cut answers exactly ONE
+# question: "is OAuth ready?". When the keychain is empty / corrupt
+# / the token has expired, the tool returns a structured ``needs_oauth``
+# next-step pointing at the CLI ``yadirect-agent auth login`` (an MCP
+# server cannot legally open a browser on the operator's machine);
+# when a valid token exists, it returns ``ready_for_profile_qa`` —
+# a placeholder slice 2 will fill with the BusinessProfile Q&A flow.
+# --------------------------------------------------------------------------
+
+
+class TestStartOnboardingTool:
+    @pytest.fixture
+    def memory_keyring(self, monkeypatch: pytest.MonkeyPatch) -> dict[tuple[str, str], str]:
+        """In-memory keyring backend, identical pattern to
+        ``tests/unit/auth/test_keychain.py::memory_keyring``.
+
+        Replicated rather than imported because the cross-package
+        ``tests/unit/auth → tests/unit/agent`` import path would
+        couple two otherwise-independent test directories. The
+        fixture is six lines; copying is cheaper than coupling.
+        """
+        import keyring.errors
+
+        storage: dict[tuple[str, str], str] = {}
+
+        def set_password(service: str, username: str, password: str) -> None:
+            storage[(service, username)] = password
+
+        def get_password(service: str, username: str) -> str | None:
+            return storage.get((service, username))
+
+        def delete_password(service: str, username: str) -> None:
+            key = (service, username)
+            if key not in storage:
+                raise keyring.errors.PasswordDeleteError(f"no password for {key}")
+            del storage[key]
+
+        monkeypatch.setattr("keyring.set_password", set_password)
+        monkeypatch.setattr("keyring.get_password", get_password)
+        monkeypatch.setattr("keyring.delete_password", delete_password)
+        return storage
+
+    def _save_token(
+        self,
+        *,
+        obtained_at: Any,
+        expires_at: Any,
+    ) -> None:
+        """Helper: write a TokenSet through the real keychain layer
+        so tests exercise the same load path the handler uses.
+        """
+        from pydantic import SecretStr
+
+        from yadirect_agent.auth.keychain import KeyringTokenStore
+        from yadirect_agent.models.auth import TokenSet
+
+        KeyringTokenStore().save(
+            TokenSet(
+                access_token=SecretStr("AQAA-access"),
+                refresh_token=SecretStr("1.AQAA-refresh"),
+                token_type="bearer",
+                scope=("direct:api", "metrika:read", "metrika:write"),
+                obtained_at=obtained_at,
+                expires_at=expires_at,
+            ),
+        )
+
+    def test_input_accepts_empty_payload(self, settings: Settings) -> None:
+        # The slice 1 tool takes no required arguments — the first
+        # call from the LLM ("помоги настроить агента") must succeed
+        # with zero context. Slice 2 will add optional ``answers``
+        # for the Q&A state machine.
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate({})
+        # Sanity-check: the model exists and instantiates with no
+        # required fields. Structural shape (no answers field) is
+        # tested separately by ``test_input_rejects_unknown_field``.
+        assert inp is not None
+
+    def test_input_rejects_unknown_field(self, settings: Settings) -> None:
+        # Defence-in-depth (auditor HIGH-2 sweep): the LLM cannot
+        # sneak a ``_force_ready`` or any other key through the
+        # input model to bypass the OAuth probe.
+        tool = build_default_registry(settings).get("start_onboarding")
+        with pytest.raises(ValidationError):
+            tool.input_model.model_validate({"_force_ready": True})
+
+    @pytest.mark.asyncio
+    async def test_handler_returns_needs_oauth_when_keychain_empty(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # The fresh-install case: operator just ran
+        # ``install-into-claude-desktop``, has not yet logged into
+        # Yandex. The handler must detect the empty keychain and
+        # return a structured next-step the LLM can read out as
+        # "please run `yadirect-agent auth login` in your terminal".
+        assert memory_keyring == {}  # sanity-check the fixture
+
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate({})
+        result = await tool.handler(inp, tool_context)
+
+        assert result["status"] == "needs_oauth"
+        assert result["action"] == "yadirect-agent auth login"
+        # The reason field must be operator-readable. Pin the
+        # presence of an explanatory string rather than the exact
+        # wording so the message can evolve without churning tests.
+        assert isinstance(result["reason"], str)
+        assert result["reason"]
+
+    @pytest.mark.asyncio
+    async def test_handler_returns_needs_oauth_when_token_expired(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # Long-idle case: operator logged in last year, the token
+        # has since expired. ``TokenSet.needs_refresh`` returns
+        # True; the handler must funnel this into ``needs_oauth``
+        # rather than returning ``ready`` and letting the next
+        # tool call fail with a 401. Auto-refresh on 401 is a
+        # separate backlog item (M15.3 follow-up); slice 1 keeps
+        # the surface explicit: when the token is expired,
+        # operator re-runs ``auth login``.
+        from datetime import UTC, datetime, timedelta
+
+        # obtained_at far in the past, expires_at in the past too.
+        past = datetime(2024, 1, 1, tzinfo=UTC)
+        self._save_token(obtained_at=past, expires_at=past + timedelta(seconds=60))
+
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate({})
+        result = await tool.handler(inp, tool_context)
+
+        assert result["status"] == "needs_oauth"
+        assert result["action"] == "yadirect-agent auth login"
+        # The reason must distinguish "expired" from "absent" so
+        # the LLM can frame the message differently to the operator
+        # (a year-long-absent user gets context, a fresh install
+        # doesn't get told their token expired).
+        assert "expir" in result["reason"].lower()
+
+    @pytest.mark.asyncio
+    async def test_handler_returns_ready_when_token_valid(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # The healthy case: a valid, fresh token exists. The handler
+        # advances the state machine to ``ready_for_profile_qa`` —
+        # placeholder slice 2 will fill with the actual Q&A payload.
+        # For slice 1 we pin the contract: status name + a non-empty
+        # reason, so a chat client can render "OAuth ok, next step:
+        # collect business profile" without inspecting the schema.
+        from datetime import UTC, datetime, timedelta
+
+        now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
+        self._save_token(obtained_at=now, expires_at=now + timedelta(days=365))
+
+        tool = build_default_registry(settings).get("start_onboarding")
+        inp = tool.input_model.model_validate({})
+        result = await tool.handler(inp, tool_context)
+
+        assert result["status"] == "ready_for_profile_qa"
+        assert isinstance(result["reason"], str)
+        assert result["reason"]
 
 
 # --------------------------------------------------------------------------

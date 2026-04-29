@@ -39,11 +39,42 @@ demo-only, technically; it cannot be handed to a non-developer.
 - [x] ~~**M15.2 — `install-into-claude-desktop`**~~ — shipped, see Done.
 - [x] ~~**M15.3 — Standard OAuth flow with keyring**~~ — shipped,
       see Done.
-- [ ] **M15.4 — Conversational MCP onboarding**: ``start_onboarding()``
-      MCP-tool that triggers M15.3 if needed, collects
-      ``BusinessProfile`` via Q&A, proposes a sensible
-      ``agent_policy.yml`` based on current account state, snapshots
-      baseline (M19), runs first M15.5 health check.
+- [ ] **M15.4 — Conversational MCP onboarding** (split into slices —
+      §M15.4 in TECHNICAL_SPEC names one tool but the actual
+      contract is "five distinct phases", each test-isolatable):
+  - [ ] **slice 1 — `start_onboarding()` skeleton + OAuth state probe**:
+        read-only MCP tool, no Q&A, no policy generation, no
+        baseline. Returns a structured next-step
+        (``{status: "needs_oauth"|"ready_for_profile_qa", ...}``)
+        based on ``KeyringTokenStore`` contents. The OAuth
+        "trigger" promised in the spec is, in MCP reality, a
+        actionable next-step pointing at
+        ``yadirect-agent auth login`` — an MCP server cannot
+        legally open a browser on the operator's machine.
+  - [ ] **slice 2 — BusinessProfile Q&A**: pydantic
+        ``BusinessProfile`` schema (niche, ICP, budget, goals,
+        forbidden phrasings) + Q&A-state-machine inputs
+        (``answers: dict[str, Any]`` to ``start_onboarding``)
+        + JSONL persistence next to ``audit.jsonl``. Re-runnable
+        per spec — second call with already-saved profile asks
+        what to update, not start from scratch.
+  - [ ] **slice 3 — policy proposal**: read current account
+        state (campaigns / daily-budget sum), propose
+        ``agent_policy.yml`` (e.g. budget cap = 1.2× of current
+        sum), return the YAML as a string for the operator to
+        review + drop into ``settings.agent_policy_path``.
+  - [ ] **slice 4 — onboarding baseline snapshot**: minimal
+        single-shot snapshot of campaign budgets + statuses +
+        strategies. **Precedes M19.1**: M19.1 is per-run
+        snapshotting, this is one onboarding-time snapshot. The
+        snapshot writer itself (``services/snapshot/take.py``)
+        is shared — when M19.1 lands it reuses this; for now it
+        only has one call site.
+  - [ ] **slice 5 — first health check + result delivery**:
+        invokes ``account_health`` (M15.5, shipped) inline and
+        rolls up the four prior slices into one onboarding
+        report (``{oauth: ok, profile: saved, policy: proposed,
+        baseline: snapshotted, health: <findings>}``).
 - [ ] **M15.6 — Built-in scheduler**: ``yadirect-agent schedule
       install`` cross-platform — LaunchAgent on macOS, systemd
       timer on Linux, Task Scheduler on Windows. Daily run at 08:00
@@ -160,7 +191,22 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **M15.4 slice 1 — `start_onboarding()` skeleton + OAuth probe**
+      (§M15.4, Phase 0+1, release 0.2.0). First read-only cut:
+      pydantic ``_StartOnboardingInput`` (``extra="forbid"``,
+      no required fields), ``_make_start_onboarding_tool``
+      registered in ``_PLAIN_FACTORIES``. Handler reads
+      ``KeyringTokenStore.load()`` and returns one of:
+      ``{status: "needs_oauth", action:
+      "yadirect-agent auth login", reason: ...}`` when the slot
+      is empty / payload corrupt; ``{status: "needs_oauth",
+      action: "yadirect-agent auth login", reason: "token expired
+      or near expiry"}`` when ``token.needs_refresh()``;
+      ``{status: "ready_for_profile_qa", reason: "..."}`` when
+      a valid token exists. The "ready_for_profile_qa" branch
+      is a placeholder — slice 2 fills the actual Q&A flow
+      under the same status. **No** browser opening from MCP:
+      see §M15.4 split note above.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
