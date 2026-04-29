@@ -39,21 +39,12 @@ demo-only, technically; it cannot be handed to a non-developer.
 - [x] ~~**M15.2 — `install-into-claude-desktop`**~~ — shipped, see Done.
 - [x] ~~**M15.3 — Standard OAuth flow with keyring**~~ — shipped,
       see Done.
-- [ ] **M15.4 — Conversational MCP onboarding** (split into slices —
-      §M15.4 in TECHNICAL_SPEC names one tool but the actual
-      contract is "five distinct phases", each test-isolatable):
-  - [x] ~~**slice 1 — `start_onboarding()` skeleton + OAuth state probe**~~
-        — shipped, see Done.
-  - [x] ~~**slice 2 — BusinessProfile collection**~~ — shipped,
-        see Done.
-  - [x] ~~**slice 3 — policy proposal**~~ — shipped, see Done.
-  - [x] ~~**slice 4 — onboarding-completed audit event**~~
-        — shipped, see Done.
-  - [ ] **slice 5 — first health check + result delivery**:
-        invokes ``account_health`` (M15.5, shipped) inline and
-        rolls up the four prior slices into one onboarding
-        report (``{oauth: ok, profile: saved, policy: proposed,
-        baseline: snapshotted, health: <findings>}``).
+- [x] ~~**M15.4 — Conversational MCP onboarding**~~ — shipped
+      (5/5 slices), see Done. ``start_onboarding`` MCP tool
+      end-to-end: OAuth probe, BusinessProfile collection,
+      policy YAML proposal, ``onboarding_completed`` audit
+      event, first health-check rollup. M15.4 architecturally
+      complete.
 - [ ] **M15.6 — Built-in scheduler**: ``yadirect-agent schedule
       install`` cross-platform — LaunchAgent on macOS, systemd
       timer on Linux, Task Scheduler on Windows. Daily run at 08:00
@@ -849,6 +840,53 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M15.4 slice 5 — first health check rollup** (§M15.4,
+      Phase 0+1, release 0.2.0). **Closes M15.4 architecturally
+      (5/5 slices).** The final promise from §M15.4 spec
+      ("запускает первый health-check (M15.5) и возвращает
+      отчёт") wired into the existing
+      ``_build_policy_proposed_response``.
+
+      Two pieces:
+
+      1. New helper ``_build_health_payload(settings)`` —
+         ``async with HealthCheckService(settings)`` then
+         ``run_account_check(date_range=default_window(days=7))``.
+         No ``goal_id`` (BusinessProfile doesn't carry a Metrika
+         goal id; conversion-based rules silently skip without
+         it, leaving cost-only signals like burning_campaign).
+         ``ConfigError`` (Metrika counter unset, the
+         most-common deployment failure) caught and surfaced as
+         ``{status: "unconfigured", reason}``. Onboarding
+         succeeds; the rest of the response lands normally.
+         Healthy path returns ``{status: "ok", report:
+         <jsonable>}`` matching the existing ``account_health``
+         MCP tool envelope.
+      2. ``_build_policy_proposed_response`` adds top-level
+         ``health`` field next to ``profile`` / ``proposal`` /
+         ``account_summary``. Both fresh-save AND re-run probe
+         get it — re-runs see CURRENT health, not findings
+         frozen at original onboarding time.
+
+      Why no second status name: ``policy_proposed`` stays.
+      The ``health`` field is additive top-level (slice 4 set
+      the precedent with ``account_summary``). No contract
+      evolution for the LLM, just a richer payload.
+
+      Why we did NOT fold the health snapshot into the slice
+      4 audit event: the audit event records "when did
+      onboarding complete?", a one-shot moment. Health
+      changes with time; freezing it in a completion event
+      would mislead readers. Operators reading the audit log
+      later run ``account_health`` to see current state.
+
+      M15.4 closed: ``start_onboarding`` MCP tool now ships
+      OAuth probe → profile collection → policy proposal →
+      audit event → health rollup, end-to-end. Anna can run
+      onboarding from chat without opening Direct.
+
+      1018 tests green (+3 new); mypy strict; ruff clean.
 
 - [x] **M15.4 slice 4 — onboarding_completed audit event**
       (§M15.4, Phase 0+1, release 0.2.0). Scope reduced from
