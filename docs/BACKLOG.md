@@ -47,13 +47,8 @@ demo-only, technically; it cannot be handed to a non-developer.
   - [x] ~~**slice 2 — BusinessProfile collection**~~ — shipped,
         see Done.
   - [x] ~~**slice 3 — policy proposal**~~ — shipped, see Done.
-  - [ ] **slice 4 — onboarding baseline snapshot**: minimal
-        single-shot snapshot of campaign budgets + statuses +
-        strategies. **Precedes M19.1**: M19.1 is per-run
-        snapshotting, this is one onboarding-time snapshot. The
-        snapshot writer itself (``services/snapshot/take.py``)
-        is shared — when M19.1 lands it reuses this; for now it
-        only has one call site.
+  - [x] ~~**slice 4 — onboarding-completed audit event**~~
+        — shipped, see Done.
   - [ ] **slice 5 — first health check + result delivery**:
         invokes ``account_health`` (M15.5, shipped) inline and
         rolls up the four prior slices into one onboarding
@@ -854,6 +849,67 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M15.4 slice 4 — onboarding_completed audit event**
+      (§M15.4, Phase 0+1, release 0.2.0). Scope reduced from
+      the originally-planned full baseline-snapshot file — the
+      dedicated snapshot was infrastructure for a consumer
+      that doesn't exist (M19 rollback / time machine is months
+      out in Phase 2; today nothing in the code reads onboarding
+      baselines). Instead, one structured event in the
+      existing audit log.
+
+      Two pieces:
+
+      1. ``_build_policy_proposed_response`` extended with
+         ``account_summary`` (``{on_campaigns_count,
+         active_daily_total_rub}``) at the response top level.
+         The LLM gets a structured handle on the current state
+         alongside the proposal; the slice 4 emitter reuses
+         the figures so audit numbers match what the operator
+         was just told. ``on_campaigns`` materialised as a
+         list (counted) rather than a generator (just summed)
+         — one extra local; the cap math is unchanged.
+      2. ``_emit_onboarding_completed_event`` helper called on
+         the fresh-save path only (post-validation,
+         post-store, before returning the response). Emits one
+         ``AuditEvent(action="onboarding_completed",
+         actor="agent", resource="onboarding:business_profile")``
+         via ``JsonlSink(settings.audit_log_path)``. Payload
+         in ``result``:
+         - ``profile_summary``: ``{niche, monthly_budget_rub,
+           target_cpa_rub_set}`` — target_cpa flagged as bool
+           rather than echoed (audit records "did the operator
+           set a target?", not the value, which lives in the
+           profile file).
+         - ``account_summary``: from the response.
+         - ``proposal_summary``: ``{chosen_account_daily_budget_cap_rub}``
+           — single actionable number.
+         No ``.requested``/``.failed`` suffix on the action
+         because this is an observability signal, not a
+         mutating service operation paired with a request
+         lifecycle.
+
+      Skip paths: re-run probe (``answers=None`` + profile
+      exists) does NOT emit — it doesn't change state, and a
+      re-onboarding flood of events would just be log noise.
+      Incomplete submit does NOT emit — completion = "we have a
+      usable profile to plan against".
+
+      Tests (4 new in ``TestStartOnboardingTool``):
+      fresh-save emits one event with full envelope and
+      payload; re-run probe emits zero; incomplete submit
+      emits zero; profile overwrite emits a fresh event
+      reflecting the NEW profile (regression-pin: snapshotting
+      before-save would have written stale numbers).
+
+      Trade-off accepted: M19.1 (rollback), when it eventually
+      ships, reads full account state itself at its snapshot
+      time. Saving it today would amortise that round-trip
+      but only against a hypothetical use — pre-empting that
+      round-trip is exactly the non-negotiable being avoided.
+
+      1015 tests green (+4 new); mypy strict; ruff clean.
 
 - [x] **M15.4 slice 3 — policy proposal** (§M15.4, Phase 0+1,
       release 0.2.0). Replaces slice 2's
