@@ -920,7 +920,11 @@ cron). Каждый — точка отвала. M15 убирает все, кр
   его в OS keychain через `keyring`.
 - `.env` больше не содержит токены — `Settings` читает их из
   keychain (с fallback на env vars для CI/Docker).
-- Команды: `yadirect-agent auth login`, `auth status`, `auth revoke`.
+- Команды: `yadirect-agent auth login`, `auth status`, `auth logout`.
+  (`logout` чистит локальный keychain-slot; Yandex OAuth не
+  предоставляет публичный revocation-endpoint, так что
+  refresh-токен на стороне Yandex остаётся валидным до ручного
+  отзыва на `yandex.ru/profile/access`.)
 
 ### M15.4 Conversational onboarding via MCP
 
@@ -1163,31 +1167,44 @@ cron). Каждый — точка отвала. M15 убирает все, кр
 > **Контракт**: «никаких surprise-мутаций» — surprise начинается там,
 > где пользователь не понимает, **почему**.
 
-### M20.1 RationaleEvent
+### M20.1 Rationale model (✅ shipped)
 
-- `models/rationale.py` — `RationaleEvent`: `decision_id`,
-  `summary` (1–2 предложения для UI), `inputs` (какие данные
-  использованы, с timestamps + values), `alternatives_considered`
-  (что ещё рассматривалось и почему отвергнуто), `policy_slack`
-  (насколько мы близки к kill-switch threshold'у), `confidence`
-  (low | medium | high).
+- `models/rationale.py` — `Rationale`: `decision_id` (1:1 с
+  `OperationPlan.plan_id`), `summary` (1–2 предложения для UI),
+  `inputs` (какие данные использованы, с timestamps + values),
+  `alternatives_considered` (что ещё рассматривалось и почему
+  отвергнуто), `policy_slack` (насколько мы близки к kill-switch
+  threshold'у), `confidence` (low | medium | high).
+- В коде модель называется `Rationale` (без суффикса `Event`),
+  чтобы не путать с audit-events; storage —
+  `logs/rationale.jsonl`, индексируется по `decision_id`.
 
-### M20.2 Эмиссия
+### M20.2 Эмиссия (✅ shipped)
 
 - Каждый агент-цикл, который заканчивается мутацией, эмитит
-  `RationaleEvent` **до** соответствующего `*.requested` audit-event.
+  `Rationale` **до** соответствующего `*.requested` audit-event.
 - Эмиссия — обязательная часть `@requires_plan`-decorator'а;
-  без rationale план не персистится.
-- Хранение — рядом с audit JSONL (`logs/rationale.jsonl`),
-  индексируется по `decision_id` и `resource_id`.
+  без `rationale=` декоратор raise'ит `TypeError` на non-bypass
+  пути ДО `pipeline.review`. Apply-plan re-entry path
+  (`_applying_plan_id` set) — bypass: rationale записан в момент
+  proposal, повторно не эмитится.
+- Реализация на стороне tool inputs: каждый mutating-tool input
+  (`pause_campaigns`, `resume_campaigns`, `set_campaign_budget`,
+  `set_keyword_bids`) несёт required `reason: str`
+  (`min_length=10, max_length=500`). LLM физически не может
+  вызвать мутирующий tool без артикуляции причины — это и есть
+  механизм, который делает M20.3 («не сочиняет на лету»)
+  реализуемым.
+- Хранение — sibling JSONL `logs/rationale.jsonl`, индексируется
+  по `decision_id` и `resource_id`.
 
 ### M20.3 Read-back
 
-- CLI: `yadirect-agent rationale show <decision_id>` или
-  `rationale why --campaign=<id> --on=<date>`.
-- MCP-tool: `explain_decision(decision_id)`.
+- CLI: `yadirect-agent rationale show <decision_id>` (✅ shipped)
+  или `rationale why --campaign=<id> --on=<date>` (планируется).
+- MCP-tool: `explain_decision(decision_id)` (slice 3, в работе).
 - В чате: *«почему ты вчера снизил ставку на ключе X?»* — агент
-  достаёт RationaleEvent, **не сочиняет на лету**.
+  достаёт `Rationale`, **не сочиняет на лету**.
 
 ### M20.4 Использование в notifications (M18)
 
