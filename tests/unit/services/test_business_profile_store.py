@@ -20,9 +20,9 @@ import json
 from pathlib import Path
 
 import pytest
-from yadirect_agent.services.business_profile_store import BusinessProfileStore
 
 from yadirect_agent.models.business_profile import BusinessProfile
+from yadirect_agent.services.business_profile_store import BusinessProfileStore
 
 
 def _profile() -> BusinessProfile:
