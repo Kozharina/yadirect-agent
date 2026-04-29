@@ -17,6 +17,7 @@ import plistlib
 from pathlib import Path
 
 import pytest
+
 from yadirect_agent.services.scheduler.macos import (
     DAILY_LABEL,
     HOURLY_LABEL,
