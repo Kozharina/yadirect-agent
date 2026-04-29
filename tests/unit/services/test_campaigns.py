@@ -20,7 +20,29 @@ from yadirect_agent.models.campaigns import (
     CampaignStatus,
     DailyBudget,
 )
+from yadirect_agent.models.rationale import Rationale
 from yadirect_agent.services.campaigns import CampaignService, CampaignSummary
+
+
+def _test_rationale(
+    *, action: str = "set_campaign_budget", resource_ids: list[int] | None = None
+) -> Rationale:
+    """Minimal valid Rationale for tests focused on decision mechanics.
+
+    M20 slice 2 made ``rationale=`` hard-required on every
+    @requires_plan call site. Tests that exercise the service's
+    decisions (state filtering, validation, audit emission) — not
+    rationale shape — pass this stub. Tests that DO exercise
+    rationale content live in ``test_executor_rationale.py``.
+    """
+    return Rationale(
+        decision_id="test-placeholder",
+        action=action,
+        resource_type="campaign",
+        resource_ids=resource_ids if resource_ids is not None else [1],
+        summary="test rationale — exercising service mechanics, not rationale content.",
+    )
+
 
 # --------------------------------------------------------------------------
 # In-memory stub that replaces DirectService.
@@ -303,7 +325,7 @@ async def test_set_daily_budget_without_safety_raises_runtime_error(
 
     svc = CampaignService(settings)  # no pipeline / no store
     with pytest.raises(RuntimeError, match="SafetyPipeline"):
-        await svc.set_daily_budget(campaign_id=42, budget_rub=500)
+        await svc.set_daily_budget(campaign_id=42, budget_rub=500, rationale=_test_rationale())
 
 
 @pytest.mark.asyncio
@@ -361,7 +383,9 @@ async def test_set_daily_budget_with_safety_persists_plan_on_confirm(
     # But there is no auto_approve_budget_change knob, so the approval-tier
     # check returns confirm.
     with pytest.raises(PlanRequired) as exc:
-        await svc.set_daily_budget(campaign_id=42, budget_rub=800)
+        await svc.set_daily_budget(
+            campaign_id=42, budget_rub=800, rationale=_test_rationale(resource_ids=[42])
+        )
 
     # Plan was persisted, with the canonical action name and raw args.
     assert exc.value.plan_id
@@ -548,7 +572,9 @@ async def test_set_daily_budget_emits_actor_agent_on_full_decorator_path(
     # Agent path: the decorator returns confirm BEFORE the wrapped
     # body runs, so no ``set_campaign_budget.*`` event fires.
     with pytest.raises(PlanRequired):
-        await svc.set_daily_budget(campaign_id=42, budget_rub=800)
+        await svc.set_daily_budget(
+            campaign_id=42, budget_rub=800, rationale=_test_rationale(resource_ids=[42])
+        )
 
     # No service-level audit events on the agent confirm path.
     assert [e.action for e in sink.events if "set_campaign_budget" in e.action] == []
@@ -708,7 +734,7 @@ async def test_pause_through_decorator_passes_allow_path(
     svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
 
     # Allow path: no exception.
-    await svc.pause([1])
+    await svc.pause([1], rationale=_test_rationale(action="pause_campaigns"))
 
     assert fake_direct.suspend_calls == [[1]]
     actions = [e.action for e in sink.events]
@@ -741,7 +767,7 @@ async def test_resume_through_decorator_persists_confirm_plan(
     svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
 
     with pytest.raises(PlanRequired) as exc:
-        await svc.resume([1])
+        await svc.resume([1], rationale=_test_rationale(action="resume_campaigns"))
 
     # Plan persisted; DirectService NOT called.
     plan = store.get(exc.value.plan_id)
@@ -797,7 +823,7 @@ async def test_pause_raises_partial_action_error_on_per_item_errors(
     svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
 
     with pytest.raises(PartialActionError):
-        await svc.pause([1, 2, 3])
+        await svc.pause([1, 2, 3], rationale=_test_rationale(action="pause_campaigns"))
 
 
 @pytest.mark.asyncio
@@ -858,7 +884,7 @@ async def test_resume_raises_partial_action_error_on_per_item_errors(
     svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
 
     with pytest.raises(PartialActionError):
-        await svc.resume([1])
+        await svc.resume([1], rationale=_test_rationale(action="resume_campaigns"))
 
 
 # --------------------------------------------------------------------------
@@ -1035,7 +1061,7 @@ async def test_resume_blocks_when_campaign_missing_required_negatives(
     svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
 
     with pytest.raises(PlanRejected):
-        await svc.resume([1])
+        await svc.resume([1], rationale=_test_rationale(action="resume_campaigns"))
 
     # No mutation reached the API.
     assert fake_direct.resume_calls == []
@@ -1069,7 +1095,7 @@ async def test_resume_proceeds_when_campaign_carries_all_required_negatives(
     svc = CampaignService(settings, pipeline=pipeline, store=store, audit_sink=sink)
 
     with pytest.raises(PlanRequired):
-        await svc.resume([1])
+        await svc.resume([1], rationale=_test_rationale(action="resume_campaigns"))
 
     # Plan persisted but DirectService NOT called (confirm tier).
     assert fake_direct.resume_calls == []
