@@ -25,7 +25,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 import structlog
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from ..audit import AuditSink, JsonlSink
 from ..auth.keychain import KeyringTokenStore
@@ -33,10 +33,12 @@ from ..clients.direct import DirectService
 from ..clients.wordstat import DirectKeywordsResearch
 from ..config import Settings
 from ..exceptions import ConfigError
+from ..models.business_profile import BusinessProfile
 from ..models.health import default_window, health_report_to_jsonable_dict
 from ..models.rationale import Rationale
 from ..rollout import RolloutStateStore
 from ..services.bidding import BiddingService, BidUpdate
+from ..services.business_profile_store import BusinessProfileStore
 from ..services.campaigns import CampaignService
 from ..services.health_check import HealthCheckService
 from .executor import PlanRejected, PlanRequired
@@ -449,13 +451,20 @@ class _AccountHealthInput(BaseModel):
 class _StartOnboardingInput(BaseModel):
     model_config = _STRICT
 
-    # Slice 1 takes no fields — the first call from the LLM
-    # ("помоги настроить агента") must succeed with zero context.
-    # ``extra="forbid"`` (inherited from ``_STRICT``) still rejects
-    # unknown keys, so a future attempt to sneak in
-    # ``_force_ready=True`` cannot bypass the OAuth probe. Slice 2
-    # will add an optional ``answers: dict[str, Any]`` for the
-    # BusinessProfile Q&A state machine.
+    answers: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Operator-supplied BusinessProfile answers, when the LLM "
+            "has collected them from the conversation. ``None`` (the "
+            "default) probes state and asks the tool what to collect "
+            "next. The shape MUST match ``BusinessProfile`` — the "
+            "schema is returned in the ``ready_for_profile_qa`` "
+            "response so the LLM never has to guess. Partial / invalid "
+            "submissions land in the ``incomplete_profile`` branch "
+            "with pydantic errors; submitting again with corrections "
+            "is always safe."
+        ),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -875,47 +884,65 @@ def _make_account_health_tool(settings: Settings) -> Tool:
 
 
 def _make_start_onboarding_tool(settings: Settings) -> Tool:
-    """Conversational onboarding entry point (M15.4 slice 1).
+    """Conversational onboarding entry point (M15.4 slices 1-2).
 
-    First, minimal cut: probes OAuth state via ``KeyringTokenStore``
-    and returns a structured next-step. Slices 2-5 layer the
-    BusinessProfile Q&A, policy proposal, baseline snapshot, and
-    first health-check on top of this skeleton.
+    Probes setup state and returns a structured next-step. The
+    LLM owns the conversation; this tool is a pure function over
+    the input. No state machine in code — submitting ``answers``
+    whole when the LLM has them is the contract.
 
-    Branches:
-    - keychain empty / corrupt → ``{status: "needs_oauth", action,
-      reason}``. ``KeyringTokenStore.load`` collapses
-      missing-slot, corrupt-JSON, and validation-failure into a
-      single ``None`` return — all three map to the same operator
-      action ("re-run ``auth login``").
-    - token expired or near-expiry → ``{status: "needs_oauth",
-      action, reason}`` with distinct text so the LLM can frame
-      "your token expired" differently from "no token yet".
-      Auto-refresh on 401 is a separate backlog item (M15.3
-      follow-up); here we keep the surface explicit.
-    - valid token → ``{status: "ready_for_profile_qa", reason}``.
-      Placeholder until slice 2 fills the Q&A flow under the same
-      status name.
+    Branches (OAuth precedes everything — without API access there
+    is nothing meaningful to advance to):
 
-    The ``settings`` argument is unused in slice 1 — kept on the
-    factory signature so the slice 2 handler (which will need
-    ``settings.audit_log_path.parent`` for the BusinessProfile
-    JSONL) doesn't change the registration site.
+    1. keychain empty / corrupt →
+       ``{status: "needs_oauth", action, reason}``.
+       ``KeyringTokenStore.load`` collapses missing-slot,
+       corrupt-JSON, and validation-failure into one ``None``
+       return — all three resolve via the same operator action.
+    2. token expired / near-expiry →
+       ``{status: "needs_oauth", action, reason}`` with distinct
+       text so the LLM can frame "your token expired" differently
+       from "no token yet". Auto-refresh on 401 is a separate
+       backlog item (M15.3 follow-up).
+
+    Then the slice 2 profile branches:
+
+    3. ``answers`` is None and no profile saved →
+       ``{status: "ready_for_profile_qa", schema, collected,
+       missing}``. ``schema`` is ``BusinessProfile``'s JSON
+       Schema so the LLM can render questions without inspecting
+       our source. ``missing`` lists only required fields.
+    4. ``answers`` is None and a profile already exists →
+       ``{status: "profile_exists", profile}``. Per §M15.4 spec
+       (re-runnable: a second call with an already-saved profile
+       asks what to update, not start from scratch).
+    5. ``answers`` provided but invalid / partial →
+       ``{status: "incomplete_profile", errors}``. Pydantic's
+       error list (``loc``, ``msg``, ``type``, ``input``) is
+       returned verbatim — the LLM reads the locs and asks the
+       right next question. NOTHING gets persisted on this path
+       — a half-baked save would strand the operator at
+       policy_proposal with no usable profile.
+    6. ``answers`` provided and valid →
+       ``{status: "ready_for_policy_proposal", profile}`` after
+       atomic save. Slice 3 will replace this status with the
+       actual policy YAML proposal.
 
     Why an MCP tool returns "run this CLI command" rather than
-    triggering the OAuth flow itself: an MCP server cannot legally
-    open a browser on the operator's machine — it runs as a
-    background subprocess of Claude Desktop, with no UI ownership.
-    The ``yadirect-agent auth login`` CLI command, by contrast,
-    runs in the operator's terminal and OWNS the browser-launch
-    decision. Returning an actionable next-step keeps the chat
-    flow honest: the LLM tells the operator "please run X", and
-    the operator stays in control.
+    triggering the OAuth flow itself: an MCP server cannot
+    legally open a browser on the operator's machine — it runs
+    as a background subprocess of Claude Desktop, with no UI
+    ownership. The ``yadirect-agent auth login`` CLI command, by
+    contrast, runs in the operator's terminal and OWNS the
+    browser-launch decision.
     """
 
-    del settings  # slice 1 has no settings dependencies
+    profile_path = settings.audit_log_path.parent / "business_profile.json"
 
-    async def handler(_raw: BaseModel, ctx: ToolContext) -> Any:
+    async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
+        inp: _StartOnboardingInput = raw  # type: ignore[assignment]
+
+        # OAuth precedes everything — slice 1 logic, unchanged.
         token = KeyringTokenStore().load()
         if token is None:
             ctx.logger.info("tool.start_onboarding.needs_oauth_empty")
@@ -940,15 +967,58 @@ def _make_start_onboarding_tool(settings: Settings) -> Tool:
                     "terminal to obtain a fresh token."
                 ),
             }
-        ctx.logger.info("tool.start_onboarding.ready")
+
+        # Slice 2: profile branches.
+        store = BusinessProfileStore(profile_path)
+
+        if inp.answers is None:
+            # Probe path: surface either the schema (no profile yet)
+            # or the existing profile (re-run path).
+            existing = store.load()
+            if existing is not None:
+                ctx.logger.info("tool.start_onboarding.profile_exists")
+                return {
+                    "status": "profile_exists",
+                    "profile": existing.model_dump(mode="json"),
+                }
+            ctx.logger.info("tool.start_onboarding.ready_for_profile_qa")
+            schema = BusinessProfile.model_json_schema()
+            required = list(schema.get("required", []))
+            return {
+                "status": "ready_for_profile_qa",
+                "schema": schema,
+                "collected": {},
+                "missing": required,
+            }
+
+        # ``answers`` provided — try full validation.
+        try:
+            profile = BusinessProfile.model_validate(inp.answers)
+        except ValidationError as exc:
+            # ``mode="json"`` keeps non-JSON-friendly inputs
+            # (e.g. ``Decimal``) renderable on the wire; the
+            # ``url`` field is a pydantic docs link that
+            # pads the error envelope without helping the LLM,
+            # so we drop it.
+            errors = [
+                {k: v for k, v in err.items() if k != "url"}
+                for err in exc.errors(include_url=False)
+            ]
+            ctx.logger.info(
+                "tool.start_onboarding.incomplete_profile",
+                error_count=len(errors),
+            )
+            return {
+                "status": "incomplete_profile",
+                "errors": errors,
+            }
+
+        # Full valid profile → persist atomically and advance.
+        store.save(profile)
+        ctx.logger.info("tool.start_onboarding.profile_saved")
         return {
-            "status": "ready_for_profile_qa",
-            "reason": (
-                "OAuth token is valid. Next step: collect the "
-                "BusinessProfile (niche, ICP, budget, goals, "
-                "forbidden phrasings). Slice 2 will surface the "
-                "Q&A flow here."
-            ),
+            "status": "ready_for_policy_proposal",
+            "profile": profile.model_dump(mode="json"),
         }
 
     return Tool(
@@ -958,15 +1028,27 @@ def _make_start_onboarding_tool(settings: Settings) -> Tool:
             "says 'help me set up the agent', 'how do I get started?', "
             "'configure me', or any equivalent in Russian (the operator "
             "speaks Russian; common phrasings include 'pomogi nastroit "
-            "agenta', 'kak nachat?', 'nastroi menya'). The tool probes "
-            "setup state and returns a structured next-step. Slice 1 only "
-            "checks OAuth: returns {status: 'needs_oauth', action: "
-            "'yadirect-agent auth login', reason: ...} when the OS "
-            "keychain has no valid Yandex token (operator must run the "
-            "CLI command — an MCP server cannot open a browser on the "
-            "operator's machine), or {status: 'ready_for_profile_qa', "
-            "reason: ...} when a valid token exists. Re-runnable: calling "
-            "it again is always safe and idempotent."
+            "agenta', 'kak nachat?', 'nastroi menya'). Re-runnable; calling "
+            "it again is always safe.\n\n"
+            "OAuth precedes everything: returns {status: 'needs_oauth', "
+            "action: 'yadirect-agent auth login', reason: ...} when the OS "
+            "keychain has no valid Yandex token. The operator must run the "
+            "CLI command — an MCP server cannot open a browser on their "
+            "machine.\n\n"
+            "Profile collection contract (no state machine — YOU own the "
+            "conversation, this tool is a pure function): call without "
+            "``answers`` to probe state. Receive {status: "
+            "'ready_for_profile_qa', schema, collected, missing} when no "
+            "profile is saved (the schema describes the BusinessProfile "
+            "fields; ask the operator naturally and submit ``answers={...}`` "
+            "WHOLE when you have them); or {status: 'profile_exists', "
+            "profile} when one exists (ask 'what would you like to update?' "
+            "then submit answers with the corrections). Submitting "
+            "``answers`` with missing or invalid fields returns {status: "
+            "'incomplete_profile', errors} — read the pydantic error locs "
+            "and ask the right next question. Submitting valid full "
+            "``answers`` returns {status: 'ready_for_policy_proposal', "
+            "profile} after an atomic save."
         ),
         input_model=_StartOnboardingInput,
         is_write=False,
