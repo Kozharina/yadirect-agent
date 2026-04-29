@@ -39,21 +39,12 @@ demo-only, technically; it cannot be handed to a non-developer.
 - [x] ~~**M15.2 — `install-into-claude-desktop`**~~ — shipped, see Done.
 - [x] ~~**M15.3 — Standard OAuth flow with keyring**~~ — shipped,
       see Done.
-- [ ] **M15.4 — Conversational MCP onboarding** (split into slices —
-      §M15.4 in TECHNICAL_SPEC names one tool but the actual
-      contract is "five distinct phases", each test-isolatable):
-  - [x] ~~**slice 1 — `start_onboarding()` skeleton + OAuth state probe**~~
-        — shipped, see Done.
-  - [x] ~~**slice 2 — BusinessProfile collection**~~ — shipped,
-        see Done.
-  - [x] ~~**slice 3 — policy proposal**~~ — shipped, see Done.
-  - [x] ~~**slice 4 — onboarding-completed audit event**~~
-        — shipped, see Done.
-  - [ ] **slice 5 — first health check + result delivery**:
-        invokes ``account_health`` (M15.5, shipped) inline and
-        rolls up the four prior slices into one onboarding
-        report (``{oauth: ok, profile: saved, policy: proposed,
-        baseline: snapshotted, health: <findings>}``).
+- [x] ~~**M15.4 — Conversational MCP onboarding**~~ — shipped
+      (5/5 slices), see Done. ``start_onboarding`` MCP tool
+      end-to-end: OAuth probe, BusinessProfile collection,
+      policy YAML proposal, ``onboarding_completed`` audit
+      event, first health-check rollup. M15.4 architecturally
+      complete.
 - [ ] **M15.6 — Built-in scheduler**: ``yadirect-agent schedule
       install`` cross-platform — LaunchAgent on macOS, systemd
       timer on Linux, Task Scheduler on Windows. Daily run at 08:00
@@ -170,44 +161,7 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-- [ ] **M15.4 slice 5 — first health check rollup**
-      (§M15.4, Phase 0+1, release 0.2.0). Closes M15.4
-      architecturally. The remaining promise from §M15.4 spec
-      ("запускает первый health-check (M15.5) и возвращает
-      отчёт") wired into the existing
-      ``_build_policy_proposed_response``. After computing
-      profile + proposal + account_summary, the helper invokes
-      ``HealthCheckService.run_account_check`` (default 7-day
-      window, no goal_id) and folds the report into the
-      response under a new top-level ``health`` field. Both
-      the fresh-save path AND the re-run probe get the
-      health rollup — same shape regardless of how the
-      operator landed in onboarding.
-
-      Health payload mirrors the existing ``account_health``
-      MCP tool envelope (``{status: "ok", report: {...}}`` or
-      ``{status: "unconfigured", reason: ...}``) so the LLM
-      sees one consistent shape across two surfaces.
-
-      ``ConfigError`` (Metrika counter not set) becomes
-      ``health.status="unconfigured"``, NOT a tool failure —
-      onboarding succeeds, the health rollup degrades visibly.
-      Other surfaces of the response (profile / proposal /
-      audit event) continue to land normally.
-
-      Status name unchanged: still ``policy_proposed``. The
-      ``health`` field is additive top-level — slice 4's
-      ``account_summary`` set the precedent. No new status
-      means no contract evolution for the LLM, just a richer
-      payload.
-
-      Out of scope: re-running the audit event with health
-      summary. The slice 4 event already records the moment
-      onboarding finished; health changes as time passes,
-      so embedding a snapshot of it in a one-shot completion
-      event would be misleading. Operators reading the
-      audit log later run ``account_health`` to see current
-      state.
+*(empty — nothing checked out right now)*
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
@@ -886,6 +840,53 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M15.4 slice 5 — first health check rollup** (§M15.4,
+      Phase 0+1, release 0.2.0). **Closes M15.4 architecturally
+      (5/5 slices).** The final promise from §M15.4 spec
+      ("запускает первый health-check (M15.5) и возвращает
+      отчёт") wired into the existing
+      ``_build_policy_proposed_response``.
+
+      Two pieces:
+
+      1. New helper ``_build_health_payload(settings)`` —
+         ``async with HealthCheckService(settings)`` then
+         ``run_account_check(date_range=default_window(days=7))``.
+         No ``goal_id`` (BusinessProfile doesn't carry a Metrika
+         goal id; conversion-based rules silently skip without
+         it, leaving cost-only signals like burning_campaign).
+         ``ConfigError`` (Metrika counter unset, the
+         most-common deployment failure) caught and surfaced as
+         ``{status: "unconfigured", reason}``. Onboarding
+         succeeds; the rest of the response lands normally.
+         Healthy path returns ``{status: "ok", report:
+         <jsonable>}`` matching the existing ``account_health``
+         MCP tool envelope.
+      2. ``_build_policy_proposed_response`` adds top-level
+         ``health`` field next to ``profile`` / ``proposal`` /
+         ``account_summary``. Both fresh-save AND re-run probe
+         get it — re-runs see CURRENT health, not findings
+         frozen at original onboarding time.
+
+      Why no second status name: ``policy_proposed`` stays.
+      The ``health`` field is additive top-level (slice 4 set
+      the precedent with ``account_summary``). No contract
+      evolution for the LLM, just a richer payload.
+
+      Why we did NOT fold the health snapshot into the slice
+      4 audit event: the audit event records "when did
+      onboarding complete?", a one-shot moment. Health
+      changes with time; freezing it in a completion event
+      would mislead readers. Operators reading the audit log
+      later run ``account_health`` to see current state.
+
+      M15.4 closed: ``start_onboarding`` MCP tool now ships
+      OAuth probe → profile collection → policy proposal →
+      audit event → health rollup, end-to-end. Anna can run
+      onboarding from chat without opening Direct.
+
+      1018 tests green (+3 new); mypy strict; ruff clean.
 
 - [x] **M15.4 slice 4 — onboarding_completed audit event**
       (§M15.4, Phase 0+1, release 0.2.0). Scope reduced from
