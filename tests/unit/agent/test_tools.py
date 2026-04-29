@@ -89,10 +89,10 @@ class TestRegistry:
 
 
 class TestDefaultRegistry:
-    def test_exposes_eight_named_tools(self, settings: Settings) -> None:
+    def test_exposes_nine_named_tools(self, settings: Settings) -> None:
         reg = build_default_registry(settings)
 
-        assert len(reg) == 8
+        assert len(reg) == 9
         assert set(reg.names()) == {
             "list_campaigns",
             "pause_campaigns",
@@ -102,6 +102,7 @@ class TestDefaultRegistry:
             "set_keyword_bids",
             "validate_phrases",
             "explain_decision",
+            "account_health",
         }
 
     @pytest.mark.parametrize(
@@ -115,6 +116,7 @@ class TestDefaultRegistry:
             ("set_keyword_bids", True),
             ("validate_phrases", False),
             ("explain_decision", False),
+            ("account_health", False),
         ],
     )
     def test_write_flags_match_spec(self, settings: Settings, name: str, is_write: bool) -> None:
@@ -132,6 +134,7 @@ class TestDefaultRegistry:
             "set_keyword_bids",
             "validate_phrases",
             "explain_decision",
+            "account_health",
         ],
     )
     def test_input_models_reject_unknown_fields(self, settings: Settings, tool_name: str) -> None:
@@ -492,6 +495,183 @@ class TestExplainDecisionTool:
         result = await tool.handler(inp, tool_context)
 
         assert result["status"] == "not_found"
+
+
+# --------------------------------------------------------------------------
+# M15.5 — ``account_health`` MCP tool. Mirrors the existing CLI
+# ``yadirect-agent health`` so a Claude Desktop chat can ask "how is
+# my account?" and receive the same rule-based findings the operator
+# gets in the terminal. Read-only (``is_write=False``); reuses
+# HealthCheckService verbatim — no new readers, no new rules.
+# --------------------------------------------------------------------------
+
+
+class TestAccountHealthTool:
+    def test_input_default_days_is_seven(self, settings: Settings) -> None:
+        # Mirrors the CLI default: 7-day window ending yesterday is the
+        # operator's natural "how was last week" question. Anything
+        # tighter false-positives on partial data; anything wider is
+        # rarely the question being asked.
+        tool = build_default_registry(settings).get("account_health")
+        inp = tool.input_model.model_validate({})
+        assert inp.days == 7
+        assert inp.goal_id is None
+
+    def test_input_rejects_zero_days(self, settings: Settings) -> None:
+        # ``days=0`` is meaningless (the report would describe an empty
+        # window). The CLI uses ``min=1``; mirror at the schema layer
+        # so the LLM can't fabricate a degenerate request.
+        tool = build_default_registry(settings).get("account_health")
+        with pytest.raises(ValidationError, match="days"):
+            tool.input_model.model_validate({"days": 0})
+
+    def test_input_rejects_excessive_days(self, settings: Settings) -> None:
+        # Mirror the CLI's ``max=90``. Metrika cap on a single report
+        # query is not 90 (it's higher), but rule decisions over a
+        # quarter-plus window dilute today's signals into noise.
+        tool = build_default_registry(settings).get("account_health")
+        with pytest.raises(ValidationError, match="days"):
+            tool.input_model.model_validate({"days": 365})
+
+    def test_input_rejects_non_positive_goal_id(self, settings: Settings) -> None:
+        tool = build_default_registry(settings).get("account_health")
+        with pytest.raises(ValidationError):
+            tool.input_model.model_validate({"goal_id": 0})
+
+    def test_input_rejects_unknown_field(self, settings: Settings) -> None:
+        tool = build_default_registry(settings).get("account_health")
+        with pytest.raises(ValidationError):
+            tool.input_model.model_validate({"_evil": True})
+
+    @pytest.mark.asyncio
+    async def test_handler_returns_report_payload(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from datetime import date
+
+        from yadirect_agent.models.health import (
+            Finding,
+            HealthReport,
+            Severity,
+        )
+        from yadirect_agent.models.metrika import DateRange
+        from yadirect_agent.services.health_check import HealthCheckService
+
+        async def fake_check(
+            self: HealthCheckService,
+            *,
+            date_range: DateRange,
+            goal_id: int | None = None,
+        ) -> HealthReport:
+            return HealthReport(
+                date_range=DateRange(start=date(2026, 4, 22), end=date(2026, 4, 28)),
+                findings=[
+                    Finding(
+                        rule_id="burning_campaign",
+                        severity=Severity.HIGH,
+                        campaign_id=42,
+                        campaign_name="autumn collection",
+                        message="cost 1500 RUB, 0 conversions over 7 days",
+                        estimated_impact_rub=1500.0,
+                    ),
+                ],
+            )
+
+        monkeypatch.setattr(HealthCheckService, "run_account_check", fake_check)
+
+        tool = build_default_registry(settings).get("account_health")
+        inp = tool.input_model.model_validate({"days": 7, "goal_id": 100})
+        result = await tool.handler(inp, tool_context)
+
+        # The structured envelope the LLM consumes: ``status="ok"`` +
+        # ``report`` carrying the JSON-friendly findings.
+        assert result["status"] == "ok"
+        report = result["report"]
+        assert report["date_range"] == {"start": "2026-04-22", "end": "2026-04-28"}
+        assert len(report["findings"]) == 1
+        finding = report["findings"][0]
+        assert finding["rule_id"] == "burning_campaign"
+        # Severity surfaces as the StrEnum value, not the enum object —
+        # MCP transports JSON only.
+        assert finding["severity"] == "high"
+        assert finding["campaign_id"] == 42
+        assert finding["estimated_impact_rub"] == 1500.0
+
+    @pytest.mark.asyncio
+    async def test_handler_returns_empty_findings_for_clean_account(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The "silence is success" case — no findings means the agent
+        # honestly reports a clean window. A regression that returned
+        # ``status="not_ok"`` for an empty list would invert the
+        # contract.
+        from datetime import date
+
+        from yadirect_agent.models.health import HealthReport
+        from yadirect_agent.models.metrika import DateRange
+        from yadirect_agent.services.health_check import HealthCheckService
+
+        async def fake_check(
+            self: HealthCheckService,
+            *,
+            date_range: DateRange,
+            goal_id: int | None = None,
+        ) -> HealthReport:
+            return HealthReport(
+                date_range=DateRange(start=date(2026, 4, 22), end=date(2026, 4, 28)),
+                findings=[],
+            )
+
+        monkeypatch.setattr(HealthCheckService, "run_account_check", fake_check)
+
+        tool = build_default_registry(settings).get("account_health")
+        inp = tool.input_model.model_validate({})
+        result = await tool.handler(inp, tool_context)
+
+        assert result["status"] == "ok"
+        assert result["report"]["findings"] == []
+
+    @pytest.mark.asyncio
+    async def test_handler_returns_unconfigured_on_missing_metrika_counter(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The most common deployment-time failure: operator hasn't
+        # set ``YANDEX_METRIKA_COUNTER_ID`` yet. ReportingService raises
+        # ``ConfigError``. Surface a structured ``status="unconfigured"``
+        # rather than letting the exception bubble up — the LLM treats
+        # it as actionable data ("set this env var") instead of a
+        # generic tool error.
+        from yadirect_agent.exceptions import ConfigError
+        from yadirect_agent.models.metrika import DateRange
+        from yadirect_agent.services.health_check import HealthCheckService
+
+        async def fake_check(
+            self: HealthCheckService,
+            *,
+            date_range: DateRange,
+            goal_id: int | None = None,
+        ) -> object:
+            raise ConfigError(
+                "Metrika counter_id is not configured — set YANDEX_METRIKA_COUNTER_ID"
+            )
+
+        monkeypatch.setattr(HealthCheckService, "run_account_check", fake_check)
+
+        tool = build_default_registry(settings).get("account_health")
+        inp = tool.input_model.model_validate({})
+        result = await tool.handler(inp, tool_context)
+
+        assert result["status"] == "unconfigured"
+        assert "YANDEX_METRIKA_COUNTER_ID" in result["reason"]
 
 
 # --------------------------------------------------------------------------
