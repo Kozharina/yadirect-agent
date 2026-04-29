@@ -948,7 +948,7 @@ def _make_start_onboarding_tool(settings: Settings) -> Tool:
        from "no token yet". Auto-refresh on 401 is a separate
        backlog item (M15.3 follow-up).
 
-    Then the slice 2 profile branches:
+    Then the profile + proposal branches:
 
     3. ``answers`` is None and no profile saved →
        ``{status: "ready_for_profile_qa", schema, collected,
@@ -956,9 +956,11 @@ def _make_start_onboarding_tool(settings: Settings) -> Tool:
        Schema so the LLM can render questions without inspecting
        our source. ``missing`` lists only required fields.
     4. ``answers`` is None and a profile already exists →
-       ``{status: "profile_exists", profile}``. Per §M15.4 spec
-       (re-runnable: a second call with an already-saved profile
-       asks what to update, not start from scratch).
+       ``{status: "policy_proposed", profile, proposal}``
+       (re-run path). The slice 2 ``profile_exists`` status was
+       retired in slice 3 — re-run = "I already onboarded, help
+       me set up", and the LLM gets full state + a fresh
+       proposal in one response rather than ping-ponging.
     5. ``answers`` provided but invalid / partial →
        ``{status: "incomplete_profile", errors}``. Pydantic's
        error list (``loc``, ``msg``, ``type``, ``input``) is
@@ -967,9 +969,12 @@ def _make_start_onboarding_tool(settings: Settings) -> Tool:
        — a half-baked save would strand the operator at
        policy_proposal with no usable profile.
     6. ``answers`` provided and valid →
-       ``{status: "ready_for_policy_proposal", profile}`` after
-       atomic save. Slice 3 will replace this status with the
-       actual policy YAML proposal.
+       ``{status: "policy_proposed", profile, proposal}`` after
+       atomic save. ``proposal.policy_yaml`` is the YAML the
+       operator copy-pastes into AGENT_POLICY_PATH;
+       ``proposal.summary`` carries inputs + chosen cap so the
+       LLM can explain the number in chat without re-deriving
+       it.
 
     Why an MCP tool returns "run this CLI command" rather than
     triggering the OAuth flow itself: an MCP server cannot
