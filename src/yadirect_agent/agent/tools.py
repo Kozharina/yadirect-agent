@@ -25,7 +25,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 import structlog
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..audit import AuditSink, JsonlSink
 from ..clients.direct import DirectService
@@ -38,6 +38,7 @@ from ..services.campaigns import CampaignService
 from .executor import PlanRejected, PlanRequired
 from .pipeline import SafetyPipeline
 from .plans import PendingPlansStore
+from .rationale_store import RationaleStore
 from .safety import (
     BudgetCapPolicy,
     ConversionIntegrityPolicy,
@@ -380,6 +381,38 @@ class _ValidatePhrasesInput(BaseModel):
     )
 
 
+class _ExplainDecisionInput(BaseModel):
+    model_config = _STRICT
+
+    decision_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        description=(
+            "The decision_id of a previously-recorded rationale. Same id "
+            "as ``OperationPlan.plan_id`` for plans the agent created. "
+            "Get it from a previous tool response (``plan_id`` field on "
+            "any pending/applied/rejected response), from the operator's "
+            "``yadirect-agent rationale list`` output, or from "
+            "``yadirect-agent plans list``. NEVER fabricate one — call "
+            "this tool only when the user references a specific past "
+            "decision."
+        ),
+    )
+
+    @field_validator("decision_id")
+    @classmethod
+    def _no_whitespace(cls, v: str) -> str:
+        # Same constraint as ``Rationale.decision_id`` (M20.1 MEDIUM-2)
+        # and ``OperationPlan.plan_id`` — pinning at the tool boundary
+        # too means a query with stray whitespace fails up front
+        # rather than silently returning a misleading "not found".
+        if any(ch.isspace() for ch in v):
+            msg = "decision_id must not contain whitespace"
+            raise ValueError(msg)
+        return v
+
+
 # --------------------------------------------------------------------------
 # Standard tool factories.
 #
@@ -666,6 +699,71 @@ def _make_validate_phrases_tool(settings: Settings) -> Tool:
     )
 
 
+def _rationale_store_path(settings: Settings) -> Any:
+    """Standard location: sibling to the audit log.
+
+    Mirrors ``cli/main.py:_rationale_store`` so both call sites pick
+    up the same on-disk file (and pin a stable JSONL path the
+    operator can grep / archive). A future refactor that promotes
+    this to a ``RationaleStore.from_settings`` classmethod is
+    BACKLOG'd; one-line duplication is cheaper than a cross-module
+    helper for two callers.
+    """
+    return settings.audit_log_path.parent / "rationale.jsonl"
+
+
+def _make_explain_decision_tool(settings: Settings) -> Tool:
+    """Read-back tool for recorded rationales (M20 slice 3).
+
+    The closing slice of M20: slice 1 added the model + JSONL store,
+    slice 2 made emission hard-required so every plan has a recorded
+    rationale, slice 3 (this) exposes those records to the LLM.
+    Reading is cheap and read-only — no pipeline / store / audit_sink
+    needed. ``RationaleStore`` itself is stateless (just a Path
+    wrapper); construction is microseconds.
+    """
+
+    async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
+        inp: _ExplainDecisionInput = raw  # type: ignore[assignment]
+        store = RationaleStore(_rationale_store_path(settings))
+        rationale = store.get(inp.decision_id)
+        if rationale is None:
+            ctx.logger.info(
+                "tool.explain_decision.not_found",
+                decision_id=inp.decision_id,
+            )
+            return {"status": "not_found", "decision_id": inp.decision_id}
+        ctx.logger.info(
+            "tool.explain_decision.found",
+            decision_id=inp.decision_id,
+            action=rationale.action,
+        )
+        # ``mode="json"`` renders datetimes as ISO strings and the
+        # Confidence enum as its string value — JSON-only payloads
+        # over MCP cannot carry Python types.
+        return {"status": "found", "rationale": rationale.model_dump(mode="json")}
+
+    return Tool(
+        name="explain_decision",
+        description=(
+            "Retrieve the recorded rationale for a specific past decision — "
+            "what the agent decided, why, what data it used, what "
+            "alternatives it rejected, how confident it was, and how close "
+            "the decision was to safety thresholds. Use this when the user "
+            "asks WHY the agent did X earlier; NEVER fabricate a reason — "
+            "always pull the recorded one. Returns {status: 'found', "
+            "rationale: {decision_id, timestamp, action, resource_type, "
+            "resource_ids, summary, inputs, alternatives_considered, "
+            "policy_slack, confidence}} or {status: 'not_found', "
+            "decision_id} when the id is unknown. Pair with `plans list` "
+            "(CLI) or any previous tool response that returned a plan_id."
+        ),
+        input_model=_ExplainDecisionInput,
+        is_write=False,
+        handler=handler,
+    )
+
+
 # --------------------------------------------------------------------------
 # Public factory.
 # --------------------------------------------------------------------------
@@ -867,6 +965,7 @@ _GATED_FACTORIES: list[_GatedFactory] = [
 _PLAIN_FACTORIES: list[_PlainFactory] = [
     _make_get_keywords_tool,
     _make_validate_phrases_tool,
+    _make_explain_decision_tool,
 ]
 
 

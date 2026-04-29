@@ -53,10 +53,8 @@ demo-only, technically; it cannot be handed to a non-developer.
       see Done. Model + store + soft-optional emission +
       ``yadirect-agent rationale show/list`` CLI.
 - [x] ~~**M20 — Hard-required emission** (slice 2)~~ — shipped, see Done.
-- [ ] **M20 — `explain_decision` MCP tool** (slice 3): mirror of
-      ``rationale show`` exposed over MCP so a Claude Desktop / Code
-      session can ask "why did you do X?" and get the recorded
-      rationale verbatim, not a fresh confabulation.
+- [x] ~~**M20 — `explain_decision` MCP tool** (slice 3)~~ — shipped,
+      see Done.
 - [ ] **M20 — auto-populated `policy_slack`** (slice 4): every
       check in the safety pipeline emits its slack (distance to
       threshold) into ``CheckResult.details``; the decorator pulls
@@ -186,6 +184,16 @@ the PR merges or is abandoned.
 ## Tech debt / follow-ups
 
 Accumulated work that isn't blocking but will sting later.
+
+- [ ] **M20.3 follow-up — ``RationaleStore.from_settings``
+      classmethod**: ``settings.audit_log_path.parent /
+      "rationale.jsonl"`` is now computed in two places —
+      ``cli/main.py:_rationale_store`` and
+      ``agent/tools.py:_rationale_store_path``. One-line
+      duplication is acceptable for two callers; if a third call
+      site appears (likely with M20.4 or
+      ``rationale list`` MCP tool), promote both to
+      ``RationaleStore.from_settings(settings)`` classmethod.
 
 - [ ] **M15.3 follow-up — auto-refresh on 401 in DirectApiClient**:
       ``clients/oauth.py:refresh_access_token`` ships in M15.3 but
@@ -830,6 +838,65 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M20 — `explain_decision` MCP tool (slice 3)** (§M20.3,
+      Phase 0+1, release 0.2.0). Closes the M20 read-back loop:
+      slice 1 shipped the ``Rationale`` model + JSONL store,
+      slice 2 made emission hard-required so every plan has a
+      recorded rationale, slice 3 (this) exposes those records
+      to the LLM so a Claude Desktop chat can ask "why did you
+      do X earlier?" without the agent fabricating after-the-fact
+      reasoning.
+
+      Three pieces:
+
+      1. ``_ExplainDecisionInput`` — pydantic model with one
+         required field, ``decision_id: str`` (``min_length=1,
+         max_length=64``, no-whitespace validator mirroring
+         ``Rationale.decision_id`` from M20.1 MEDIUM-2). A query
+         with stray whitespace fails up front rather than silently
+         returning "not found".
+      2. ``_make_explain_decision_tool`` — read-only handler
+         (``is_write=False``); takes only ``settings``. Constructs
+         a fresh ``RationaleStore`` per call from
+         ``settings.audit_log_path.parent / "rationale.jsonl"``;
+         the store is stateless (just a Path wrapper), construction
+         is microseconds. Tool description tells the LLM WHEN to
+         call ("when the user asks WHY the agent did X earlier"),
+         what NOT to do ("NEVER fabricate a reason — always pull
+         the recorded one"), and how to discover ``decision_id``
+         (from previous tool responses, ``rationale list``, or
+         ``plans list``).
+      3. Output shape: ``{status: "found", rationale: {...}}``
+         with all fields rendered via ``model_dump(mode="json")``
+         so MCP's JSON-only transport carries them cleanly
+         (confidence as string, timestamp as ISO). Unknown id
+         OR missing rationale.jsonl → ``{status: "not_found",
+         decision_id}`` rather than raise; the LLM treats it as
+         actionable data ("I don't have a record of that
+         decision") instead of a tool error.
+
+      Registered in ``_PLAIN_FACTORIES`` so
+      ``build_default_registry`` exposes the tool by default.
+      ``is_write=False`` means it joins the read-only catalogue
+      in default MCP mode without operator opt-in (no
+      ``--allow-write`` needed). Tests pin: tool present in
+      both default and write modes; full dispatch through
+      ``McpServerHandle.dispatch`` with seeded
+      ``rationale.jsonl`` returns the structured found-shape
+      verbatim.
+
+      926 tests green (10 new — 3 input validation, 3 found-path
+      shape, 2 not-found paths, 1 read-only catalogue,
+      1 MCP-dispatch end-to-end); mypy strict; ruff clean.
+
+      Out of scope (deferred): slice 4 — auto-populated
+      ``policy_slack`` from ``CheckResult.details`` (cross-cutting,
+      touches all 7 KS checks). Tech-debt follow-up:
+      ``RationaleStore.from_settings`` classmethod to dedupe the
+      one-line path computation now duplicated between
+      ``cli/main.py:_rationale_store`` and
+      ``agent/tools.py:_rationale_store_path``.
 
 - [x] **M20 — Hard-required rationale emission (slice 2)**
       (§M20.2, Phase 0+1, release 0.2.0). Flips the @requires_plan
