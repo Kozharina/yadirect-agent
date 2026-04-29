@@ -16,7 +16,17 @@ import pytest
 
 from yadirect_agent.mcp.server import build_mcp_server
 
-_READ_ONLY_TOOLS = {"list_campaigns", "get_keywords", "validate_phrases"}
+_READ_ONLY_TOOLS = {
+    "list_campaigns",
+    "get_keywords",
+    "validate_phrases",
+    # ``explain_decision`` (M20 slice 3) — read-back of recorded
+    # rationales. Read-only by definition: it reads
+    # ``rationale.jsonl`` and never mutates anything, so it joins
+    # the read-only catalogue exposed in default MCP mode without
+    # operator opt-in.
+    "explain_decision",
+}
 _GATED_WRITE_TOOLS = {
     "pause_campaigns",
     "resume_campaigns",
@@ -180,3 +190,45 @@ class TestMcpToolDispatch:
         handle = build_mcp_server(settings, allow_write=False)
         with pytest.raises(ValueError, match="unknown tool"):
             await handle.dispatch("set_campaign_budget", {"campaign_id": 1, "budget_rub": 500})
+
+    @pytest.mark.asyncio
+    async def test_explain_decision_dispatches_in_read_only_mode(self, settings: Any) -> None:
+        """End-to-end through MCP for the M20 slice 3 read-back tool:
+        the operator's read-only Claude Desktop mode (the default)
+        must expose ``explain_decision`` and dispatch it correctly.
+        Without this, the closing slice of M20 — "agent retrieves
+        recorded rationale, не сочиняет на лету" — only works from
+        the CLI, not from the operator's chat.
+        """
+        from datetime import UTC, datetime
+
+        from yadirect_agent.agent.rationale_store import RationaleStore
+        from yadirect_agent.models.rationale import Confidence, Rationale
+
+        # Seed the store on the same path the tool reads from.
+        rationale_path = settings.audit_log_path.parent / "rationale.jsonl"
+        store = RationaleStore(rationale_path)
+        store.append(
+            Rationale(
+                decision_id="dec-mcp-test",
+                timestamp=datetime(2026, 4, 28, 12, 0, tzinfo=UTC),
+                action="set_campaign_budget",
+                resource_type="campaign",
+                resource_ids=[7],
+                summary="Reduced budget on campaign 7 because CPA crept above target.",
+                confidence=Confidence.MEDIUM,
+            ),
+        )
+
+        handle = build_mcp_server(settings, allow_write=False)
+
+        # Pin: tool is in the read-only catalogue (no allow_write needed).
+        names = {t.name for t in handle.tools}
+        assert "explain_decision" in names
+
+        # Pin: dispatch returns the structured found-shape verbatim.
+        result = await handle.dispatch("explain_decision", {"decision_id": "dec-mcp-test"})
+        assert result["status"] == "found"
+        assert result["rationale"]["decision_id"] == "dec-mcp-test"
+        assert result["rationale"]["confidence"] == "medium"
+        assert "Reduced budget" in result["rationale"]["summary"]
