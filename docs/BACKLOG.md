@@ -170,7 +170,44 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **M15.4 slice 5 — first health check rollup**
+      (§M15.4, Phase 0+1, release 0.2.0). Closes M15.4
+      architecturally. The remaining promise from §M15.4 spec
+      ("запускает первый health-check (M15.5) и возвращает
+      отчёт") wired into the existing
+      ``_build_policy_proposed_response``. After computing
+      profile + proposal + account_summary, the helper invokes
+      ``HealthCheckService.run_account_check`` (default 7-day
+      window, no goal_id) and folds the report into the
+      response under a new top-level ``health`` field. Both
+      the fresh-save path AND the re-run probe get the
+      health rollup — same shape regardless of how the
+      operator landed in onboarding.
+
+      Health payload mirrors the existing ``account_health``
+      MCP tool envelope (``{status: "ok", report: {...}}`` or
+      ``{status: "unconfigured", reason: ...}``) so the LLM
+      sees one consistent shape across two surfaces.
+
+      ``ConfigError`` (Metrika counter not set) becomes
+      ``health.status="unconfigured"``, NOT a tool failure —
+      onboarding succeeds, the health rollup degrades visibly.
+      Other surfaces of the response (profile / proposal /
+      audit event) continue to land normally.
+
+      Status name unchanged: still ``policy_proposed``. The
+      ``health`` field is additive top-level — slice 4's
+      ``account_summary`` set the precedent. No new status
+      means no contract evolution for the LLM, just a richer
+      payload.
+
+      Out of scope: re-running the audit event with health
+      summary. The slice 4 event already records the moment
+      onboarding finished; health changes as time passes,
+      so embedding a snapshot of it in a one-shot completion
+      event would be misleading. Operators reading the
+      audit log later run ``account_health`` to see current
+      state.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
