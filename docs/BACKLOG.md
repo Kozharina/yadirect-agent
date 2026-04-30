@@ -167,7 +167,48 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **M15.3 follow-up — auto-refresh on AuthError(code=52)
+      in DirectApiClient** (Phase 0+1 housekeeping). Closes
+      the long-standing M15.3 follow-up for Direct only;
+      Metrika (HTTP 401, different surface) follows in a
+      separate PR.
+
+      Why ``code=52`` specifically: Direct API returns app-level
+      error codes (HTTP 200 + ``error.error_code`` in body),
+      not HTTP 401. Of the four ``_AUTH_CODES`` (52, 53, 54,
+      58), only **52 — invalid/expired token** is a legitimate
+      refresh trigger. Codes 53 (header missing — our bug),
+      54 (no rights), 58 (insufficient privileges) won't be
+      fixed by a refresh; pin them as raise-as-is.
+
+      Implementation in ``DirectApiClient._do_call``:
+      1. Run inner request → if ``AuthError(code=52)`` raised
+         AND not already-refreshed-in-this-call, attempt
+         refresh.
+      2. Refresh: ``KeyringTokenStore().load()`` → if no
+         refresh_token, raise original ``AuthError`` (operator
+         must re-run ``auth login`` — refresh isn't a magic
+         re-auth).
+      3. ``refresh_access_token(refresh_token, settings)`` →
+         new ``TokenSet``.
+      4. ``KeyringTokenStore().save(new_token_set)`` —
+         persistent storage.
+      5. Mutate ``settings.yandex_direct_token`` +
+         ``yandex_metrika_token`` (single grant covers both
+         scopes; matches the Settings hydration semantics).
+      6. Update ``self._client.headers["Authorization"]`` with
+         the fresh access token.
+      7. Retry the request once with
+         ``_already_refreshed=True`` flag. A second AuthError
+         on retry surfaces as-is — no infinite loop.
+
+      Out of scope (separate PR):
+      - Metrika auto-refresh — Metrika returns HTTP 401 (not
+        app-level codes), and its retry shape differs.
+      - Refresh on the OAuth refresh-token endpoint itself —
+        Yandex OAuth has no public refresh-of-refresh
+        endpoint; the operator re-runs ``auth login`` if the
+        refresh_token itself expires.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
@@ -203,25 +244,7 @@ Accumulated work that isn't blocking but will sting later.
       ``rationale list`` MCP tool), promote both to
       ``RationaleStore.from_settings(settings)`` classmethod.
 
-- [ ] **Architectural gap — keychain TokenSet not wired into runtime
-      clients**: ``DirectApiClient._build_default_headers`` and
-      ``MetrikaService`` read tokens from
-      ``Settings.yandex_direct_token`` / ``Settings.yandex_metrika_token``
-      (env vars), NOT from the M15.3 keychain TokenSet. So
-      ``auth login`` saves a token nobody reads at runtime. The
-      env-var path is what's actually authenticating against
-      Direct / Metrika today; M15.3 is operator-facing onboarding
-      ergonomics only. Bridging is a multi-step refactor:
-      (a) the runtime clients read from a token-source abstraction;
-      (b) the abstraction has two backends — env-var (legacy) and
-      keychain (M15.3); (c) Settings carries a flag (or env-var
-      detection) to pick which one. Until this lands, all the
-      M15.3 follow-ups below that touch refresh / cross-client
-      retry semantics are blocked. Discovered while scoping
-      the auto-refresh-on-401 follow-up.
-
-- [ ] **M15.3 follow-up — auto-refresh on 401 in DirectApiClient**
-      (BLOCKED on the keychain-runtime bridge above):
+- [ ] **M15.3 follow-up — auto-refresh on 401 in DirectApiClient**:
       ``clients/oauth.py:refresh_access_token`` ships in M15.3 but
       is not wired into the retry path. Yandex access tokens last
       ~year so this is rarely-needed in practice, but a long-idle
@@ -232,6 +255,16 @@ Accumulated work that isn't blocking but will sting later.
       ``refresh_access_token`` with the stored refresh, persist the
       new TokenSet via ``KeyringTokenStore.save``, retry the
       original request once. Single retry, never an infinite loop.
+      **Note (corrected from prior session)**: I previously
+      thought this was blocked on a missing keychain ↔ runtime
+      bridge. False — ``Settings._hydrate_tokens_from_keyring``
+      (config.py model_validator) already pulls keychain
+      ``TokenSet.access_token`` into empty env-var slots, and
+      ``tests/unit/test_config_keyring_fallback.py`` pins it.
+      End-to-end auth flow already works: ``auth login`` →
+      keychain → Settings hydration → ``DirectApiClient``. The
+      refresh is purely a "what happens when the access token
+      expires?" follow-up, not a missing bridge.
 - [ ] **M15.3 follow-up — headless / Docker fallback printer**:
       the ``on_browser_open`` hook lets the orchestrator be redirected
       somewhere other than ``webbrowser.open``, but the CLI does
