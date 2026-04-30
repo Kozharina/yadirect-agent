@@ -428,8 +428,6 @@ def _seed_keychain_token(
     """
     from datetime import UTC, datetime, timedelta
 
-    from pydantic import SecretStr
-
     from yadirect_agent.auth.keychain import KeyringTokenStore
     from yadirect_agent.models.auth import TokenSet
 
@@ -459,8 +457,6 @@ async def test_auth_error_code_52_triggers_refresh_and_retry_succeeds(
     # AuthError.
     from datetime import UTC, datetime, timedelta
 
-    from pydantic import SecretStr
-
     from yadirect_agent.models.auth import TokenSet
 
     _seed_keychain_token(refresh_token="1.AQAA-good-refresh")
@@ -468,18 +464,19 @@ async def test_auth_error_code_52_triggers_refresh_and_retry_succeeds(
     refresh_calls: list[str] = []
 
     async def fake_refresh(
-        refresh_token: SecretStr,
-        settings: Settings,
+        *,
+        refresh_token: str,
+        now: object | None = None,
     ) -> TokenSet:
-        refresh_calls.append(refresh_token.get_secret_value())
-        now = datetime(2026, 4, 30, 12, 0, tzinfo=UTC)
+        refresh_calls.append(refresh_token)
+        ts = datetime(2026, 4, 30, 12, 0, tzinfo=UTC)
         return TokenSet(
             access_token=SecretStr("AQAA-access-fresh"),
             refresh_token=SecretStr("1.AQAA-refresh-rotated"),
             token_type="bearer",
             scope=("direct:api", "metrika:read", "metrika:write"),
-            obtained_at=now,
-            expires_at=now + timedelta(days=365),
+            obtained_at=ts,
+            expires_at=ts + timedelta(days=365),
         )
 
     monkeypatch.setattr("yadirect_agent.clients.base.refresh_access_token", fake_refresh)
@@ -527,25 +524,24 @@ async def test_auth_error_code_52_persists_new_tokenset_to_keychain(
     # login on every cold start after the first expiry.
     from datetime import UTC, datetime, timedelta
 
-    from pydantic import SecretStr
-
     from yadirect_agent.auth.keychain import KeyringTokenStore
     from yadirect_agent.models.auth import TokenSet
 
     _seed_keychain_token()
 
     async def fake_refresh(
-        refresh_token: SecretStr,
-        settings: Settings,
+        *,
+        refresh_token: str,
+        now: object | None = None,
     ) -> TokenSet:
-        now = datetime(2026, 4, 30, 12, 0, tzinfo=UTC)
+        ts = datetime(2026, 4, 30, 12, 0, tzinfo=UTC)
         return TokenSet(
             access_token=SecretStr("AQAA-access-NEW"),
             refresh_token=SecretStr("1.AQAA-refresh-NEW"),
             token_type="bearer",
             scope=("direct:api", "metrika:read", "metrika:write"),
-            obtained_at=now,
-            expires_at=now + timedelta(days=365),
+            obtained_at=ts,
+            expires_at=ts + timedelta(days=365),
         )
 
     monkeypatch.setattr("yadirect_agent.clients.base.refresh_access_token", fake_refresh)
@@ -584,24 +580,23 @@ async def test_auth_error_code_52_retry_uses_new_authorization_header(
     # value the wire saw.
     from datetime import UTC, datetime, timedelta
 
-    from pydantic import SecretStr
-
     from yadirect_agent.models.auth import TokenSet
 
     _seed_keychain_token()
 
     async def fake_refresh(
-        refresh_token: SecretStr,
-        settings: Settings,
+        *,
+        refresh_token: str,
+        now: object | None = None,
     ) -> TokenSet:
-        now = datetime(2026, 4, 30, 12, 0, tzinfo=UTC)
+        ts = datetime(2026, 4, 30, 12, 0, tzinfo=UTC)
         return TokenSet(
             access_token=SecretStr("AQAA-access-FRESH-FOR-RETRY"),
             refresh_token=SecretStr("1.AQAA-refresh-still-valid"),
             token_type="bearer",
             scope=("direct:api", "metrika:read", "metrika:write"),
-            obtained_at=now,
-            expires_at=now + timedelta(days=365),
+            obtained_at=ts,
+            expires_at=ts + timedelta(days=365),
         )
 
     monkeypatch.setattr("yadirect_agent.clients.base.refresh_access_token", fake_refresh)
@@ -680,8 +675,9 @@ async def test_auth_error_code_52_refresh_endpoint_failure_raises_original(
     _seed_keychain_token()
 
     async def failing_refresh(
-        refresh_token: SecretStr,
-        settings: Settings,
+        *,
+        refresh_token: str,
+        now: object | None = None,
     ) -> TokenSet:
         from yadirect_agent.exceptions import AuthError as _AuthError
 
@@ -718,8 +714,6 @@ async def test_auth_error_code_52_retry_failure_does_not_loop(
     # exactly one. An infinite loop would deadlock the agent.
     from datetime import UTC, datetime, timedelta
 
-    from pydantic import SecretStr
-
     from yadirect_agent.models.auth import TokenSet
 
     _seed_keychain_token()
@@ -727,19 +721,20 @@ async def test_auth_error_code_52_retry_failure_does_not_loop(
     refresh_call_count = 0
 
     async def counted_refresh(
-        refresh_token: SecretStr,
-        settings: Settings,
+        *,
+        refresh_token: str,
+        now: object | None = None,
     ) -> TokenSet:
         nonlocal refresh_call_count
         refresh_call_count += 1
-        now = datetime(2026, 4, 30, 12, 0, tzinfo=UTC)
+        ts = datetime(2026, 4, 30, 12, 0, tzinfo=UTC)
         return TokenSet(
             access_token=SecretStr("AQAA-fresh"),
             refresh_token=SecretStr("1.AQAA-refresh"),
             token_type="bearer",
             scope=("direct:api", "metrika:read", "metrika:write"),
-            obtained_at=now,
-            expires_at=now + timedelta(days=365),
+            obtained_at=ts,
+            expires_at=ts + timedelta(days=365),
         )
 
     monkeypatch.setattr("yadirect_agent.clients.base.refresh_access_token", counted_refresh)
@@ -781,8 +776,9 @@ async def test_other_auth_codes_do_not_trigger_refresh(
     refresh_called = False
 
     async def spy_refresh(
-        refresh_token: SecretStr,
-        settings: Settings,
+        *,
+        refresh_token: str,
+        now: object | None = None,
     ) -> TokenSet:
         nonlocal refresh_called
         refresh_called = True
