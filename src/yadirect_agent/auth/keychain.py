@@ -83,14 +83,27 @@ class KeyringTokenStore:
     def load(self) -> TokenSet | None:
         """Read the TokenSet from the keychain, or ``None`` if absent / unusable.
 
-        "Unusable" covers three cases collapsed into one return path
-        — missing slot, corrupt JSON, and validation failure — all of
-        which point to the same operator action: re-run
-        ``yadirect-agent auth login``. Surfacing them as three
-        different exceptions would force every caller to handle
-        the same recovery path three times.
+        "Unusable" covers four cases collapsed into one return
+        path — missing slot, corrupt JSON, validation failure,
+        and **no usable backend at all** (CI Linux without
+        keyrings.alt, Docker without dbus, ``keyrings.alt``
+        absent on a stripped-down server) — all of which point
+        to the same operator action: re-run
+        ``yadirect-agent auth login`` (or, for the no-backend
+        case, fall back to env-var tokens). Surfacing them as
+        four different exceptions would force every caller to
+        handle the same recovery path four times.
+
+        ``keyring.errors.KeyringError`` is the base class for
+        all keyring-side failures (NoKeyringError, KeyringLocked,
+        InitError); catching the base keeps us forward-compatible
+        with future keyring versions.
         """
-        raw = keyring.get_password(KEYRING_SERVICE_NAME, KEYRING_USERNAME)
+        try:
+            raw = keyring.get_password(KEYRING_SERVICE_NAME, KEYRING_USERNAME)
+        except keyring.errors.KeyringError:
+            self._logger.warning("keychain.backend_unavailable")
+            return None
         if raw is None:
             return None
         try:

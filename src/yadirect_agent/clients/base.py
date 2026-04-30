@@ -243,7 +243,16 @@ class DirectApiClient:
         from ..auth.keychain import KeyringTokenStore
 
         store = KeyringTokenStore()
-        token = store.load()
+        try:
+            token = store.load()
+        except Exception as exc:
+            # ``KeyringTokenStore.load`` is itself defensive (catches
+            # KeyringError, JSONDecodeError, ValidationError) but a
+            # future change might surface a new exception class. The
+            # outer caller will raise the original AuthError, so any
+            # refresh-path failure is logged and swallowed here.
+            log.warning("api.auth_refresh.skip_keychain_load_failed", error=str(exc))
+            return False
         if token is None:
             log.info("api.auth_refresh.skip_no_keychain_token")
             return False
