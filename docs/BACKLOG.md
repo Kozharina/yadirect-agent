@@ -49,7 +49,7 @@ demo-only, technically; it cannot be handed to a non-developer.
       slices because LaunchAgent / systemd timer / Task
       Scheduler have nothing in common but the high-level
       concept):
-  - [ ] **slice 1 — macOS LaunchAgent**: see In progress.
+  - [x] ~~**slice 1 — macOS LaunchAgent**~~ — shipped, see Done.
   - [ ] **slice 2 — Linux systemd --user timer**: timer +
         service unit pair, ``systemctl --user`` lifecycle.
         Mirror the slice 1 contract (install / status / remove);
@@ -167,50 +167,7 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-- [ ] **M15.6 slice 1 — macOS LaunchAgent scheduler**
-      (§M15.6, Phase 0+1, release 0.2.0). Cross-platform
-      scheduler reduced to per-platform slices because
-      ``LaunchAgent`` / ``systemd timer`` / ``Task Scheduler``
-      have nothing in common but the high-level concept; one
-      mega-PR would have given each platform 33% of the test
-      coverage and 33% of the review attention.
-
-      Slice 1 ships:
-      1. ``services/scheduler/__init__.py`` — common ``ScheduleSpec``
-         (daily 08:00 + hourly health) + ``Platform`` enum.
-         Pure dataclass; no I/O.
-      2. ``services/scheduler/macos.py`` — generates
-         ``com.yadirect-agent.daily.plist`` +
-         ``com.yadirect-agent.hourly-health.plist``,
-         installs to ``~/Library/LaunchAgents/`` (atomic via
-         tempfile + ``os.replace``), invokes
-         ``launchctl load -w`` to activate. ``status`` reads
-         the plist files back; ``remove`` ``launchctl unload``s
-         and deletes them. Uses ``load -w`` rather than
-         ``bootstrap`` for cross-version compatibility (Catalina
-         → Sequoia). All ``launchctl`` invocations go through
-         a ``run_launchctl`` indirection so tests can monkeypatch.
-      3. ``cli/schedule.py`` — operator-facing rendering
-         (Russian per language convention) for status text +
-         install summary.
-      4. ``schedule install / status / remove`` CLI commands
-         in ``cli/main.py`` as a typer sub-app. ``--platform``
-         defaults to ``auto`` (detected from ``sys.platform``);
-         Linux/Windows return a clear "shipping in slice
-         2/3" message rather than crashing.
-
-      Out of scope for slice 1:
-      - Linux ``systemd --user`` timer (slice 2).
-      - Windows Task Scheduler (slice 3).
-      - ``schedule pause`` (Apple's docs are split between
-        ``launchctl disable`` and the ``Disabled`` plist key;
-        ship after slice 2/3 settle the cross-platform contract).
-
-      Trade-off accepted: Anna on macOS gets full automation
-      this slice; Linux / Windows operators see a visible
-      "not yet supported" message. Better than a half-done
-      cross-platform release where one platform silently
-      no-ops.
+*(empty — nothing checked out right now)*
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
@@ -889,6 +846,79 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M15.6 slice 1 — macOS LaunchAgent scheduler**
+      (§M15.6, Phase 0+1, release 0.2.0). First per-platform
+      slice of the cross-platform built-in scheduler. Anna on
+      Mac gets daily + hourly automated runs without touching
+      cron / launchctl directly.
+
+      Three pieces:
+
+      1. ``services/scheduler/__init__.py`` — package marker;
+         per-platform implementations live in submodules (slice
+         1: macOS; slices 2-3: Linux / Windows).
+      2. ``services/scheduler/macos.py`` — full lifecycle.
+         Pure functions ``generate_daily_plist`` /
+         ``generate_hourly_plist`` return XML bytes via
+         ``plistlib.dumps``. ``MacOSScheduler.install`` writes
+         both plists atomically (tempfile + ``os.replace`` in
+         the target's parent dir) and calls
+         ``launchctl load -w`` per plist. ``status`` reads
+         on-disk plists (no subprocess); ``installed=True``
+         requires BOTH plists present (a half-installed state
+         from a previous-version typo reads as
+         ``installed=False`` so the operator reinstalls
+         cleanly). ``remove`` is idempotent: missing plists
+         are no-op, ``launchctl unload`` failure (operator
+         already manually unloaded) does NOT block file
+         deletion. All ``launchctl`` calls go through a
+         ``run_launchctl`` indirection so tests replace it
+         with an in-memory spy — no real subprocess fires.
+         ``RunAtLoad=False`` on both plists so installing
+         doesn't fire the agent immediately or on every
+         reboot.
+      3. ``schedule install / status / remove`` typer subapp
+         in ``cli/main.py``. ``--platform=auto`` (default)
+         reads ``sys.platform``; Linux + Windows + unknown
+         platforms exit 2 with a clear "shipping in slice
+         2/3" message. ``--executable`` override on
+         ``install``; default is ``shutil.which("yadirect-agent")``,
+         missing-on-PATH gets a clear "activate your venv or
+         pass --executable" exit-2 message rather than a
+         cryptic launchctl error post-install.
+
+      Why ``yadirect-agent health`` and not
+      ``yadirect-agent run``: ``run`` requires a task argument
+      (human-driven). ``health`` is read-only, exits 0/1
+      (cron-friendly), and emits JSON. When autonomous-mode
+      lands in Phase 3, operators re-run ``schedule install``
+      to update both plists.
+
+      Why ``launchctl load -w`` (not ``bootstrap``):
+      ``bootstrap`` (Big Sur+ idiom) requires uid-bound
+      domain identifier + separate ``enable``. ``load -w``
+      works on every macOS version from El Capitan forward,
+      and the matching ``unload`` at remove-time clears
+      state cleanly.
+
+      Tests (23 new — 12 service + 11 CLI): plist
+      round-trip through ``plistlib.loads`` (the same parser
+      ``launchd`` uses), Label pinning, atomicity (spy on
+      ``os.replace``), missing-executable handling,
+      platform-dispatch boundary conditions. ``launchctl``
+      replaced by in-memory spy throughout — no real
+      subprocess fires.
+
+      1041 tests green; mypy strict; ruff clean.
+
+      Out of scope:
+      - Linux ``systemd --user`` timer (slice 2).
+      - Windows Task Scheduler (slice 3).
+      - ``schedule pause`` (Apple's docs are split between
+        ``launchctl disable`` and the ``Disabled`` plist
+        key; ship after slice 2/3 settle the cross-platform
+        contract).
 
 - [x] **M15.4 slice 5 — first health check rollup** (§M15.4,
       Phase 0+1, release 0.2.0). **Closes M15.4 architecturally
