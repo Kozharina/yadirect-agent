@@ -162,6 +162,74 @@ class TestAuthLogin:
         assert result.exit_code == 2, result.output
         assert "invalid_grant" in result.output
 
+    def test_login_default_timeout_passed_when_flag_omitted(
+        self,
+        runner: CliRunner,
+        memory_keyring: dict[tuple[str, str], str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Without the flag, the CLI must still pass the
+        # M15.3 default (300s) into ``perform_login`` — so a
+        # regression that broke 300-second login surfaces here
+        # rather than at the operator's first slow-2FA flow.
+        from yadirect_agent.auth.login_flow import DEFAULT_LOGIN_TIMEOUT_S
+
+        captured: dict[str, object] = {}
+
+        async def fake_perform_login(**kwargs: object) -> TokenSet:
+            captured.update(kwargs)
+            token = _tokenset()
+            KeyringTokenStore().save(token)
+            return token
+
+        monkeypatch.setattr("yadirect_agent.cli.main.perform_login", fake_perform_login)
+
+        result = runner.invoke(app, ["auth", "login"])
+
+        assert result.exit_code == 0, result.output
+        assert captured.get("timeout_seconds") == DEFAULT_LOGIN_TIMEOUT_S
+
+    def test_login_timeout_seconds_flag_overrides_default(
+        self,
+        runner: CliRunner,
+        memory_keyring: dict[tuple[str, str], str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Operators with slow 2FA (corporate phones, email-based
+        # OTP, international roaming) blow past the 300-second
+        # default. The flag is the operator-facing knob the
+        # backlog item promised.
+        captured: dict[str, object] = {}
+
+        async def fake_perform_login(**kwargs: object) -> TokenSet:
+            captured.update(kwargs)
+            token = _tokenset()
+            KeyringTokenStore().save(token)
+            return token
+
+        monkeypatch.setattr("yadirect_agent.cli.main.perform_login", fake_perform_login)
+
+        result = runner.invoke(app, ["auth", "login", "--timeout-seconds", "900"])
+
+        assert result.exit_code == 0, result.output
+        # Pin the precise float forwarded — typer should coerce
+        # the CLI string to the right numeric type.
+        assert captured.get("timeout_seconds") == 900.0
+
+    def test_login_timeout_seconds_rejects_non_positive(
+        self,
+        runner: CliRunner,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # ``0`` and negative values are operator typos, not
+        # legitimate "no timeout" semantics. typer's ``min=1``
+        # constraint refuses with exit 2 (typer's
+        # bad-parameter convention) before any login attempt
+        # fires.
+        for bad_value in ("0", "-30"):
+            result = runner.invoke(app, ["auth", "login", "--timeout-seconds", bad_value])
+            assert result.exit_code == 2, (bad_value, result.output)
+
 
 class TestAuthStatus:
     def test_status_when_not_logged_in_exits_one(

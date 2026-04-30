@@ -52,7 +52,7 @@ from ..agent.tools import build_default_registry, build_safety_pair
 from ..audit import AuditEvent, AuditSink, audit_action
 from ..auth.callback_server import OAuthCallbackError
 from ..auth.keychain import KeyringTokenStore
-from ..auth.login_flow import perform_login
+from ..auth.login_flow import DEFAULT_LOGIN_TIMEOUT_S, perform_login
 from ..config import Settings, get_settings
 from ..exceptions import AuthError
 from ..logging import configure_logging
@@ -356,7 +356,22 @@ app.add_typer(auth_app, name="auth")
 
 
 @auth_app.command("login")
-def auth_login_cmd() -> None:
+def auth_login_cmd(
+    timeout_seconds: Annotated[
+        float,
+        typer.Option(
+            "--timeout-seconds",
+            min=1,
+            help=(
+                "How long to wait for the OAuth callback before giving up. "
+                "Default 300 (5 minutes). Raise this for slow 2FA delivery "
+                "(corporate phones, email-based OTP, international roaming) "
+                "where the consent page may sit on the operator's screen "
+                "longer than 5 minutes."
+            ),
+        ),
+    ] = DEFAULT_LOGIN_TIMEOUT_S,
+) -> None:
     """Run the Yandex OAuth PKCE flow and persist the token to the OS keychain.
 
     Opens the operator's default browser to the Yandex consent
@@ -372,7 +387,7 @@ def auth_login_cmd() -> None:
     _out.print(LOGIN_OPENING_BROWSER_HINT)
     _out.print(LOGIN_BROWSER_FALLBACK_HINT)
     try:
-        token = asyncio.run(perform_login())
+        token = asyncio.run(perform_login(timeout_seconds=timeout_seconds))
     except OAuthCallbackError as exc:
         _err.print(f"[red]{LOGIN_OAUTH_ERROR_PREFIX}:[/red] {_rich_escape(str(exc))}")
         raise typer.Exit(code=2) from exc
