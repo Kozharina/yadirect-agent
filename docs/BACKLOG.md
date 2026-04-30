@@ -167,21 +167,7 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-- [ ] **M15.3 follow-up — `auth login --timeout-seconds` flag**
-      (Phase 0+1, release 0.2.0). Smallest M15.3 follow-up:
-      operator-facing CLI flag wired through to
-      ``perform_login(timeout_seconds=...)``. Today the default
-      300s is hard-coded in ``DEFAULT_LOGIN_TIMEOUT_S``; a slow
-      2FA / password-recovery flow can blow past that, leaving
-      the operator with a timeout error and no knob.
-
-      Closes the code-reviewer NIT in the slice 1 backlog list.
-      Real consumer today: anyone whose OTP delivery is slow
-      (corporate phones, email-based 2FA, international roaming).
-
-      No behaviour change at default — a regression that broke
-      300-second login would surface in the existing test suite
-      first.
+*(empty — nothing checked out right now)*
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
@@ -217,7 +203,25 @@ Accumulated work that isn't blocking but will sting later.
       ``rationale list`` MCP tool), promote both to
       ``RationaleStore.from_settings(settings)`` classmethod.
 
-- [ ] **M15.3 follow-up — auto-refresh on 401 in DirectApiClient**:
+- [ ] **Architectural gap — keychain TokenSet not wired into runtime
+      clients**: ``DirectApiClient._build_default_headers`` and
+      ``MetrikaService`` read tokens from
+      ``Settings.yandex_direct_token`` / ``Settings.yandex_metrika_token``
+      (env vars), NOT from the M15.3 keychain TokenSet. So
+      ``auth login`` saves a token nobody reads at runtime. The
+      env-var path is what's actually authenticating against
+      Direct / Metrika today; M15.3 is operator-facing onboarding
+      ergonomics only. Bridging is a multi-step refactor:
+      (a) the runtime clients read from a token-source abstraction;
+      (b) the abstraction has two backends — env-var (legacy) and
+      keychain (M15.3); (c) Settings carries a flag (or env-var
+      detection) to pick which one. Until this lands, all the
+      M15.3 follow-ups below that touch refresh / cross-client
+      retry semantics are blocked. Discovered while scoping
+      the auto-refresh-on-401 follow-up.
+
+- [ ] **M15.3 follow-up — auto-refresh on 401 in DirectApiClient**
+      (BLOCKED on the keychain-runtime bridge above):
       ``clients/oauth.py:refresh_access_token`` ships in M15.3 but
       is not wired into the retry path. Yandex access tokens last
       ~year so this is rarely-needed in practice, but a long-idle
@@ -853,6 +857,32 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M15.3 follow-up — `auth login --timeout-seconds` flag**
+      (M15.3 code-reviewer NIT, Phase 0+1 housekeeping).
+      Operator-facing knob wired through to
+      ``perform_login(timeout_seconds=...)``. Default unchanged
+      (300s); the flag lets operators on slow 2FA delivery
+      raise the bound. ``min=1`` constraint at the typer
+      boundary rejects 0 / negatives before any login attempt.
+
+      Real consumer today: corporate-phone OTP, email-based
+      2FA, international-roaming OTP delivery — all routinely
+      blow past 5 minutes.
+
+      Tests pin (a) default forwarded when omitted, (b)
+      override forwarded with float coercion, (c) non-positive
+      rejected at CLI boundary.
+
+      1044 tests green; mypy strict; ruff clean.
+
+      Side note: I considered the bigger M15.3 follow-up
+      (auto-refresh on 401) and discovered ``DirectApiClient``
+      / ``MetrikaService`` read tokens from ``Settings`` env
+      vars, NOT from the M15.3 keychain TokenSet — disconnected
+      auth pathways that need a separate architectural pass to
+      bridge before refresh-on-401 makes sense. Recorded as a
+      tech-debt item below.
 
 - [x] **M15.6 slice 1 — macOS LaunchAgent scheduler**
       (§M15.6, Phase 0+1, release 0.2.0). First per-platform
