@@ -167,7 +167,21 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **M15.3 follow-up — `auth login --timeout-seconds` flag**
+      (Phase 0+1, release 0.2.0). Smallest M15.3 follow-up:
+      operator-facing CLI flag wired through to
+      ``perform_login(timeout_seconds=...)``. Today the default
+      300s is hard-coded in ``DEFAULT_LOGIN_TIMEOUT_S``; a slow
+      2FA / password-recovery flow can blow past that, leaving
+      the operator with a timeout error and no knob.
+
+      Closes the code-reviewer NIT in the slice 1 backlog list.
+      Real consumer today: anyone whose OTP delivery is slow
+      (corporate phones, email-based 2FA, international roaming).
+
+      No behaviour change at default — a regression that broke
+      300-second login would surface in the existing test suite
+      first.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
@@ -297,13 +311,6 @@ Accumulated work that isn't blocking but will sting later.
       before M15.4 builds on top of ``perform_login``; not blocking
       M15.3 because the docstring explicitly calls out the test-vs-
       production split.
-
-- [ ] **M15.3 follow-up — ``auth login --timeout`` flag**
-      (code-reviewer NIT): ``DEFAULT_LOGIN_TIMEOUT_S = 300`` is fine
-      for most operators, but a slow 2FA or password-recovery flow
-      can blow past 5 minutes. Today the only escape is restarting
-      the command. Add ``--timeout-seconds`` to ``auth login`` so
-      operators on slow flows have a knob.
 
 - [ ] **M15.3 follow-up — behavioural test names**
       (code-reviewer NIT, REVIEW.md tier 4 §21): a few test names
