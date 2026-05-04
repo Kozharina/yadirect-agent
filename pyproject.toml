@@ -69,7 +69,7 @@ dev = [
     "pytest-randomly>=3.15",        # shuffles test order each run; catches hidden deps
     "pytest-timeout>=2.3",          # hard per-test timeout so hangs fail fast
     "respx>=0.21",                  # httpx mocking
-    "ruff==0.15.11",                # pinned exact — see docs/TESTING.md on version skew
+    "ruff==0.15.12",                # pinned exact — see docs/TESTING.md on version skew
     "mypy>=1.11",
     "pre-commit>=4.0",              # git hooks for ruff/mypy/hygiene
     "types-python-slugify",
