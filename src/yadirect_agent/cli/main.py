@@ -60,6 +60,8 @@ from ..models.health import default_window
 from ..rollout import RolloutState, RolloutStateStore
 from ..services.campaigns import CampaignService, CampaignSummary
 from ..services.health_check import HealthCheckService
+from ..services.scheduler.linux import LinuxScheduler
+from ..services.scheduler.linux import ScheduleStatus as LinuxScheduleStatus
 from ..services.scheduler.macos import MacOSScheduler, ScheduleStatus
 from .auth import (
     LOGIN_BROWSER_FALLBACK_HINT,
@@ -1314,28 +1316,23 @@ async def _run_mcp_stdio(handle: Any) -> None:
 schedule_app = typer.Typer(
     name="schedule",
     help=(
-        "Manage the built-in scheduler. Slice 1 ships macOS LaunchAgent; "
-        "Linux + Windows are shipping in slices 2-3."
+        "Manage the built-in scheduler. Slices 1+2 ship macOS LaunchAgent + "
+        "Linux systemd --user timers; Windows is shipping in slice 3."
     ),
     no_args_is_help=True,
 )
 app.add_typer(schedule_app, name="schedule")
 
 # Module-level constants for the message strings — kept here rather than
-# in cli/schedule.py because the count is small (4 strings) and inlining
+# in cli/schedule.py because the count is small (3 strings) and inlining
 # makes the platform-dispatch logic locally readable. If the count grows
 # past ~10, promote to cli/schedule.py.
-_SCHEDULE_LINUX_PENDING = (
-    "Linux scheduler (systemd --user timer) is shipping in slice 2 of M15.6. "
-    "Run ``yadirect-agent health`` from cron in the meantime."
-)
 _SCHEDULE_WINDOWS_PENDING = (
     "Windows scheduler (Task Scheduler) is shipping in slice 3 of M15.6. "
     "Run ``yadirect-agent health`` from a scheduled .bat in the meantime."
 )
 _SCHEDULE_UNSUPPORTED_PLATFORM = (
-    "Unsupported platform: {platform!r}. Supported: macos. "
-    "Linux + Windows are shipping in slices 2-3."
+    "Unsupported platform: {platform!r}. Supported: macos, linux. Windows is shipping in slice 3."
 )
 _SCHEDULE_EXECUTABLE_MISSING = (
     "Cannot find ``yadirect-agent`` on PATH. The scheduler needs an "
@@ -1398,6 +1395,31 @@ def _resolve_macos_paths() -> tuple[Path, Path]:
     )
 
 
+def _resolve_linux_paths() -> tuple[Path, Path]:
+    """Standard XDG locations for systemd user units + state logs.
+
+    - ``$XDG_CONFIG_HOME/systemd/user`` (default ``~/.config/systemd/user``)
+      — where ``systemctl --user`` looks up unit files.
+    - ``$XDG_STATE_HOME/yadirect-agent/logs`` (default
+      ``~/.local/state/yadirect-agent/logs``) — where systemd
+      ``StandardOutput=append:...`` writes the daily/hourly logs.
+
+    State (``$XDG_STATE_HOME``, not ``$XDG_DATA_HOME``) is the
+    correct XDG bucket for "log files the operator may want to
+    tail but the application can regenerate" — matches the
+    spec author's own recommendation.
+    """
+    import os as _os  # local import keeps top-of-file imports stable
+
+    home = Path.home()
+    config_home = Path(_os.environ.get("XDG_CONFIG_HOME") or (home / ".config"))
+    state_home = Path(_os.environ.get("XDG_STATE_HOME") or (home / ".local" / "state"))
+    return (
+        config_home / "systemd" / "user",
+        state_home / "yadirect-agent" / "logs",
+    )
+
+
 @schedule_app.command("install")
 def schedule_install_cmd(
     platform: Annotated[
@@ -1430,17 +1452,37 @@ def schedule_install_cmd(
     """
     target = _detect_platform_for_scheduler(platform)
 
-    if target == "linux":
-        _err.print(f"[yellow]{_SCHEDULE_LINUX_PENDING}[/yellow]")
-        raise typer.Exit(code=2)
     if target == "windows":
         _err.print(f"[yellow]{_SCHEDULE_WINDOWS_PENDING}[/yellow]")
         raise typer.Exit(code=2)
-    if target != "macos":
+    if target not in ("macos", "linux"):
         _err.print(f"[red]{_SCHEDULE_UNSUPPORTED_PLATFORM.format(platform=target)}[/red]")
         raise typer.Exit(code=2)
 
     exec_path = _resolve_yadirect_executable(executable)
+
+    if target == "linux":
+        units_dir, log_dir = _resolve_linux_paths()
+        linux_scheduler = LinuxScheduler(
+            units_dir=units_dir,
+            log_dir=log_dir,
+            executable=exec_path,
+        )
+        linux_result = linux_scheduler.install()
+        _out.print("[green]Scheduler installed.[/green]")
+        _out.print(f"  daily service: {linux_result.daily_service_path}")
+        _out.print(f"  daily timer:   {linux_result.daily_timer_path}")
+        _out.print(f"  hourly service:{linux_result.hourly_service_path}")
+        _out.print(f"  hourly timer:  {linux_result.hourly_timer_path}")
+        _out.print(f"  log dir:       {linux_result.log_dir}")
+        _out.print(
+            "[dim]The agent will run health checks daily at 08:00 and "
+            "every hour. Tail the log dir to follow runs, or use "
+            "``journalctl --user -u yadirect-agent-daily`` for systemd's "
+            "view.[/dim]"
+        )
+        return
+
     launchagents_dir, log_dir = _resolve_macos_paths()
 
     scheduler = MacOSScheduler(
@@ -1472,15 +1514,37 @@ def schedule_status_cmd(
 ) -> None:
     """Report whether the scheduled jobs are installed."""
     target = _detect_platform_for_scheduler(platform)
-    if target == "linux":
-        _err.print(f"[yellow]{_SCHEDULE_LINUX_PENDING}[/yellow]")
-        raise typer.Exit(code=2)
     if target == "windows":
         _err.print(f"[yellow]{_SCHEDULE_WINDOWS_PENDING}[/yellow]")
         raise typer.Exit(code=2)
-    if target != "macos":
+    if target not in ("macos", "linux"):
         _err.print(f"[red]{_SCHEDULE_UNSUPPORTED_PLATFORM.format(platform=target)}[/red]")
         raise typer.Exit(code=2)
+
+    if target == "linux":
+        units_dir, log_dir = _resolve_linux_paths()
+        # Same placeholder-executable trick as macos: status is read-only
+        # and doesn't actually invoke the executable, but the constructor
+        # validates absoluteness for symmetry with install.
+        linux_scheduler = LinuxScheduler(
+            units_dir=units_dir,
+            log_dir=log_dir,
+            executable="/usr/local/bin/yadirect-agent",
+        )
+        linux_status: LinuxScheduleStatus = linux_scheduler.status()
+        if linux_status.installed:
+            _out.print("[green]Scheduler installed.[/green]")
+            _out.print(f"  daily service: {linux_status.daily_service_path}")
+            _out.print(f"  daily timer:   {linux_status.daily_timer_path}")
+            _out.print(f"  hourly service:{linux_status.hourly_service_path}")
+            _out.print(f"  hourly timer:  {linux_status.hourly_timer_path}")
+        else:
+            _out.print("[yellow]Scheduler not installed.[/yellow]")
+            _out.print(
+                "[dim]Run ``yadirect-agent schedule install`` to set up the "
+                "daily + hourly timers.[/dim]"
+            )
+        return
 
     launchagents_dir, log_dir = _resolve_macos_paths()
     # ``status`` does NOT call launchctl — reads on-disk plists. The
@@ -1523,15 +1587,23 @@ def schedule_remove_cmd(
     about leftover state.
     """
     target = _detect_platform_for_scheduler(platform)
-    if target == "linux":
-        _err.print(f"[yellow]{_SCHEDULE_LINUX_PENDING}[/yellow]")
-        raise typer.Exit(code=2)
     if target == "windows":
         _err.print(f"[yellow]{_SCHEDULE_WINDOWS_PENDING}[/yellow]")
         raise typer.Exit(code=2)
-    if target != "macos":
+    if target not in ("macos", "linux"):
         _err.print(f"[red]{_SCHEDULE_UNSUPPORTED_PLATFORM.format(platform=target)}[/red]")
         raise typer.Exit(code=2)
+
+    if target == "linux":
+        units_dir, log_dir = _resolve_linux_paths()
+        linux_scheduler = LinuxScheduler(
+            units_dir=units_dir,
+            log_dir=log_dir,
+            executable="/usr/local/bin/yadirect-agent",
+        )
+        linux_scheduler.remove()
+        _out.print("[green]Scheduler removed.[/green]")
+        return
 
     launchagents_dir, log_dir = _resolve_macos_paths()
     scheduler = MacOSScheduler(
