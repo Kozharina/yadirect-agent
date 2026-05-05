@@ -479,7 +479,7 @@ async def test_auth_error_code_52_triggers_refresh_and_retry_succeeds(
             expires_at=ts + timedelta(days=365),
         )
 
-    monkeypatch.setattr("yadirect_agent.clients.base.refresh_access_token", fake_refresh)
+    monkeypatch.setattr("yadirect_agent.clients._token_refresh.refresh_access_token", fake_refresh)
 
     # First call: 200 + AuthError(code=52). Second call: clean 200.
     route = respx_mock.post("https://api-sandbox.direct.yandex.com/json/v5/campaigns").mock(
@@ -544,7 +544,7 @@ async def test_auth_error_code_52_persists_new_tokenset_to_keychain(
             expires_at=ts + timedelta(days=365),
         )
 
-    monkeypatch.setattr("yadirect_agent.clients.base.refresh_access_token", fake_refresh)
+    monkeypatch.setattr("yadirect_agent.clients._token_refresh.refresh_access_token", fake_refresh)
 
     respx_mock.post("https://api-sandbox.direct.yandex.com/json/v5/campaigns").mock(
         side_effect=[
@@ -599,7 +599,7 @@ async def test_auth_error_code_52_retry_uses_new_authorization_header(
             expires_at=ts + timedelta(days=365),
         )
 
-    monkeypatch.setattr("yadirect_agent.clients.base.refresh_access_token", fake_refresh)
+    monkeypatch.setattr("yadirect_agent.clients._token_refresh.refresh_access_token", fake_refresh)
 
     captured_authorizations: list[str] = []
 
@@ -683,7 +683,9 @@ async def test_auth_error_code_52_refresh_endpoint_failure_raises_original(
 
         raise _AuthError("refresh_token revoked")
 
-    monkeypatch.setattr("yadirect_agent.clients.base.refresh_access_token", failing_refresh)
+    monkeypatch.setattr(
+        "yadirect_agent.clients._token_refresh.refresh_access_token", failing_refresh
+    )
 
     respx_mock.post("https://api-sandbox.direct.yandex.com/json/v5/campaigns").mock(
         return_value=httpx.Response(
@@ -737,7 +739,9 @@ async def test_auth_error_code_52_retry_failure_does_not_loop(
             expires_at=ts + timedelta(days=365),
         )
 
-    monkeypatch.setattr("yadirect_agent.clients.base.refresh_access_token", counted_refresh)
+    monkeypatch.setattr(
+        "yadirect_agent.clients._token_refresh.refresh_access_token", counted_refresh
+    )
 
     route = respx_mock.post("https://api-sandbox.direct.yandex.com/json/v5/campaigns").mock(
         return_value=httpx.Response(
@@ -785,7 +789,7 @@ async def test_other_auth_codes_do_not_trigger_refresh(
         msg = "should not be called"
         raise AssertionError(msg)
 
-    monkeypatch.setattr("yadirect_agent.clients.base.refresh_access_token", spy_refresh)
+    monkeypatch.setattr("yadirect_agent.clients._token_refresh.refresh_access_token", spy_refresh)
 
     respx_mock.post("https://api-sandbox.direct.yandex.com/json/v5/campaigns").mock(
         return_value=httpx.Response(

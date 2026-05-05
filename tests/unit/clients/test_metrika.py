@@ -636,7 +636,7 @@ class TestAutoRefreshOn401:
 
         refresh_calls: list[str] = []
         monkeypatch.setattr(
-            "yadirect_agent.clients.metrika.refresh_access_token",
+            "yadirect_agent.clients._token_refresh.refresh_access_token",
             _fake_refresh_factory(refresh_calls=refresh_calls),
         )
 
@@ -679,7 +679,7 @@ class TestAutoRefreshOn401:
         _seed_keychain_token()
 
         monkeypatch.setattr(
-            "yadirect_agent.clients.metrika.refresh_access_token",
+            "yadirect_agent.clients._token_refresh.refresh_access_token",
             _fake_refresh_factory(new_access="AQAA-metrika-PERSISTED", new_refresh="1.AQAA-rot"),
         )
 
@@ -713,7 +713,7 @@ class TestAutoRefreshOn401:
         _seed_keychain_token()
 
         monkeypatch.setattr(
-            "yadirect_agent.clients.metrika.refresh_access_token",
+            "yadirect_agent.clients._token_refresh.refresh_access_token",
             _fake_refresh_factory(new_access="AQAA-FRESH-FOR-RETRY"),
         )
 
@@ -779,7 +779,9 @@ class TestAutoRefreshOn401:
         ) -> object:
             raise AuthError("refresh_token revoked")
 
-        monkeypatch.setattr("yadirect_agent.clients.metrika.refresh_access_token", failing_refresh)
+        monkeypatch.setattr(
+            "yadirect_agent.clients._token_refresh.refresh_access_token", failing_refresh
+        )
 
         respx.get(_GOALS_URL).mock(
             return_value=httpx.Response(
@@ -829,7 +831,9 @@ class TestAutoRefreshOn401:
                 expires_at=ts + timedelta(days=365),
             )
 
-        monkeypatch.setattr("yadirect_agent.clients.metrika.refresh_access_token", counted_refresh)
+        monkeypatch.setattr(
+            "yadirect_agent.clients._token_refresh.refresh_access_token", counted_refresh
+        )
 
         route = respx.get(_GOALS_URL).mock(
             return_value=httpx.Response(
@@ -875,7 +879,9 @@ class TestAutoRefreshOn401:
             msg = "should not be called"
             raise AssertionError(msg)
 
-        monkeypatch.setattr("yadirect_agent.clients.metrika.refresh_access_token", spy_refresh)
+        monkeypatch.setattr(
+            "yadirect_agent.clients._token_refresh.refresh_access_token", spy_refresh
+        )
 
         respx.get(_GOALS_URL).mock(
             return_value=httpx.Response(
@@ -913,7 +919,9 @@ class TestAutoRefreshOn401:
             msg = "should not be called"
             raise AssertionError(msg)
 
-        monkeypatch.setattr("yadirect_agent.clients.metrika.refresh_access_token", spy_refresh)
+        monkeypatch.setattr(
+            "yadirect_agent.clients._token_refresh.refresh_access_token", spy_refresh
+        )
 
         respx.get(_GOALS_URL).mock(
             return_value=httpx.Response(

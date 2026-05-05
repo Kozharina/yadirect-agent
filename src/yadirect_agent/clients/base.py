@@ -43,7 +43,7 @@ from ..exceptions import (
     ValidationError,
     YaDirectError,
 )
-from .oauth import refresh_access_token
+from ._token_refresh import refresh_settings_token
 
 # Direct API auth error code that means "access token invalid /
 # expired" — the only one of ``_AUTH_CODES`` (52, 53, 54, 58) where
@@ -178,7 +178,12 @@ class DirectApiClient:
         except AuthError as exc:
             if exc.code != _INVALID_TOKEN_CODE:
                 raise
-            refreshed = await self._try_refresh_after_invalid_token(log)
+            refreshed = await refresh_settings_token(
+                self._settings,
+                scheme="Bearer",
+                httpx_client=self._client,
+                logger=log,
+            )
             if not refreshed:
                 raise
             # Retry exactly once with the fresh access token.
@@ -215,68 +220,6 @@ class DirectApiClient:
 
         # Unreachable, but keeps mypy happy.
         raise YaDirectError("retry loop returned without result")
-
-    async def _try_refresh_after_invalid_token(self, log: structlog.stdlib.BoundLogger) -> bool:
-        """Attempt to refresh the keychain TokenSet.
-
-        Returns True if the refresh succeeded and the httpx client
-        + Settings are now using the new access token. Returns
-        False if no refresh is possible (no keychain entry, or the
-        refresh endpoint itself rejects). On False, the caller
-        surfaces the original AuthError so the operator sees the
-        actionable cause (re-run ``auth login``) rather than an
-        opaque retry failure.
-
-        Side effects on success:
-        - New ``TokenSet`` persisted to keychain so the NEXT
-          process invocation also benefits.
-        - ``settings.yandex_direct_token`` and
-          ``settings.yandex_metrika_token`` mirror the new
-          access_token (same shape as
-          ``Settings._hydrate_tokens_from_keyring``: a single
-          OAuth grant covers both scopes).
-        - ``self._client.headers["Authorization"]`` rewritten so
-          the next HTTP call uses the fresh Bearer.
-        """
-        # Lazy import keeps the keyring stack out of every import
-        # chain; the cost only pays on the (rare) refresh path.
-        from ..auth.keychain import KeyringTokenStore
-
-        store = KeyringTokenStore()
-        try:
-            token = store.load()
-        except Exception as exc:
-            # ``KeyringTokenStore.load`` is itself defensive (catches
-            # KeyringError, JSONDecodeError, ValidationError) but a
-            # future change might surface a new exception class. The
-            # outer caller will raise the original AuthError, so any
-            # refresh-path failure is logged and swallowed here.
-            log.warning("api.auth_refresh.skip_keychain_load_failed", error=str(exc))
-            return False
-        if token is None:
-            log.info("api.auth_refresh.skip_no_keychain_token")
-            return False
-        try:
-            new_token = await refresh_access_token(
-                refresh_token=token.refresh_token.get_secret_value(),
-            )
-        except Exception as exc:
-            # Yandex OAuth refresh can fail in many ways — refresh
-            # token expired, grant revoked at yandex.ru/profile/access,
-            # transient network blip. None of them merit hiding the
-            # original wire AuthError; we log the inner cause and
-            # the caller surfaces the original error.
-            log.warning("api.auth_refresh.failed", error=str(exc))
-            return False
-
-        store.save(new_token)
-        self._settings.yandex_direct_token = new_token.access_token
-        self._settings.yandex_metrika_token = new_token.access_token
-        self._client.headers["Authorization"] = (
-            f"Bearer {new_token.access_token.get_secret_value()}"
-        )
-        log.info("api.auth_refresh.ok")
-        return True
 
     async def _do_call(
         self,
