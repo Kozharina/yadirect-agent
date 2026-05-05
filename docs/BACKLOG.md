@@ -203,20 +203,32 @@ Accumulated work that isn't blocking but will sting later.
       ``rationale list`` MCP tool), promote both to
       ``RationaleStore.from_settings(settings)`` classmethod.
 
-- [ ] **M15.3 follow-up — auto-refresh on Metrika HTTP 401**:
-      Direct surface shipped (auto-refresh on
-      ``AuthError(code=52)``). Metrika returns HTTP 401 (not
-      app-level codes) and its retry shape is simpler — no
-      tenacity envelope, single ``MetrikaService._request``
-      site. Same refresh helper pattern (read keychain →
-      ``refresh_access_token`` → save → retry once) but the
-      catch boundary lives at the HTTP-status check rather
-      than the JSON-error path. Could share infrastructure
-      with ``DirectApiClient._try_refresh_after_invalid_token``
-      via a small abstraction (``_TokenRefresher``) in
-      ``clients/base.py``; defer that decision until the
-      Metrika impl reveals concrete commonality (avoid
-      premature DRY).
+- [ ] **M15.3 follow-up — extract shared
+      ``refresh_settings_token`` helper**: Direct (#67) and
+      Metrika auto-refresh implementations are now ~95%
+      identical (load keychain → refresh_access_token → save →
+      mirror to Settings → rewrite httpx Authorization header).
+      Differences are exactly two parameters: the auth scheme
+      (``Bearer`` for Direct, ``OAuth`` for Metrika) and the
+      httpx client target (``self._api._client`` /
+      ``self._client``). Move into
+      ``clients/_token_refresh.py`` as a public
+      ``refresh_settings_token`` and delete the duplicated
+      ``_try_refresh_after_invalid_token`` /
+      ``_try_refresh_after_401`` methods.
+
+      Deferred from the Metrika auto-refresh PR because the
+      refactor adds ~150 lines (new helper + new test file +
+      monkeypatch path migration in 17 existing tests across
+      ``test_base.py`` + ``test_metrika.py``) without changing
+      user-visible behaviour. Ship-value-first, polish later.
+
+      When picked up: tests should mock the new
+      ``yadirect_agent.clients._token_refresh.refresh_access_token``
+      path; the existing ``yadirect_agent.clients.base.refresh_access_token``
+      and ``yadirect_agent.clients.metrika.refresh_access_token``
+      module-level imports can be deleted (no longer reached
+      through monkeypatch).
 - [ ] **M15.3 follow-up — headless / Docker fallback printer**:
       the ``on_browser_open`` hook lets the orchestrator be redirected
       somewhere other than ``webbrowser.open``, but the CLI does
@@ -842,6 +854,53 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M15.3 follow-up — auto-refresh on Metrika HTTP 401**
+      (Phase 0+1 housekeeping). Parity with the Direct surface
+      shipped in #67. Long-idle operator hits a stale access
+      token, ``MetrikaService`` transparently refreshes via the
+      keychain ``TokenSet`` and retries once.
+
+      Two pieces:
+
+      1. ``MetrikaService._request`` extension: new
+         ``_already_refreshed: bool = False`` recursion-guard
+         parameter; after tenacity exits with a non-retryable
+         status, the method checks for HTTP 401 + not-already-
+         refreshed and tries ``_try_refresh_after_401``. On
+         success, re-enters ``_request`` with the guard set. A
+         second 401 surfaces as-is — exactly one refresh +
+         retry. 401 is deliberately NOT in the tenacity retry
+         set (would burn the 4-attempt budget repeating 401s
+         before our refresh ever fires).
+      2. ``_try_refresh_after_401`` helper, mirroring Direct's
+         ``_try_refresh_after_invalid_token`` but using
+         Metrika's ``OAuth <token>`` auth scheme (NOT
+         ``Bearer``). Lazy-imports keychain; defensive
+         ``Exception`` catch around ``store.load`` and
+         ``refresh_access_token`` falls through to the original
+         AuthError so the operator sees the actionable cause.
+         On success: keychain persist → mirror access_token
+         into both ``yandex_direct_token`` and
+         ``yandex_metrika_token`` → rewrite
+         ``self._client.headers["Authorization"]``.
+
+      Why ``_INVALID_TOKEN_STATUS = 401`` is the only refresh
+      trigger: 403 means token is valid but lacks the scope
+      (refresh won't auto-elevate); 4xx other than 401 is
+      validation (counter not found, bad params).
+
+      Tests (8 new in ``TestAutoRefreshOn401``): refresh +
+      retry happy path, atomicity (TokenSet persist, OAuth
+      header rewrite, scheme correctness vs Bearer),
+      no-keychain skip, refresh-endpoint-failure skip,
+      retry-failure-no-loop, 403 + 404 skip-refresh.
+
+      Deferred (separate follow-up below): refactor to extract
+      shared ``refresh_settings_token`` helper between Direct
+      and Metrika. Ship-value-first.
+
+      1061 tests green; mypy strict; ruff clean.
 
 - [x] **M15.3 follow-up — auto-refresh on AuthError(code=52)
       in DirectApiClient** (Phase 0+1 housekeeping). Closes
