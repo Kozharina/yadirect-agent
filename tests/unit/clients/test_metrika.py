@@ -517,3 +517,413 @@ class TestGetConversionBySource:
             )
 
         assert conv == {}
+
+
+# --------------------------------------------------------------------------
+# M15.3 follow-up — auto-refresh on Metrika HTTP 401.
+#
+# Parity with the Direct surface (#67): a long-idle operator hits a stale
+# access token, the client transparently refreshes via the keychain
+# TokenSet and retries once. Operator never sees AuthError.
+#
+# Differences vs Direct: catch boundary is the raw HTTP 401 (not an
+# app-level error code), so the retry happens inside ``_request`` after
+# the tenacity envelope completes but BEFORE the caller raises
+# ``AuthError`` via ``_classify_terminal``.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def memory_keyring(monkeypatch: pytest.MonkeyPatch) -> dict[tuple[str, str], str]:
+    """In-memory keyring backend so refresh tests don't touch the OS."""
+    import keyring.errors
+
+    storage: dict[tuple[str, str], str] = {}
+
+    def set_password(service: str, username: str, password: str) -> None:
+        storage[(service, username)] = password
+
+    def get_password(service: str, username: str) -> str | None:
+        return storage.get((service, username))
+
+    def delete_password(service: str, username: str) -> None:
+        key = (service, username)
+        if key not in storage:
+            raise keyring.errors.PasswordDeleteError(f"no password for {key}")
+        del storage[key]
+
+    monkeypatch.setattr("keyring.set_password", set_password)
+    monkeypatch.setattr("keyring.get_password", get_password)
+    monkeypatch.setattr("keyring.delete_password", delete_password)
+    return storage
+
+
+def _seed_keychain_token(
+    *,
+    refresh_token: str = "1.AQAA-refresh-original",
+    access_token: str = "AQAA-metrika-original",
+) -> None:
+    """Helper: persist a TokenSet to the in-memory keychain."""
+    from datetime import UTC, datetime, timedelta
+
+    from pydantic import SecretStr
+
+    from yadirect_agent.auth.keychain import KeyringTokenStore
+    from yadirect_agent.models.auth import TokenSet
+
+    now = datetime(2026, 4, 30, 12, 0, tzinfo=UTC)
+    KeyringTokenStore().save(
+        TokenSet(
+            access_token=SecretStr(access_token),
+            refresh_token=SecretStr(refresh_token),
+            token_type="bearer",
+            scope=("direct:api", "metrika:read", "metrika:write"),
+            obtained_at=now,
+            expires_at=now + timedelta(days=365),
+        ),
+    )
+
+
+def _fake_refresh_factory(
+    *,
+    new_access: str = "AQAA-metrika-FRESH",
+    new_refresh: str = "1.AQAA-rotated",
+    refresh_calls: list[str] | None = None,
+):
+    """Build a fake refresh that returns a TokenSet with the given values.
+
+    Optionally records the inbound refresh_token for assertion.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from pydantic import SecretStr
+
+    from yadirect_agent.models.auth import TokenSet
+
+    async def fake_refresh(
+        *,
+        refresh_token: str,
+        now: object | None = None,
+    ) -> TokenSet:
+        if refresh_calls is not None:
+            refresh_calls.append(refresh_token)
+        ts = datetime(2026, 4, 30, 12, 0, tzinfo=UTC)
+        return TokenSet(
+            access_token=SecretStr(new_access),
+            refresh_token=SecretStr(new_refresh),
+            token_type="bearer",
+            scope=("direct:api", "metrika:read", "metrika:write"),
+            obtained_at=ts,
+            expires_at=ts + timedelta(days=365),
+        )
+
+    return fake_refresh
+
+
+class TestAutoRefreshOn401:
+    @respx.mock
+    async def test_401_triggers_refresh_and_retry_succeeds(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # Long-idle operator: access token expired, refresh_token
+        # still valid. Metrika returns 401 → client refreshes
+        # transparently → retry returns 200 with the goals payload
+        # the caller asked for.
+        _seed_keychain_token(refresh_token="1.AQAA-good-refresh")
+
+        refresh_calls: list[str] = []
+        monkeypatch.setattr(
+            "yadirect_agent.clients.metrika.refresh_access_token",
+            _fake_refresh_factory(refresh_calls=refresh_calls),
+        )
+
+        respx.get(_GOALS_URL).mock(
+            side_effect=[
+                httpx.Response(
+                    401,
+                    json={"errors": [{"message": "token invalid"}]},
+                ),
+                httpx.Response(
+                    200,
+                    json={"goals": [{"id": 100, "name": "Order completed", "type": "number"}]},
+                ),
+            ],
+        )
+
+        async with MetrikaService(settings) as svc:
+            goals = await svc.get_goals(counter_id=12345)
+
+        # Pin: refresh fired exactly once with the keychain's
+        # refresh_token (not the original env-var access token).
+        assert refresh_calls == ["1.AQAA-good-refresh"]
+        # Pin: caller saw the retry's payload, not the AuthError.
+        assert len(goals) == 1
+        assert goals[0].id == 100
+
+    @respx.mock
+    async def test_401_persists_new_tokenset_to_keychain(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # Same persistence contract as Direct: the refreshed
+        # TokenSet must land in the keychain so the NEXT process
+        # invocation also benefits. A regression that refreshed
+        # in-memory only would force re-login on every cold start.
+        from yadirect_agent.auth.keychain import KeyringTokenStore
+
+        _seed_keychain_token()
+
+        monkeypatch.setattr(
+            "yadirect_agent.clients.metrika.refresh_access_token",
+            _fake_refresh_factory(new_access="AQAA-metrika-PERSISTED", new_refresh="1.AQAA-rot"),
+        )
+
+        respx.get(_GOALS_URL).mock(
+            side_effect=[
+                httpx.Response(401, json={"errors": [{"message": "expired"}]}),
+                httpx.Response(200, json={"goals": []}),
+            ],
+        )
+
+        async with MetrikaService(settings) as svc:
+            await svc.get_goals(counter_id=12345)
+
+        persisted = KeyringTokenStore().load()
+        assert persisted is not None
+        assert persisted.access_token.get_secret_value() == "AQAA-metrika-PERSISTED"
+        assert persisted.refresh_token.get_secret_value() == "1.AQAA-rot"
+
+    @respx.mock
+    async def test_401_retry_uses_fresh_oauth_header(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # The retry GET must carry the FRESH access token in its
+        # Authorization header — otherwise we'd hit the same 401
+        # on retry. Metrika uses ``OAuth <token>`` (NOT
+        # ``Bearer``), so the assertion pins both the scheme AND
+        # the value.
+        _seed_keychain_token()
+
+        monkeypatch.setattr(
+            "yadirect_agent.clients.metrika.refresh_access_token",
+            _fake_refresh_factory(new_access="AQAA-FRESH-FOR-RETRY"),
+        )
+
+        captured_authorizations: list[str] = []
+
+        def capture_then_respond(request: httpx.Request) -> httpx.Response:
+            captured_authorizations.append(request.headers.get("authorization", ""))
+            if len(captured_authorizations) == 1:
+                return httpx.Response(401, json={"errors": [{"message": "expired"}]})
+            return httpx.Response(200, json={"goals": []})
+
+        respx.get(_GOALS_URL).mock(side_effect=capture_then_respond)
+
+        async with MetrikaService(settings) as svc:
+            await svc.get_goals(counter_id=12345)
+
+        assert len(captured_authorizations) == 2
+        # Original used the Settings-supplied test token; retry
+        # uses the freshly-refreshed token under the Metrika
+        # ``OAuth`` scheme.
+        assert captured_authorizations[0] == "OAuth test-metrika-token"
+        assert captured_authorizations[1] == "OAuth AQAA-FRESH-FOR-RETRY"
+
+    @respx.mock
+    async def test_401_no_keychain_token_raises_original_auth_error(
+        self,
+        settings: Settings,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # Cold-start: keychain entry was wiped (manual delete, OS
+        # reinstall) but env var still has a stale token. Refresh
+        # path can't proceed without a refresh_token; surface the
+        # original AuthError so the operator knows to re-run
+        # ``auth login``.
+        respx.get(_GOALS_URL).mock(
+            return_value=httpx.Response(
+                401,
+                json={"errors": [{"message": "token invalid"}]},
+            ),
+        )
+
+        async with MetrikaService(settings) as svc:
+            with pytest.raises(AuthError, match="token invalid"):
+                await svc.get_goals(counter_id=12345)
+
+    @respx.mock
+    async def test_401_refresh_endpoint_failure_raises_original(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # Refresh endpoint rejects (refresh_token revoked at
+        # yandex.ru/profile/access). Original wire AuthError must
+        # surface; inner refresh failure is logged but doesn't
+        # replace the user-visible cause.
+        _seed_keychain_token()
+
+        async def failing_refresh(
+            *,
+            refresh_token: str,
+            now: object | None = None,
+        ) -> object:
+            raise AuthError("refresh_token revoked")
+
+        monkeypatch.setattr("yadirect_agent.clients.metrika.refresh_access_token", failing_refresh)
+
+        respx.get(_GOALS_URL).mock(
+            return_value=httpx.Response(
+                401,
+                json={"errors": [{"message": "token invalid"}]},
+            ),
+        )
+
+        async with MetrikaService(settings) as svc:
+            with pytest.raises(AuthError, match="token invalid"):
+                await svc.get_goals(counter_id=12345)
+
+    @respx.mock
+    async def test_401_retry_failure_does_not_loop(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # Refresh succeeds, retry GET hits another 401 (e.g. the
+        # operator's grant was revoked between refresh and retry).
+        # MUST NOT trigger a second refresh — exactly one retry.
+        _seed_keychain_token()
+
+        refresh_call_count = 0
+
+        async def counted_refresh(
+            *,
+            refresh_token: str,
+            now: object | None = None,
+        ) -> object:
+            nonlocal refresh_call_count
+            refresh_call_count += 1
+            from datetime import UTC, datetime, timedelta
+
+            from pydantic import SecretStr
+
+            from yadirect_agent.models.auth import TokenSet
+
+            ts = datetime(2026, 4, 30, 12, 0, tzinfo=UTC)
+            return TokenSet(
+                access_token=SecretStr("AQAA-fresh"),
+                refresh_token=SecretStr("1.AQAA-refresh"),
+                token_type="bearer",
+                scope=("direct:api", "metrika:read", "metrika:write"),
+                obtained_at=ts,
+                expires_at=ts + timedelta(days=365),
+            )
+
+        monkeypatch.setattr("yadirect_agent.clients.metrika.refresh_access_token", counted_refresh)
+
+        route = respx.get(_GOALS_URL).mock(
+            return_value=httpx.Response(
+                401,
+                json={"errors": [{"message": "still invalid"}]},
+            ),
+        )
+
+        async with MetrikaService(settings) as svc:
+            with pytest.raises(AuthError):
+                await svc.get_goals(counter_id=12345)
+
+        # Exactly one refresh — never two.
+        assert refresh_call_count == 1
+        # Original + retry only (each goes through 4 tenacity
+        # attempts but 401 is NOT a retryable status, so each
+        # _request call hits the wire exactly once).
+        assert route.call_count == 2
+
+    @respx.mock
+    async def test_403_does_not_trigger_refresh(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # 403 Forbidden means the token is valid but lacks the
+        # scope (operator never granted ``metrika:read``, or
+        # revoked it). Refresh would burn an OAuth call for
+        # nothing — token-self-grant is not auto-elevatable. Pin
+        # via spy that refresh was NOT called.
+        _seed_keychain_token()
+
+        refresh_called = False
+
+        async def spy_refresh(
+            *,
+            refresh_token: str,
+            now: object | None = None,
+        ) -> object:
+            nonlocal refresh_called
+            refresh_called = True
+            msg = "should not be called"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr("yadirect_agent.clients.metrika.refresh_access_token", spy_refresh)
+
+        respx.get(_GOALS_URL).mock(
+            return_value=httpx.Response(
+                403,
+                json={"errors": [{"message": "scope insufficient"}]},
+            ),
+        )
+
+        async with MetrikaService(settings) as svc:
+            with pytest.raises(AuthError, match="scope insufficient"):
+                await svc.get_goals(counter_id=12345)
+
+        assert refresh_called is False
+
+    @respx.mock
+    async def test_404_does_not_trigger_refresh(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        memory_keyring: dict[tuple[str, str], str],
+    ) -> None:
+        # Non-auth 4xx (e.g. 404 Not Found from a wrong counter
+        # ID) is not an auth issue; refresh is irrelevant.
+        _seed_keychain_token()
+
+        refresh_called = False
+
+        async def spy_refresh(
+            *,
+            refresh_token: str,
+            now: object | None = None,
+        ) -> object:
+            nonlocal refresh_called
+            refresh_called = True
+            msg = "should not be called"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr("yadirect_agent.clients.metrika.refresh_access_token", spy_refresh)
+
+        respx.get(_GOALS_URL).mock(
+            return_value=httpx.Response(
+                404,
+                json={"errors": [{"message": "counter not found"}]},
+            ),
+        )
+
+        async with MetrikaService(settings) as svc:
+            with pytest.raises(ValidationError, match="counter not found"):
+                await svc.get_goals(counter_id=12345)
+
+        assert refresh_called is False
