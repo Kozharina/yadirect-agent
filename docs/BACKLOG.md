@@ -167,7 +167,40 @@ Anna doesn't open Direct. Silence = success.
 
 ## In progress
 
-*(empty — nothing checked out right now)*
+- [ ] **M15.3 follow-up — auto-refresh on Metrika HTTP 401**
+      (Phase 0+1 housekeeping). Parity with the Direct
+      surface (#67): when Metrika returns HTTP 401 on a long-
+      idle operator's first call, the client transparently
+      refreshes via the keychain ``TokenSet`` and retries
+      once.
+
+      Differences vs Direct:
+      - Metrika returns HTTP 401 (not app-level codes), so
+        the catch boundary is in ``MetrikaService._request``
+        AFTER the tenacity envelope (the raw status, before
+        ``_classify_terminal`` raises ``AuthError``).
+      - Authorization scheme is ``OAuth <token>`` (Metrika),
+        not ``Bearer <token>`` (Direct).
+      - The httpx client lives on ``self._client`` and is
+        constructed in ``__aenter__`` (lazy), so the header
+        update guards against ``None`` for the (impossible
+        but typed) case where refresh fires outside an
+        ``async with`` block.
+
+      Three commits planned:
+      1. ``test(clients)``: red tests pinning the contract
+         (refresh on 401, persist new token, retry uses fresh
+         OAuth header, no-keychain skip, refresh-failure skip,
+         retry-also-401 no-loop guard, 403 / non-401 statuses
+         do NOT trigger refresh).
+      2. ``feat(clients)``: inline Metrika refresh helper in
+         ``MetrikaService``.
+      3. ``refactor(clients)``: extract shared
+         ``refresh_settings_token`` helper in
+         ``clients/_token_refresh.py`` (or similar) once both
+         Direct and Metrika impls reveal the actual shape of
+         duplication. Defer-until-needed cleanup, not
+         premature DRY.
 
 Update this section when a feature branch is pushed; move back out when
 the PR merges or is abandoned.
