@@ -1,25 +1,30 @@
-"""Tests for ``yadirect-agent schedule ...`` CLI subapp (M15.6 slice 1).
+"""Tests for ``yadirect-agent schedule ...`` CLI subapp (M15.6 slices 1+2).
 
 Three commands operators run by hand:
 
 - ``schedule install [--platform=auto/macos/linux/windows]``
-  — generate plists, write them to ``~/Library/LaunchAgents``,
-  call ``launchctl load -w``. macOS only in slice 1; Linux /
-  Windows print a "shipping in slice 2/3" message and exit 2.
-- ``schedule status`` — read the on-disk plists, report
-  installed / not installed (paths included so the operator can
-  tail the logs).
+  — generate plists or systemd unit files, write them to the
+  platform's standard location, call ``launchctl load -w`` or
+  ``systemctl --user enable --now``. macOS + Linux ship in
+  slices 1+2; Windows still prints a "shipping in slice 3"
+  message and exits 2.
+- ``schedule status`` — read the on-disk plists / unit files,
+  report installed / not installed (paths included so the
+  operator can tail the logs).
 - ``schedule remove`` — call ``launchctl unload`` + delete the
-  plist files. Idempotent on fresh accounts.
+  plist files (macOS), or ``systemctl --user disable --now`` +
+  delete the unit files (Linux). Idempotent on fresh accounts.
 
-Tests patch ``MacOSScheduler`` to an in-memory spy; the actual
-plist generation + launchctl behaviour is covered in
-``tests/unit/services/scheduler/test_macos.py``.
+Tests patch ``MacOSScheduler`` / ``LinuxScheduler`` with in-memory
+spies; the actual plist / unit-file generation + subprocess
+behaviour is covered in
+``tests/unit/services/scheduler/test_macos.py`` and
+``test_linux.py``.
 
 Exit-code conventions:
 - 0 — success (install completed, status read, remove completed).
-- 2 — platform not yet supported (Linux/Windows in slice 1) OR
-  install failure (subprocess error from launchctl).
+- 2 — platform not yet supported (Windows until slice 3) OR
+  install failure (subprocess error from launchctl / systemctl).
 """
 
 from __future__ import annotations
@@ -70,6 +75,43 @@ def fake_scheduler(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> MagicMock
     return instance
 
 
+@pytest.fixture
+def fake_linux_scheduler(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> MagicMock:
+    """Replace ``LinuxScheduler`` with a MagicMock so CLI tests
+    don't depend on real systemctl.
+
+    Mirrors ``fake_scheduler`` for the macOS path; returns
+    realistic ``LinuxInstallResult`` / ``ScheduleStatus`` instances
+    so the rendering layer (which reads attributes off them) gets
+    the right shape.
+    """
+    from yadirect_agent.services.scheduler.linux import (
+        LinuxInstallResult,
+        ScheduleStatus,
+    )
+
+    instance = MagicMock()
+    instance.install.return_value = LinuxInstallResult(
+        daily_service_path=tmp_path / "yadirect-agent-daily.service",
+        daily_timer_path=tmp_path / "yadirect-agent-daily.timer",
+        hourly_service_path=tmp_path / "yadirect-agent-hourly.service",
+        hourly_timer_path=tmp_path / "yadirect-agent-hourly.timer",
+        log_dir=tmp_path / "logs",
+    )
+    instance.status.return_value = ScheduleStatus(
+        installed=True,
+        daily_service_path=tmp_path / "yadirect-agent-daily.service",
+        daily_timer_path=tmp_path / "yadirect-agent-daily.timer",
+        hourly_service_path=tmp_path / "yadirect-agent-hourly.service",
+        hourly_timer_path=tmp_path / "yadirect-agent-hourly.timer",
+    )
+    instance.remove.return_value = None
+
+    cls = MagicMock(return_value=instance)
+    monkeypatch.setattr("yadirect_agent.cli.main.LinuxScheduler", cls)
+    return instance
+
+
 class TestScheduleInstall:
     def test_install_macos_explicit_succeeds(
         self,
@@ -105,23 +147,43 @@ class TestScheduleInstall:
         assert result.exit_code == 0, result.output
         fake_scheduler.install.assert_called_once()
 
-    def test_install_linux_prints_not_yet_supported_and_exits_2(
+    def test_install_linux_explicit_succeeds(
         self,
         runner: CliRunner,
+        fake_linux_scheduler: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Slice 1 ships macOS only. Operators on Linux must see a
-        # clear "shipping in slice 2" message rather than a silent
-        # no-op or a confusing error.
-        monkeypatch.setattr("sys.platform", "linux")
+        # Slice 2 ships systemd ``--user`` timers. Operators on
+        # Linux now get the same install / status / remove surface
+        # as macOS — the platform branch is no longer a stub.
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/yadirect-agent")
 
         result = runner.invoke(app, ["schedule", "install", "--platform=linux"])
 
-        assert result.exit_code == 2, result.output
-        # Operator gets actionable info: which slice ships their
-        # platform.
-        assert "linux" in result.output.lower()
-        assert "slice 2" in result.output.lower() or "not yet" in result.output.lower()
+        assert result.exit_code == 0, result.output
+        # Operator-visible summary mentions both timers + the log
+        # dir, mirroring the macOS install summary.
+        assert "daily" in result.stdout.lower()
+        assert "hourly" in result.stdout.lower()
+        # The fake LinuxScheduler's install was actually called.
+        fake_linux_scheduler.install.assert_called_once()
+
+    def test_install_auto_uses_linux_on_linux_platform(
+        self,
+        runner: CliRunner,
+        fake_linux_scheduler: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # ``sys.platform == "linux"`` (or any "linux*" variant)
+        # auto-resolves to the systemd dispatch — operators don't
+        # need to pass ``--platform`` on a normal Linux install.
+        monkeypatch.setattr("sys.platform", "linux")
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/yadirect-agent")
+
+        result = runner.invoke(app, ["schedule", "install"])
+
+        assert result.exit_code == 0, result.output
+        fake_linux_scheduler.install.assert_called_once()
 
     def test_install_windows_prints_not_yet_supported_and_exits_2(
         self,
@@ -204,15 +266,60 @@ class TestScheduleStatus:
         assert result.exit_code == 0, result.output
         assert "not installed" in result.stdout.lower() or "not yet" in result.stdout.lower()
 
-    def test_status_linux_prints_not_supported_and_exits_2(
+    def test_status_linux_reports_installed(
         self,
         runner: CliRunner,
+        fake_linux_scheduler: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # Slice 2 wires the linux dispatch — status prints both
+        # unit pairs so the operator can ``systemctl --user
+        # status yadirect-agent-daily.timer`` or tail the log dir.
+        # We deliberately don't pin the full ``yadirect-agent-*.timer``
+        # filenames here: rich.Console wraps long lines at the
+        # terminal width and on CI runners with deep tmpdirs the
+        # path overflow splits the filename across a newline,
+        # causing a brittle substring test. Short tokens (daily /
+        # hourly) survive wrap and are still a sufficient regression
+        # signal — if the dispatch silently dropped both pairs from
+        # the rendered status, those tokens would be gone too.
         monkeypatch.setattr("sys.platform", "linux")
 
         result = runner.invoke(app, ["schedule", "status"])
-        assert result.exit_code == 2, result.output
+
+        assert result.exit_code == 0, result.output
+        assert "installed" in result.stdout.lower()
+        assert "daily" in result.stdout.lower()
+        assert "hourly" in result.stdout.lower()
+        # The fake LinuxScheduler.status was actually called — pins
+        # that the dispatch routes status through the linux path,
+        # not silently through the macos one.
+        fake_linux_scheduler.status.assert_called_once()
+
+    def test_status_linux_reports_not_installed(
+        self,
+        runner: CliRunner,
+        fake_linux_scheduler: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Same exit-0 contract as macOS: "not installed" is a
+        # valid state, not an error. Keeps cron-like wrappers
+        # honest about telling normal state apart from invocation
+        # failure.
+        from yadirect_agent.services.scheduler.linux import ScheduleStatus
+
+        monkeypatch.setattr("sys.platform", "linux")
+        fake_linux_scheduler.status.return_value = ScheduleStatus(
+            installed=False,
+            daily_service_path=Path("/tmp/d.service"),
+            daily_timer_path=Path("/tmp/d.timer"),
+            hourly_service_path=Path("/tmp/h.service"),
+            hourly_timer_path=Path("/tmp/h.timer"),
+        )
+
+        result = runner.invoke(app, ["schedule", "status"])
+        assert result.exit_code == 0, result.output
+        assert "not installed" in result.stdout.lower()
 
 
 class TestScheduleRemove:
@@ -243,3 +350,19 @@ class TestScheduleRemove:
 
         result = runner.invoke(app, ["schedule", "remove"])
         assert result.exit_code == 0
+
+    def test_remove_linux_succeeds(
+        self,
+        runner: CliRunner,
+        fake_linux_scheduler: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Parity with the macOS remove: slice 2 routes ``remove``
+        # to ``LinuxScheduler.remove`` which itself is idempotent
+        # at the service layer. The CLI returns exit 0.
+        monkeypatch.setattr("sys.platform", "linux")
+
+        result = runner.invoke(app, ["schedule", "remove"])
+
+        assert result.exit_code == 0, result.output
+        fake_linux_scheduler.remove.assert_called_once()
