@@ -27,6 +27,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
 from yadirect_agent.services.scheduler.linux import (
     DAILY_UNIT_NAME,
     HOURLY_UNIT_NAME,
