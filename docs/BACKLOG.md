@@ -203,32 +203,8 @@ Accumulated work that isn't blocking but will sting later.
       ``rationale list`` MCP tool), promote both to
       ``RationaleStore.from_settings(settings)`` classmethod.
 
-- [ ] **M15.3 follow-up — extract shared
-      ``refresh_settings_token`` helper**: Direct (#67) and
-      Metrika auto-refresh implementations are now ~95%
-      identical (load keychain → refresh_access_token → save →
-      mirror to Settings → rewrite httpx Authorization header).
-      Differences are exactly two parameters: the auth scheme
-      (``Bearer`` for Direct, ``OAuth`` for Metrika) and the
-      httpx client target (``self._api._client`` /
-      ``self._client``). Move into
-      ``clients/_token_refresh.py`` as a public
-      ``refresh_settings_token`` and delete the duplicated
-      ``_try_refresh_after_invalid_token`` /
-      ``_try_refresh_after_401`` methods.
-
-      Deferred from the Metrika auto-refresh PR because the
-      refactor adds ~150 lines (new helper + new test file +
-      monkeypatch path migration in 17 existing tests across
-      ``test_base.py`` + ``test_metrika.py``) without changing
-      user-visible behaviour. Ship-value-first, polish later.
-
-      When picked up: tests should mock the new
-      ``yadirect_agent.clients._token_refresh.refresh_access_token``
-      path; the existing ``yadirect_agent.clients.base.refresh_access_token``
-      and ``yadirect_agent.clients.metrika.refresh_access_token``
-      module-level imports can be deleted (no longer reached
-      through monkeypatch).
+- [x] ~~**M15.3 follow-up — extract shared
+      ``refresh_settings_token`` helper**~~ — shipped, see Done.
 - [ ] **M15.3 follow-up — headless / Docker fallback printer**:
       the ``on_browser_open`` hook lets the orchestrator be redirected
       somewhere other than ``webbrowser.open``, but the CLI does
@@ -854,6 +830,49 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M15.3 follow-up — extract shared ``refresh_settings_token``
+      helper** (Phase 0+1 housekeeping; deferred from #69 per
+      ship-value-first, polish-later). Direct (#67) and Metrika
+      (#69) auto-refresh implementations were 95% identical —
+      4-step keychain → ``oauth.refresh_access_token`` → Settings
+      mirror → httpx Authorization header dance — differing only
+      in HTTP scheme (``Bearer`` vs ``OAuth``) and whether
+      structlog logging fired (Direct logged, Metrika silent).
+
+      Extracted to ``src/yadirect_agent/clients/_token_refresh.py``
+      as ``refresh_settings_token(settings, *, scheme,
+      httpx_client, logger)``. ``scheme`` is a
+      ``Literal["Bearer", "OAuth"]`` so a typo at the call site
+      (``"bearer"`` lower-case) won't silently pass ``str``.
+      Logging is now uniform across both clients — Metrika
+      previously silent, now emits the same
+      ``api.auth_refresh.*`` events Direct does. That's an
+      improvement, not a regression: operators reading logs can
+      always tell whether refresh fired and whether it succeeded.
+
+      ``DirectApiClient._try_refresh_after_invalid_token`` and
+      ``MetrikaService._try_refresh_after_401`` deleted; both
+      call sites now ``await refresh_settings_token(...)`` directly.
+      The lazy ``KeyringTokenStore`` import is preserved so the
+      keyring stack stays out of every ``clients/`` import chain
+      — module-load cost only pays on the rare refresh path.
+
+      Tests: 13 monkeypatch sites in ``test_base.py`` /
+      ``test_metrika.py`` migrated from
+      ``clients.{base,metrika}.refresh_access_token`` to
+      ``clients._token_refresh.refresh_access_token`` (the new
+      module is the only one importing ``refresh_access_token``
+      directly). 8 new dedicated unit tests in
+      ``tests/unit/clients/test_token_refresh.py`` pin the
+      helper's contract independently — Bearer vs OAuth header,
+      both Settings fields mirrored on every refresh, keychain
+      persistence, ``httpx_client=None`` skips header rewrite,
+      no-keychain / load-failure / refresh-endpoint-failure all
+      return False without touching Settings.
+
+      1069 tests green; mypy strict; ruff clean. Pure structural
+      extraction — behaviour preserved end-to-end.
 
 - [x] **M15.3 follow-up — auto-refresh on Metrika HTTP 401**
       (Phase 0+1 housekeeping). Parity with the Direct surface
