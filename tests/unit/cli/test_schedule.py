@@ -272,20 +272,29 @@ class TestScheduleStatus:
         fake_linux_scheduler: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Slice 2 wires the linux dispatch — status prints the four
-        # unit-file paths so operators can ``systemctl --user
+        # Slice 2 wires the linux dispatch — status prints both
+        # unit pairs so the operator can ``systemctl --user
         # status yadirect-agent-daily.timer`` or tail the log dir.
+        # We deliberately don't pin the full ``yadirect-agent-*.timer``
+        # filenames here: rich.Console wraps long lines at the
+        # terminal width and on CI runners with deep tmpdirs the
+        # path overflow splits the filename across a newline,
+        # causing a brittle substring test. Short tokens (daily /
+        # hourly) survive wrap and are still a sufficient regression
+        # signal — if the dispatch silently dropped both pairs from
+        # the rendered status, those tokens would be gone too.
         monkeypatch.setattr("sys.platform", "linux")
 
         result = runner.invoke(app, ["schedule", "status"])
 
         assert result.exit_code == 0, result.output
         assert "installed" in result.stdout.lower()
-        # Both timers' presence is part of the operator-visible
-        # output. Pinning these strings prevents a regression that
-        # silently dropped a path from the rendered status.
-        assert "yadirect-agent-daily.timer" in result.stdout
-        assert "yadirect-agent-hourly.timer" in result.stdout
+        assert "daily" in result.stdout.lower()
+        assert "hourly" in result.stdout.lower()
+        # The fake LinuxScheduler.status was actually called — pins
+        # that the dispatch routes status through the linux path,
+        # not silently through the macos one.
+        fake_linux_scheduler.status.assert_called_once()
 
     def test_status_linux_reports_not_installed(
         self,
