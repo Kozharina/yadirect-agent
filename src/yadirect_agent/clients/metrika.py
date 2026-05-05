@@ -49,7 +49,7 @@ from ..exceptions import (
     ValidationError,
 )
 from ..models.metrika import DateRange, MetrikaCounter, MetrikaGoal, ReportRow
-from .oauth import refresh_access_token
+from ._token_refresh import refresh_settings_token
 
 # HTTP status that means "access token invalid / expired" — the
 # only Metrika non-2xx where a refresh is meaningful. 403 means
@@ -235,7 +235,11 @@ class MetrikaService:
                     if (
                         response.status_code == _INVALID_TOKEN_STATUS
                         and not _already_refreshed
-                        and await self._try_refresh_after_401()
+                        and await refresh_settings_token(
+                            self._settings,
+                            scheme="OAuth",
+                            httpx_client=self._client,
+                        )
                     ):
                         return await self._request(
                             method, path, params=params, _already_refreshed=True
@@ -261,61 +265,6 @@ class MetrikaService:
 
         msg = "unreachable: retrier produced no result"
         raise RuntimeError(msg)  # pragma: no cover
-
-    async def _try_refresh_after_401(self) -> bool:
-        """Refresh the keychain TokenSet and rewrite the OAuth header.
-
-        Returns True if the refresh succeeded and the httpx client
-        now uses the new access token. Returns False if no refresh
-        is possible (no keychain entry, refresh endpoint failure,
-        keyring backend unavailable). On False the caller falls
-        through to the original 401 path so the operator sees the
-        actionable cause.
-
-        Side effects on success match the Direct equivalent
-        (``base.py::_try_refresh_after_invalid_token``):
-        - New ``TokenSet`` persisted to keychain.
-        - ``settings.yandex_direct_token`` and
-          ``yandex_metrika_token`` mirror the new access_token
-          (single OAuth grant covers both scopes; matches
-          ``Settings._hydrate_tokens_from_keyring`` semantics).
-        - ``self._client.headers["Authorization"]`` rewritten with
-          the Metrika ``OAuth <token>`` scheme.
-        """
-        # Lazy import keeps the keyring stack out of every Metrika
-        # import chain; the cost only pays on the (rare) refresh path.
-        from ..auth.keychain import KeyringTokenStore
-
-        store = KeyringTokenStore()
-        try:
-            token = store.load()
-        except Exception:
-            # ``KeyringTokenStore.load`` already catches KeyringError;
-            # this guards against future-novel exception classes.
-            return False
-        if token is None:
-            return False
-        try:
-            new_token = await refresh_access_token(
-                refresh_token=token.refresh_token.get_secret_value(),
-            )
-        except Exception:
-            # Refresh endpoint can fail in many ways (refresh_token
-            # revoked, transient network blip, backend down). None
-            # of them merit hiding the original wire AuthError.
-            return False
-
-        store.save(new_token)
-        self._settings.yandex_direct_token = new_token.access_token
-        self._settings.yandex_metrika_token = new_token.access_token
-        if self._client is not None:
-            # Metrika uses the ``OAuth <token>`` scheme (not Direct's
-            # ``Bearer``). The literal mirrors ``__aenter__``'s
-            # initial header construction.
-            self._client.headers["Authorization"] = (
-                f"OAuth {new_token.access_token.get_secret_value()}"
-            )
-        return True
 
     async def get_counters(self) -> list[MetrikaCounter]:
         """List counters this token has access to.
