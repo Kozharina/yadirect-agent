@@ -49,6 +49,14 @@ from ..exceptions import (
     ValidationError,
 )
 from ..models.metrika import DateRange, MetrikaCounter, MetrikaGoal, ReportRow
+from .oauth import refresh_access_token
+
+# HTTP status that means "access token invalid / expired" — the
+# only Metrika non-2xx where a refresh is meaningful. 403 means
+# the token is valid but lacks the scope; refreshing won't
+# auto-elevate. 4xx other than 401 are validation / not-found
+# concerns.
+_INVALID_TOKEN_STATUS = 401
 
 # Status codes that warrant a retry. 429 is included so we honour
 # Metrika's rate-limit signal; 5xx covers transient server issues.
@@ -174,6 +182,7 @@ class MetrikaService:
         path: str,
         *,
         params: dict[str, Any] | None = None,
+        _already_refreshed: bool = False,
     ) -> httpx.Response:
         """Send a request with retry on transient failures.
 
@@ -185,6 +194,15 @@ class MetrikaService:
         Stops after 4 attempts total; ``RetryError`` from tenacity is
         unwrapped to a typed terminal error pointing at the last
         response so callers see a stable exception type.
+
+        One additional non-tenacity retry layer: HTTP 401 from a
+        long-idle access token triggers an OAuth refresh via the
+        keychain ``TokenSet``, then retries the whole request once.
+        Mirrors the Direct surface (``base.py``) — same parity for
+        operators who haven't logged in in months. ``_already_refreshed``
+        is the recursion-once guard; a second 401 surfaces as-is so
+        the operator sees the actionable cause (re-run
+        ``auth login``).
         """
         client = self._require_client()
 
@@ -206,7 +224,23 @@ class MetrikaService:
         try:
             async for attempt in retrier:
                 with attempt:
-                    return await _attempt()
+                    response = await _attempt()
+                    # Refresh-on-401 fires AFTER tenacity exits with
+                    # a non-retryable status. The check sits inside
+                    # the retrier loop so the response is still in
+                    # scope, but we don't add 401 to the tenacity
+                    # retry set (tenacity would burn the budget on
+                    # repeated 401s; we want exactly one refresh +
+                    # retry attempt instead).
+                    if (
+                        response.status_code == _INVALID_TOKEN_STATUS
+                        and not _already_refreshed
+                        and await self._try_refresh_after_401()
+                    ):
+                        return await self._request(
+                            method, path, params=params, _already_refreshed=True
+                        )
+                    return response
         except _RetryableStatus as final:
             # Retries exhausted on a retryable HTTP status. Promote to
             # a typed terminal error using the last response we saw —
@@ -227,6 +261,61 @@ class MetrikaService:
 
         msg = "unreachable: retrier produced no result"
         raise RuntimeError(msg)  # pragma: no cover
+
+    async def _try_refresh_after_401(self) -> bool:
+        """Refresh the keychain TokenSet and rewrite the OAuth header.
+
+        Returns True if the refresh succeeded and the httpx client
+        now uses the new access token. Returns False if no refresh
+        is possible (no keychain entry, refresh endpoint failure,
+        keyring backend unavailable). On False the caller falls
+        through to the original 401 path so the operator sees the
+        actionable cause.
+
+        Side effects on success match the Direct equivalent
+        (``base.py::_try_refresh_after_invalid_token``):
+        - New ``TokenSet`` persisted to keychain.
+        - ``settings.yandex_direct_token`` and
+          ``yandex_metrika_token`` mirror the new access_token
+          (single OAuth grant covers both scopes; matches
+          ``Settings._hydrate_tokens_from_keyring`` semantics).
+        - ``self._client.headers["Authorization"]`` rewritten with
+          the Metrika ``OAuth <token>`` scheme.
+        """
+        # Lazy import keeps the keyring stack out of every Metrika
+        # import chain; the cost only pays on the (rare) refresh path.
+        from ..auth.keychain import KeyringTokenStore
+
+        store = KeyringTokenStore()
+        try:
+            token = store.load()
+        except Exception:
+            # ``KeyringTokenStore.load`` already catches KeyringError;
+            # this guards against future-novel exception classes.
+            return False
+        if token is None:
+            return False
+        try:
+            new_token = await refresh_access_token(
+                refresh_token=token.refresh_token.get_secret_value(),
+            )
+        except Exception:
+            # Refresh endpoint can fail in many ways (refresh_token
+            # revoked, transient network blip, backend down). None
+            # of them merit hiding the original wire AuthError.
+            return False
+
+        store.save(new_token)
+        self._settings.yandex_direct_token = new_token.access_token
+        self._settings.yandex_metrika_token = new_token.access_token
+        if self._client is not None:
+            # Metrika uses the ``OAuth <token>`` scheme (not Direct's
+            # ``Bearer``). The literal mirrors ``__aenter__``'s
+            # initial header construction.
+            self._client.headers["Authorization"] = (
+                f"OAuth {new_token.access_token.get_secret_value()}"
+            )
+        return True
 
     async def get_counters(self) -> list[MetrikaCounter]:
         """List counters this token has access to.
