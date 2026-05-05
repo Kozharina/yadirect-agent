@@ -1304,12 +1304,13 @@ async def _run_mcp_stdio(handle: Any) -> None:
 
 
 # --------------------------------------------------------------------------
-# `schedule` subapp — built-in cross-platform scheduler (M15.6 slice 1).
+# `schedule` subapp — built-in cross-platform scheduler (M15.6 slices 1+2).
 #
-# Slice 1 ships macOS LaunchAgent only; Linux / Windows surface a clear
-# "shipping in slice 2/3" message and exit 2. The CLI surface is final
-# (install / status / remove); slice 2/3 PRs add new platform branches
-# without changing the command shape.
+# Slice 1 shipped macOS LaunchAgent; slice 2 shipped Linux systemd
+# ``--user`` timers. Windows still surfaces a clear "shipping in slice 3"
+# message and exits 2. The CLI surface is final (install / status /
+# remove); slice 3 adds the Windows platform branch without changing
+# the command shape.
 # --------------------------------------------------------------------------
 
 

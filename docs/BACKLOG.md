@@ -50,10 +50,8 @@ demo-only, technically; it cannot be handed to a non-developer.
       Scheduler have nothing in common but the high-level
       concept):
   - [x] ~~**slice 1 — macOS LaunchAgent**~~ — shipped, see Done.
-  - [ ] **slice 2 — Linux systemd --user timer**: timer +
-        service unit pair, ``systemctl --user`` lifecycle.
-        Mirror the slice 1 contract (install / status / remove);
-        share the ``services/scheduler/__init__.py`` common types.
+  - [x] ~~**slice 2 — Linux systemd --user timer**~~ — shipped,
+        see Done.
   - [ ] **slice 3 — Windows Task Scheduler**: ``schtasks``
         XML + create/query/delete. Same contract.
 - [x] ~~**M20 — Human-readable rationale (slice 1)**~~ — shipped,
@@ -830,6 +828,67 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M15.6 slice 2 — Linux systemd ``--user`` scheduler**
+      (Phase 0+1 release 0.2.0). Mirror of slice 1 (#65) for the
+      Linux path: same ``install`` / ``status`` / ``remove`` CLI
+      surface, same atomic-write contract (sibling tempfile +
+      ``os.replace``), same single indirection point for the
+      platform CLI (``run_systemctl`` ↔ ``run_launchctl``).
+      Operators on Linux now get the full ``yadirect-agent
+      schedule ...`` surface; Windows continues to print
+      "shipping in slice 3".
+
+      Wire format: four unit files in ``$XDG_CONFIG_HOME/systemd/user``
+      (default ``~/.config/systemd/user``):
+
+      - ``yadirect-agent-daily.service`` (Type=oneshot, ExecStart
+        ``health --days=7 --json``) + ``yadirect-agent-daily.timer``
+        (``OnCalendar=*-*-* 08:00:00``, ``Persistent=true`` so a
+        sleeping laptop catches up on the missed 08:00 run).
+      - ``yadirect-agent-hourly.service`` (Type=oneshot, ExecStart
+        ``health --days=1 --json``) + ``yadirect-agent-hourly.timer``
+        (``OnBootSec=10min`` to settle after login,
+        ``OnUnitActiveSec=1h`` so the hour-counter starts after
+        each completion rather than synchronising every hourly
+        job in the system on minute 0).
+
+      Logs: ``$XDG_STATE_HOME/yadirect-agent/logs`` (default
+      ``~/.local/state/yadirect-agent/logs``) — XDG_STATE_HOME is
+      the correct bucket for "logs the operator may tail but the
+      app can regenerate".
+
+      Lifecycle ordering documented in ``LinuxScheduler``
+      docstrings: install does mkdir → atomic-write 4 units →
+      ``daemon-reload`` → ``enable --now`` for both timers
+      (daemon-reload before enable so systemd has the new units
+      in cache); remove does ``disable --now`` for each timer
+      (CalledProcessError tolerated and logged — same shape as
+      slice 1's launchctl unload tolerance) → unlink → conditional
+      ``daemon-reload`` (only if any file was actually removed,
+      keeping fresh-account ``schedule remove`` truly silent).
+
+      Hard-coded ``/usr/bin/systemctl`` path mirrors slice 1's
+      ``/bin/launchctl`` choice (mainstream distros: Debian,
+      Ubuntu, Fedora, Arch). NixOS / non-FHS users override
+      ``run_systemctl`` directly — same escape hatch the macOS
+      module documents.
+
+      No shared abstract base / Protocol on the scheduler
+      package: macOS and Linux ``InstallResult`` / ``ScheduleStatus``
+      shapes differ in cardinality (2 vs 4 paths). Promote to a
+      shared Protocol only if slice 3 (Windows) reveals a third
+      copy of the same shape — see ``services/scheduler/__init__.py``
+      docstring for the deliberate decision record.
+
+      Tests: 15 service-layer tests pin unit-file directives
+      (Type=oneshot, OnCalendar, Persistent, OnUnitActiveSec,
+      WantedBy=timers.target, executable-must-be-absolute), atomic
+      install with systemctl spy, all-or-nothing status,
+      idempotent remove, disable-failure tolerance. 5 new CLI
+      tests via a ``fake_linux_scheduler`` fixture mirroring
+      ``fake_scheduler``. 1087 tests green; mypy strict; ruff
+      clean.
 
 - [x] **M15.3 follow-up — extract shared ``refresh_settings_token``
       helper** (Phase 0+1 housekeeping; deferred from #69 per
