@@ -42,6 +42,7 @@ from ..services.bidding import BiddingService, BidUpdate
 from ..services.business_profile_store import BusinessProfileStore
 from ..services.campaigns import CampaignService
 from ..services.health_check import HealthCheckService
+from ..services.health_history_store import HealthHistoryStore
 from ..services.policy_proposal import generate_policy_proposal
 from .executor import PlanRejected, PlanRequired
 from .pipeline import SafetyPipeline
@@ -833,8 +834,13 @@ def _make_account_health_tool(settings: Settings) -> Tool:
     async def handler(raw: BaseModel, ctx: ToolContext) -> Any:
         inp: _AccountHealthInput = raw  # type: ignore[assignment]
         date_range = default_window(days=inp.days)
+        # M15.5.5: wire HealthHistoryStore so CTR-drift rule has
+        # last-week's snapshots to compare against. Same store path
+        # the CLI uses (``HealthHistoryStore.from_settings``); the
+        # conversational and CLI surfaces share one history file.
+        history_store = HealthHistoryStore.from_settings(settings)
         try:
-            async with HealthCheckService(settings) as svc:
+            async with HealthCheckService(settings, history_store=history_store) as svc:
                 report = await svc.run_account_check(
                     date_range=date_range,
                     goal_id=inp.goal_id,
@@ -904,8 +910,13 @@ async def _build_health_payload(settings: Settings) -> dict[str, Any]:
     succeeds visibly; the rest of the response (profile,
     proposal, audit event) lands normally.
     """
+    # M15.5.5: same history-store wiring as the standalone
+    # account_health tool — onboarding's first health-check rollup
+    # also writes a baseline snapshot so the very next manual
+    # ``account_health()`` call has data to drift-compare against.
+    history_store = HealthHistoryStore.from_settings(settings)
     try:
-        async with HealthCheckService(settings) as svc:
+        async with HealthCheckService(settings, history_store=history_store) as svc:
             report = await svc.run_account_check(date_range=default_window(days=7))
     except ConfigError as exc:
         return {"status": "unconfigured", "reason": str(exc)}

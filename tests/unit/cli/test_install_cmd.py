@@ -51,9 +51,14 @@ class TestInstallCmd:
         # Config has our entry.
         data = json.loads(config_path.read_text())
         assert "yadirect-agent" in data["mcpServers"]
-        # Output mentions what happened + the path.
+        # Output mentions what happened + the path. We pin only the
+        # filename, not the full ``str(config_path)``: rich.Console
+        # wraps long lines at 80 cols by default, and on CI runners
+        # with deep tmpdirs the absolute path overflows and gets
+        # split across a newline (e.g. ``yadirect-ag\nent``). Same
+        # wrap-width gotcha as the M15.6 slice 2 status assertion.
         assert "added" in result.output.lower() or "installed" in result.output.lower()
-        assert str(config_path) in result.output
+        assert config_path.name in result.output
 
     def test_already_installed_is_idempotent(
         self,
