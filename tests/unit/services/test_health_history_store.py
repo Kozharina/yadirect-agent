@@ -22,16 +22,17 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
-from yadirect_agent.models.health_history import HealthSnapshot
-from yadirect_agent.services.health_history_store import HealthHistoryStore
 
+from yadirect_agent.models.health_history import HealthSnapshot
 from yadirect_agent.models.metrika import DateRange
+from yadirect_agent.services.health_history_store import HealthHistoryStore
 
 
 def _snapshot(
     *,
     campaign_id: int = 1,
     snapshot_at: datetime | None = None,
+    start: date | None = None,
     end: date | None = None,
     clicks: int = 100,
     impressions: int = 10_000,
@@ -39,9 +40,10 @@ def _snapshot(
 ) -> HealthSnapshot:
     snap_at = snapshot_at or datetime(2026, 5, 6, 8, 0, tzinfo=UTC)
     end_date = end or date(2026, 5, 5)
+    start_date = start or date(2026, 4, 29)
     return HealthSnapshot(
         snapshot_at=snap_at,
-        date_range=DateRange(start=date(2026, 4, 29), end=end_date),
+        date_range=DateRange(start=start_date, end=end_date),
         campaign_id=campaign_id,
         clicks=clicks,
         impressions=impressions,
@@ -141,6 +143,7 @@ class TestHealthHistoryStore:
         old = _snapshot(
             campaign_id=1,
             snapshot_at=datetime(2026, 4, 29, 8, 0, tzinfo=UTC),
+            start=date(2026, 4, 22),
             end=date(2026, 4, 28),
             ctr_pct=1.5,
         )
