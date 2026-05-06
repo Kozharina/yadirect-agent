@@ -1062,3 +1062,54 @@ def test_health_passes_history_store_to_service(
     assert isinstance(captured["history_store"], HealthHistoryStore), (
         f"expected HealthHistoryStore, got {captured['history_store']!r}"
     )
+
+
+def test_health_catches_config_error_with_friendly_message(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # M15.x acceptance polish: on a fresh install without
+    # YANDEX_METRIKA_COUNTER_ID, ``yadirect-agent health`` used
+    # to crash with a full Python traceback (Rich-formatted but
+    # still a traceback) AND exit 0 — both are bugs. The MCP
+    # ``account_health`` tool already handles the same case
+    # gracefully with a structured ``unconfigured`` envelope; the
+    # CLI surface should be at least as polite. (auditor smoke
+    # walkthrough: critical UX blocker for Anna.)
+    from yadirect_agent.exceptions import ConfigError
+    from yadirect_agent.services.health_check import HealthCheckService
+
+    async def fake_check(
+        self: HealthCheckService,
+        *,
+        date_range: object,
+        goal_id: int | None = None,
+    ) -> object:
+        raise ConfigError(
+            "Metrika counter_id is not configured — set "
+            "YANDEX_METRIKA_COUNTER_ID in your .env or pass "
+            "yandex_metrika_counter_id to Settings explicitly."
+        )
+
+    monkeypatch.setattr(HealthCheckService, "run_account_check", fake_check)
+
+    monkeypatch.setenv("YANDEX_DIRECT_TOKEN", "x")
+    monkeypatch.setenv("YANDEX_METRIKA_TOKEN", "x")
+    monkeypatch.setenv("YANDEX_METRIKA_COUNTER_ID", "1")
+    monkeypatch.setenv("AGENT_POLICY_PATH", str(tmp_path / "policy.yml"))
+    monkeypatch.setenv("AUDIT_LOG_PATH", str(tmp_path / "logs" / "audit.jsonl"))
+
+    result = runner.invoke(app, ["health", "--days", "7"])
+
+    # Non-zero exit so cron-style ``health || alert`` works.
+    # exit 2 matches the ``auth login`` convention for
+    # "user-actionable misconfiguration".
+    assert result.exit_code == 2, result.output
+    # No Python traceback markers — must be a clean operator
+    # message, not a crash report.
+    assert "Traceback" not in result.output
+    assert "ConfigError" not in result.output
+    # Operator-friendly Russian hint mentioning the next step.
+    output_lower = result.output.lower()
+    assert "metrika" in output_lower or "metrika_counter_id" in output_lower

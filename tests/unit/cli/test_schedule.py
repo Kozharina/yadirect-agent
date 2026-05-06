@@ -327,11 +327,13 @@ class TestScheduleStatus:
 
         result = runner.invoke(app, ["schedule", "status"])
 
-        # Status is a read; "not installed" is a valid state, not
-        # an error. Exit 0 lets cron-like wrappers tell normal
-        # state from invocation failure.
+        # Status is a read; the "not configured" state is valid,
+        # not an error. Exit 0 lets cron-like wrappers tell normal
+        # state from invocation failure. Operator-facing CLI text
+        # lives in Russian per CLAUDE.md `<language_conventions>`
+        # — Anna (target persona) reads it on her terminal.
         assert result.exit_code == 0, result.output
-        assert "not installed" in result.stdout.lower() or "not yet" in result.stdout.lower()
+        assert "не настроено" in result.stdout.lower()
 
     def test_status_linux_reports_installed(
         self,
@@ -369,10 +371,9 @@ class TestScheduleStatus:
         fake_linux_scheduler: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Same exit-0 contract as macOS: "not installed" is a
-        # valid state, not an error. Keeps cron-like wrappers
-        # honest about telling normal state apart from invocation
-        # failure.
+        # Same exit-0 contract as macOS: the "not configured" state
+        # is valid, not an error. Operator-facing text in Russian
+        # per CLAUDE.md `<language_conventions>`.
         from yadirect_agent.services.scheduler.linux import ScheduleStatus
 
         monkeypatch.setattr("sys.platform", "linux")
@@ -386,7 +387,7 @@ class TestScheduleStatus:
 
         result = runner.invoke(app, ["schedule", "status"])
         assert result.exit_code == 0, result.output
-        assert "not installed" in result.stdout.lower()
+        assert "не настроено" in result.stdout.lower()
 
     def test_status_windows_reports_installed(
         self,
@@ -419,8 +420,9 @@ class TestScheduleStatus:
         fake_windows_scheduler: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Same exit-0 contract as macOS / Linux: "not installed"
-        # is a valid state.
+        # Same exit-0 contract as macOS / Linux: the "not configured"
+        # state is valid. Operator-facing text in Russian per
+        # CLAUDE.md `<language_conventions>`.
         from yadirect_agent.services.scheduler.windows import ScheduleStatus
 
         monkeypatch.setattr("sys.platform", "win32")
@@ -432,7 +434,7 @@ class TestScheduleStatus:
 
         result = runner.invoke(app, ["schedule", "status"])
         assert result.exit_code == 0, result.output
-        assert "not installed" in result.stdout.lower()
+        assert "не настроено" in result.stdout.lower()
 
 
 class TestScheduleRemove:
