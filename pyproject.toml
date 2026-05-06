@@ -1,6 +1,6 @@
 [project]
 name = "yadirect-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Autonomous AI agent for Yandex.Direct and Yandex.Metrika — with safety rails, audit trail, and a plan→confirm→execute policy."
 readme = "README.md"
 requires-python = ">=3.11"
