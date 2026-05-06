@@ -68,7 +68,7 @@ def render_status_text(
     previous = summaries_by_month.get((prev_year, prev_month))
 
     if current is None and previous is None:
-        console.print("[dim]No agent runs recorded yet — nothing to report.[/dim]")
+        console.print("[dim]Запусков агента ещё не было — данных пока нет.[/dim]")
         return
 
     table = Table(show_header=True, header_style="bold")

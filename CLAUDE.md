@@ -201,6 +201,20 @@ The repo deliberately uses two languages, by audience:
   `docs/TECHNICAL_SPEC.md` and `docs/BACKLOG.md`. These are operator-facing
   and the operator works in Russian. Code-level references inside them
   (file paths, function names, commit conventions) stay English.
+- **Russian is the default for operator-facing CLI / TUI text**:
+  the human reading `yadirect-agent ...` output is the target persona
+  Anna (non-developer media-buyer in Russia). Confirmation messages,
+  empty-state hints, error guidance, prompts — all live in Russian.
+  Distinct from English-by-convention surfaces:
+  - structlog event names (machine identifiers, English).
+  - exception class names + their `.args` payloads (English; the
+    operator-facing renderer translates to Russian text).
+  - `--option` help strings on typer commands (reference docs;
+    leave English unless the next person migrating CLI strings
+    decides otherwise).
+  - MCP tool response envelopes (the LLM in Claude Desktop reads
+    them and produces Russian chat output for Anna; the envelope
+    itself stays English so other MCP clients can consume it).
 
 In a single file, pick one and stay consistent. If a section in
 `TECHNICAL_SPEC.md` is half-Russian, half-English, it's a smell — fix it

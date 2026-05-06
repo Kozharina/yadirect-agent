@@ -54,7 +54,7 @@ from ..auth.callback_server import OAuthCallbackError
 from ..auth.keychain import KeyringTokenStore
 from ..auth.login_flow import DEFAULT_LOGIN_TIMEOUT_S, perform_login
 from ..config import Settings, get_settings
-from ..exceptions import AuthError
+from ..exceptions import AuthError, ConfigError
 from ..logging import configure_logging
 from ..models.health import default_window
 from ..rollout import RolloutState, RolloutStateStore
@@ -132,7 +132,20 @@ def _root(
         ),
     ] = False,
 ) -> None:
-    """Root callback; typer requires at least one."""
+    """Root callback; typer requires at least one.
+
+    Side effect: configures structlog before any command runs.
+    Without this, commands that don't call ``_bootstrap_settings``
+    (``install-into-claude-desktop``, ``uninstall-from-claude-desktop``,
+    ``auth logout``) ran on the structlog default factory which
+    writes to stdout — leaking log lines into operator-facing
+    output. By configuring once at the root callback, every command
+    (including those that never touch Settings) gets stderr-routed
+    logs. Settings access here is cheap and side-effect-free:
+    defaults cover all required fields, so ``get_settings()``
+    succeeds even on a fresh machine without env vars set.
+    """
+    configure_logging(get_settings())
 
 
 # --------------------------------------------------------------------------
@@ -299,7 +312,25 @@ def health_cmd(
                 goal_id=goal_id,
             )
 
-    report = asyncio.run(fetch())
+    try:
+        report = asyncio.run(fetch())
+    except ConfigError as exc:
+        # M15.x acceptance polish: on a fresh install without
+        # YANDEX_METRIKA_COUNTER_ID, this used to crash with a
+        # full Python traceback AND exit 0 — both bugs. The MCP
+        # ``account_health`` tool already handles the same case
+        # gracefully with a structured ``unconfigured`` envelope.
+        # Mirror the contract on the CLI side: friendly Russian
+        # message (per ``CLAUDE.md`` ``<language_conventions>``),
+        # exit 2 (matches ``auth login`` convention for "user-
+        # actionable misconfiguration"), no traceback noise.
+        _err.print(f"[yellow]{exc}[/yellow]")
+        _err.print(
+            "[dim]Подсказка: запустите онбординг через Claude Desktop "
+            "(«помоги настроить агента») или укажите переменные в .env "
+            "вручную.[/dim]"
+        )
+        raise typer.Exit(code=2) from exc
 
     if as_json:
         typer.echo(render_report_json(report))
@@ -1589,10 +1620,10 @@ def schedule_status_cmd(
             _out.print(f"  hourly service:{linux_status.hourly_service_path}")
             _out.print(f"  hourly timer:  {linux_status.hourly_timer_path}")
         else:
-            _out.print("[yellow]Scheduler not installed.[/yellow]")
+            _out.print("[yellow]Расписание не настроено.[/yellow]")
             _out.print(
-                "[dim]Run ``yadirect-agent schedule install`` to set up the "
-                "daily + hourly timers.[/dim]"
+                "[dim]Запустите ``yadirect-agent schedule install`` "
+                "чтобы создать ежедневный и ежечасный таймеры.[/dim]"
             )
         return
 
@@ -1615,10 +1646,10 @@ def schedule_status_cmd(
             _out.print(f"  daily xml:  {windows_status.daily_xml_path}")
             _out.print(f"  hourly xml: {windows_status.hourly_xml_path}")
         else:
-            _out.print("[yellow]Scheduler not installed.[/yellow]")
+            _out.print("[yellow]Расписание не настроено.[/yellow]")
             _out.print(
-                "[dim]Run ``yadirect-agent schedule install`` to set up the "
-                "daily + hourly tasks.[/dim]"
+                "[dim]Запустите ``yadirect-agent schedule install`` "
+                "чтобы создать ежедневную и ежечасную задачи.[/dim]"
             )
         return
 
@@ -1640,9 +1671,10 @@ def schedule_status_cmd(
         _out.print(f"  daily plist:  {status.daily_plist_path}")
         _out.print(f"  hourly plist: {status.hourly_plist_path}")
     else:
-        _out.print("[yellow]Scheduler not installed.[/yellow]")
+        _out.print("[yellow]Расписание не настроено.[/yellow]")
         _out.print(
-            "[dim]Run ``yadirect-agent schedule install`` to set up the daily + hourly jobs.[/dim]"
+            "[dim]Запустите ``yadirect-agent schedule install`` "
+            "чтобы создать ежедневную и ежечасную задачи.[/dim]"
         )
 
 
