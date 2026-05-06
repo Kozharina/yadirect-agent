@@ -60,6 +60,7 @@ from ..models.health import default_window
 from ..rollout import RolloutState, RolloutStateStore
 from ..services.campaigns import CampaignService, CampaignSummary
 from ..services.health_check import HealthCheckService
+from ..services.health_history_store import HealthHistoryStore
 from ..services.scheduler.linux import LinuxScheduler
 from ..services.scheduler.linux import ScheduleStatus as LinuxScheduleStatus
 from ..services.scheduler.macos import MacOSScheduler, ScheduleStatus
@@ -283,8 +284,16 @@ def health_cmd(
     """
     settings = _bootstrap_settings()
 
+    # M15.5.5: pass a HealthHistoryStore so the CTR-drift rule has
+    # somewhere to read previous-week snapshots from. The store sits
+    # alongside ``audit.jsonl`` (single source of truth via
+    # ``from_settings``); first run on a fresh account silently
+    # writes its baseline and returns no drift findings, second run
+    # has data to compare against.
+    history_store = HealthHistoryStore.from_settings(settings)
+
     async def fetch() -> Any:
-        async with HealthCheckService(settings) as svc:
+        async with HealthCheckService(settings, history_store=history_store) as svc:
             return await svc.run_account_check(
                 date_range=default_window(days=days),
                 goal_id=goal_id,

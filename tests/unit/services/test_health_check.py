@@ -16,6 +16,7 @@ A second file or section below adds the high-CPA rule.
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 from typing import Any, Self
 
 import pytest
@@ -1139,3 +1140,316 @@ class TestLowCtrRule:
         # CTR which is below threshold).
         assert len(low_ctr_findings) == 1
         assert low_ctr_findings[0].campaign_id == 2
+
+
+# --------------------------------------------------------------------------
+# CtrDriftRule (M15.5.5) — historical week-over-week comparison.
+# --------------------------------------------------------------------------
+
+
+def _snapshot_for_drift(
+    *,
+    campaign_id: int = 1,
+    snapshot_at: object = None,  # datetime, but typed loosely so the helper stays tiny
+    clicks: int = 100,
+    impressions: int = 10_000,
+    ctr_pct: float | None = 1.0,
+) -> object:
+    """Test-local HealthSnapshot helper. Mirrors the one in
+    test_health_history_store but with a default snapshot_at one
+    week before _WEEK.start so "previous" is always coherent."""
+    from datetime import UTC, date
+    from datetime import datetime as _dt
+
+    from yadirect_agent.models.health_history import HealthSnapshot
+
+    snap_at = snapshot_at or _dt(2026, 3, 25, 8, 0, tzinfo=UTC)
+    return HealthSnapshot(
+        snapshot_at=snap_at,  # type: ignore[arg-type]
+        date_range=DateRange(start=date(2026, 3, 18), end=date(2026, 3, 24)),
+        campaign_id=campaign_id,
+        clicks=clicks,
+        impressions=impressions,
+        ctr_pct=ctr_pct,
+    )
+
+
+class TestCtrDriftRule:
+    def test_flags_campaign_with_drop_above_threshold(self) -> None:
+        # Canonical drift: previous week 2.0% CTR → current 0.8% CTR
+        # → 60% relative drop. WARNING-severity finding pinned to
+        # the campaign with both prev and current CTR in the message.
+        from yadirect_agent.services.health_check import CtrDriftRule
+
+        rule = CtrDriftRule(_settings_for_rules())
+        previous = _snapshot_for_drift(
+            campaign_id=42,
+            clicks=200,
+            impressions=10_000,
+            ctr_pct=2.0,
+        )
+        current = _perf(
+            campaign_id=42,
+            name="search-broad",
+            clicks=80,
+            cost_rub=400.0,
+            impressions=10_000,
+        )
+
+        finding = rule.check(current, previous_snapshot=previous)  # type: ignore[arg-type]
+
+        assert finding is not None
+        assert finding.rule_id == "ctr_drift"
+        assert finding.severity == Severity.WARNING
+        assert finding.campaign_id == 42
+        assert finding.campaign_name == "search-broad"
+        # Message must surface BOTH the previous and the current
+        # CTR so the operator can see the magnitude of the drop
+        # without grepping the history file.
+        assert "2.0" in finding.message
+        assert "0.8" in finding.message
+
+    def test_no_finding_when_drop_below_threshold(self) -> None:
+        # 2.0% → 1.6% = 20% relative drop, below the 30% threshold.
+        # No finding — operator already sees the campaign in
+        # week-over-week reporting elsewhere.
+        from yadirect_agent.services.health_check import CtrDriftRule
+
+        rule = CtrDriftRule(_settings_for_rules())
+        previous = _snapshot_for_drift(
+            campaign_id=1,
+            ctr_pct=2.0,
+            clicks=200,
+            impressions=10_000,
+        )
+        current = _perf(
+            campaign_id=1,
+            clicks=160,
+            impressions=10_000,
+        )
+
+        assert rule.check(current, previous_snapshot=previous) is None  # type: ignore[arg-type]
+
+    def test_no_finding_when_ctr_went_up(self) -> None:
+        # CTR going UP is good news, never a drift alert. A
+        # symmetric "absolute change" rule would surface this and
+        # spam the operator with positive news; we deliberately
+        # treat upward movement as a no-op.
+        from yadirect_agent.services.health_check import CtrDriftRule
+
+        rule = CtrDriftRule(_settings_for_rules())
+        previous = _snapshot_for_drift(
+            campaign_id=1,
+            ctr_pct=1.0,
+            clicks=100,
+            impressions=10_000,
+        )
+        current = _perf(
+            campaign_id=1,
+            clicks=300,
+            impressions=10_000,
+        )
+
+        assert rule.check(current, previous_snapshot=previous) is None  # type: ignore[arg-type]
+
+    def test_no_finding_when_previous_snapshot_is_none(self) -> None:
+        # First-ever run for this campaign — there's nothing to
+        # compare against. Rule must silently skip.
+        from yadirect_agent.services.health_check import CtrDriftRule
+
+        rule = CtrDriftRule(_settings_for_rules())
+        current = _perf(campaign_id=1, clicks=10, impressions=10_000)
+
+        assert rule.check(current, previous_snapshot=None) is None
+
+    def test_no_finding_when_previous_below_min_impressions(self) -> None:
+        # Previous-week sample was statistically meaningless (200
+        # impressions). Comparing this week's 10k-impression CTR
+        # against a 200-impression baseline produces noise. Skip.
+        from yadirect_agent.services.health_check import CtrDriftRule
+
+        rule = CtrDriftRule(_settings_for_rules())
+        previous = _snapshot_for_drift(
+            campaign_id=1,
+            ctr_pct=3.0,
+            clicks=6,
+            impressions=200,  # well below MIN_IMPRESSIONS
+        )
+        current = _perf(
+            campaign_id=1,
+            clicks=80,
+            impressions=10_000,  # would be 0.8%, a "drop" from 3.0%
+        )
+
+        assert rule.check(current, previous_snapshot=previous) is None  # type: ignore[arg-type]
+
+    def test_no_finding_when_current_below_min_impressions(self) -> None:
+        # Symmetric: current-week sample is too small to trust as
+        # the "after" reading. The campaign may have been paused
+        # mid-week; flagging on a 50-impression sample would mislead.
+        from yadirect_agent.services.health_check import CtrDriftRule
+
+        rule = CtrDriftRule(_settings_for_rules())
+        previous = _snapshot_for_drift(
+            campaign_id=1,
+            ctr_pct=2.0,
+            clicks=200,
+            impressions=10_000,
+        )
+        current = _perf(
+            campaign_id=1,
+            clicks=0,
+            impressions=50,  # well below MIN_IMPRESSIONS
+        )
+
+        assert rule.check(current, previous_snapshot=previous) is None  # type: ignore[arg-type]
+
+    def test_no_finding_when_previous_ctr_is_none(self) -> None:
+        # Previous snapshot had impressions=0 (CTR undefined).
+        # Cannot compute a drop. Skip rather than treat None as 0.
+        from yadirect_agent.services.health_check import CtrDriftRule
+
+        rule = CtrDriftRule(_settings_for_rules())
+        previous = _snapshot_for_drift(
+            campaign_id=1,
+            clicks=0,
+            impressions=0,
+            ctr_pct=None,
+        )
+        current = _perf(
+            campaign_id=1,
+            clicks=80,
+            impressions=10_000,
+        )
+
+        assert rule.check(current, previous_snapshot=previous) is None  # type: ignore[arg-type]
+
+
+def _settings_for_rules() -> Settings:
+    """Same shape as the conftest fixture but constructable inline.
+
+    Rule unit tests don't need a Settings with anything specific
+    set — the rule reads thresholds off class constants. Cheaper
+    to spin one up here than to convert each rule test to an
+    async pytest function just to receive ``settings``.
+    """
+    from pathlib import Path as _Path
+
+    from pydantic import SecretStr
+
+    return Settings(
+        yandex_direct_token=SecretStr("test-direct-token"),
+        yandex_metrika_token=SecretStr("test-metrika-token"),
+        yandex_use_sandbox=True,
+        agent_policy_path=_Path("/tmp/policy.yml"),
+        agent_max_daily_budget_rub=10_000,
+        audit_log_path=_Path("/tmp/audit.jsonl"),  # nosec
+    )
+
+
+# --------------------------------------------------------------------------
+# HealthCheckService + HealthHistoryStore integration (M15.5.5).
+# --------------------------------------------------------------------------
+
+
+class TestHealthCheckServiceWithHistory:
+    async def test_no_history_store_means_no_drift_findings_and_no_save(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # Default constructor (no history_store) — historical rules
+        # silently skip and nothing is written. Lets the existing
+        # `--no-LLM` mode keep working without forcing a history
+        # file on every fresh install.
+        perf = _perf(
+            campaign_id=1,
+            clicks=80,
+            impressions=10_000,  # would trigger LowCtrRule too — that's fine
+        )
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[perf]))
+
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=_WEEK)
+
+        # No ctr_drift in findings (historical rule is OFF).
+        assert all(f.rule_id != "ctr_drift" for f in report.findings)
+        # No history file created.
+        assert not (tmp_path / "logs" / "health_history.jsonl").exists()
+
+    async def test_first_run_with_empty_history_store_skips_drift_and_saves_snapshots(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # Fresh install with history store wired in. First run has
+        # nothing to compare against → no ctr_drift finding. But it
+        # must persist current snapshots so the second run has a
+        # baseline. This is the lifecycle the operator first
+        # experiences.
+        from yadirect_agent.services.health_history_store import HealthHistoryStore
+
+        store = HealthHistoryStore.from_settings(settings)
+        perf = _perf(
+            campaign_id=1,
+            clicks=200,
+            impressions=10_000,
+        )
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[perf]))
+
+        async with HealthCheckService(settings, history_store=store) as svc:
+            report = await svc.run_account_check(date_range=_WEEK)
+
+        assert all(f.rule_id != "ctr_drift" for f in report.findings)
+        # Snapshot persisted for next run's comparison.
+        latest = store.load_latest_per_campaign()
+        assert set(latest) == {1}
+        assert latest[1].clicks == 200
+        assert latest[1].impressions == 10_000
+
+    async def test_second_run_with_drift_above_threshold_flags_finding(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # End-to-end: pre-seed the store with last week's snapshot,
+        # run the service with a current-week perf row that's a >30%
+        # drop. Service must surface a ctr_drift finding.
+        from datetime import UTC
+        from datetime import datetime as _dt
+
+        from yadirect_agent.models.health_history import HealthSnapshot
+        from yadirect_agent.services.health_history_store import HealthHistoryStore
+
+        store = HealthHistoryStore.from_settings(settings)
+        prev = HealthSnapshot(
+            snapshot_at=_dt(2026, 3, 25, 8, 0, tzinfo=UTC),
+            date_range=DateRange(start=date(2026, 3, 18), end=date(2026, 3, 24)),
+            campaign_id=42,
+            clicks=200,
+            impressions=10_000,
+            ctr_pct=2.0,
+        )
+        store.append([prev])
+
+        current = _perf(
+            campaign_id=42,
+            name="search-broad",
+            clicks=80,
+            impressions=10_000,
+        )
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[current]))
+
+        async with HealthCheckService(settings, history_store=store) as svc:
+            report = await svc.run_account_check(date_range=_WEEK)
+
+        drift_findings = [f for f in report.findings if f.rule_id == "ctr_drift"]
+        assert len(drift_findings) == 1
+        assert drift_findings[0].campaign_id == 42
+
+        # Current snapshot also persisted for the next run.
+        latest = store.load_latest_per_campaign()
+        assert latest[42].clicks == 80

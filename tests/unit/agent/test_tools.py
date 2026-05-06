@@ -676,6 +676,62 @@ class TestAccountHealthTool:
         assert result["status"] == "unconfigured"
         assert "YANDEX_METRIKA_COUNTER_ID" in result["reason"]
 
+    @pytest.mark.asyncio
+    async def test_handler_passes_history_store_to_service(
+        self,
+        settings: Settings,
+        tool_context: ToolContext,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # M15.5.5: the MCP tool must wire a HealthHistoryStore into
+        # HealthCheckService so the CTR-drift rule has somewhere to
+        # read previous-week snapshots from. Without this assertion,
+        # a regression that dropped the kwarg silently disables drift
+        # detection on the conversational surface even when the CLI
+        # surface still works.
+        from typing import Self
+
+        from yadirect_agent.models.health import HealthReport
+        from yadirect_agent.models.metrika import DateRange
+        from yadirect_agent.services.health_history_store import HealthHistoryStore
+
+        captured: dict[str, object] = {}
+
+        class _SpyService:
+            def __init__(
+                self,
+                _settings: object,
+                *,
+                history_store: HealthHistoryStore | None = None,
+            ) -> None:
+                captured["history_store"] = history_store
+
+            async def __aenter__(self) -> Self:
+                return self
+
+            async def __aexit__(self, *_: object) -> None:
+                return None
+
+            async def run_account_check(
+                self,
+                *,
+                date_range: DateRange,
+                goal_id: int | None = None,
+            ) -> HealthReport:
+                return HealthReport(date_range=date_range, findings=[])
+
+        from yadirect_agent.agent import tools as _tools_mod
+
+        monkeypatch.setattr(_tools_mod, "HealthCheckService", _SpyService)
+
+        tool = build_default_registry(settings).get("account_health")
+        inp = tool.input_model.model_validate({})
+        await tool.handler(inp, tool_context)
+
+        assert isinstance(captured["history_store"], HealthHistoryStore), (
+            f"expected HealthHistoryStore, got {captured['history_store']!r}"
+        )
+
 
 # --------------------------------------------------------------------------
 # M15.4 slice 1 — ``start_onboarding`` MCP tool. Read-only probe of

@@ -80,10 +80,9 @@ demo-only, technically; it cannot be handed to a non-developer.
 - [x] ~~**M15.5.2-3 — rejected-ads / rejected-keywords rules**~~ —
       shipped, see Done.
 - [x] ~~**M15.5.4 — low-CTR rule**~~ — shipped, see Done.
-- [ ] **M15.5.5 — CTR-drift rule**: week-over-week CTR comparison,
-      needs a mini history-store for last-week's per-campaign
-      CTR. Larger PR than M15.5.4 because of the history
-      infrastructure.
+- [x] ~~**M15.5.5 — CTR-drift rule**~~ — shipped, see Done.
+      First historical / week-over-week rule + reusable
+      ``HealthHistoryStore`` infrastructure.
 - [ ] **`@requires_llm` decorator** (deferred): pattern for tools
       that gate on Anthropic key presence. Waiting for the first
       real LLM-gated consumer (M8 creatives or M12 reports) per
@@ -1120,6 +1119,77 @@ Last 10 items (newest at top). Older items are available via
       tests via a ``fake_linux_scheduler`` fixture mirroring
       ``fake_scheduler``. 1087 tests green; mypy strict; ruff
       clean.
+
+- [x] **M15.5.5 — CTR-drift rule + reusable HealthHistoryStore**
+      (Phase 0+1 release 0.2.0). First historical / week-over-week
+      rule. Closes the M15.5 health-rule expansion architecturally
+      (.1 → .5 all shipped); only ``--no-llm`` mode remains
+      structurally, and that's been honoured since M15.5.
+
+      Three pieces:
+
+      - ``models/health_history.py`` — frozen dataclass
+        ``HealthSnapshot`` with ``snapshot_at``, ``date_range``,
+        ``campaign_id``, ``clicks``, ``impressions``,
+        ``ctr_pct: float | None``. ``__post_init__`` rejects
+        negative clicks / impressions at the boundary so a future
+        ``from_jsonable`` deserialization path can't sneak in
+        values that invert downstream rule semantics.
+      - ``services/health_history_store.py`` — append-only JSONL
+        store sibling to ``rationale.jsonl`` / ``cost.jsonl``.
+        Same operational shape every persistent store in the
+        codebase has settled on: missing file is normal,
+        corrupt-line tolerance with one aggregated structlog
+        warning per scan, ``HealthHistoryStore.from_settings``
+        classmethod placing the file alongside ``audit.jsonl``.
+        Empty-list ``append`` is a no-op so a fresh-account
+        ``run_account_check`` with zero campaigns stays truly
+        silent on disk.
+      - ``services/health_check.py`` — third rule lane
+        (``_HistoricalRule`` base class) joining ``_Rule`` and
+        ``_DirectStateRule``. ``CtrDriftRule`` implementation:
+        relative drop > 30% over the prev week, with
+        ``MIN_IMPRESSIONS=1000`` symmetric guards on both
+        windows so a 200-impression baseline can't be compared
+        against a 10k-impression current week (or vice versa).
+        ``HealthCheckService`` grew an optional ``history_store``
+        kwarg — None preserves the no-LLM-mode contract for any
+        caller that hasn't been updated; provided wires the
+        load → run → save lifecycle.
+
+      Wiring: CLI ``health`` cmd, MCP ``account_health`` tool,
+      and the M15.4 onboarding's ``_build_health_payload`` rollup
+      all pass ``HealthHistoryStore.from_settings(settings)``.
+      One canonical history file shared across surfaces — a
+      manual terminal run contributes baselines the next
+      conversational call uses for drift comparison, and vice
+      versa.
+
+      Decisions deliberately deferred (separate follow-up
+      tickets if needed):
+      - **Direction**: drop-only, not symmetric absolute change.
+        CTR going UP is good news; symmetric rule would surface
+        every optimisation win as an "alert" and train the
+        operator to ignore the channel.
+      - **Relative, not absolute**: operators think in relative
+        terms ("CTR fell by a third"). 2.0% → 1.4% is a 30%
+        relative drop; same as 1.0% → 0.7%. The rule speaks the
+        operator's language.
+      - **estimated_impact_rub=None**: lost-clicks-equivalent in
+        RUB requires CPC, which we don't carry on perf rows
+        (cost_rub is window-aggregated, not per-click). Future
+        enhancement could derive avg-CPC from prev-week
+        ``cost_rub / clicks`` and multiply by lost-click delta.
+
+      Collateral fix included to unblock CI:
+      ``test_explicit_config_path_creates_config`` was a
+      pre-existing flake (rich.Console 80-col wrap-width on deep
+      CI tmpdirs splits the absolute path across a newline; same
+      gotcha as M15.6 slice 2). Pin filename only, document
+      inline.
+
+      55 tests green for the M15.5.5 surface; full suite 1168
+      tests; mypy strict; ruff clean.
 
 - [x] **M15.3 follow-up — extract shared ``refresh_settings_token``
       helper** (Phase 0+1 housekeeping; deferred from #69 per

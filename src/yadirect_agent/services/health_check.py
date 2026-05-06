@@ -1,24 +1,31 @@
-"""Account health check service (M15.5.1, M15.5.2-3).
+"""Account health check service (M15.5.1, M15.5.2-3, M15.5.4, M15.5.5).
 
-Consumes data from two sources and applies a battery of rule-based
+Consumes data from three sources and applies a battery of rule-based
 checks:
 
 1. **Metrika perf rows** — ``CampaignPerformance`` from the M6
    ``ReportingService.account_overview``. Each ``_Rule`` subclass
    has a synchronous ``check(perf)`` method returning zero or one
    ``Finding``. Used for cost/conversion-based rules
-   (BurningCampaign, HighCpa).
+   (BurningCampaign, HighCpa, LowCtr).
 2. **Direct API state** — moderation status of ads / keywords.
    Each ``_DirectStateRule`` subclass has an async
    ``collect_findings(direct, *, campaigns)`` method returning
    any number of findings (typically aggregated per-campaign).
    Used for state-based rules (RejectedAds, RejectedKeywords).
+3. **Historical Metrika perf** — last week's ``HealthSnapshot``
+   from ``HealthHistoryStore``, paired with this week's perf.
+   Each ``_HistoricalRule`` subclass has a synchronous
+   ``check(perf, *, previous_snapshot)`` method. Used for
+   week-over-week rules (CtrDrift). Historical rules silently
+   skip when no ``history_store`` is wired in — the M15.5.x
+   ``--no-llm`` mode keeps working on fresh installs.
 
-Two parallel rule lists rather than one unified interface because
-the data shapes differ enough that a common base class would
-either require Optional fields everywhere or push tribal knowledge
-of "which rules consume what" into every site that builds a rule
-list. Two lists, two clear contracts.
+Three parallel rule lists rather than one unified interface
+because the data shapes differ enough that a common base class
+would either require Optional fields everywhere or push tribal
+knowledge of "which rules consume what" into every site that
+builds a rule list. Three lists, three clear contracts.
 
 Why rules-as-classes rather than a flat function:
 
@@ -26,8 +33,8 @@ Why rules-as-classes rather than a flat function:
   ``HIGH_CPA_MULTIPLIER``, etc.) that are easier to override per
   test or per future ``agent_policy.yml`` knob when they live as
   class-level constants.
-- Adding a new rule (M15.5.4 CTR-drift, etc.) is "drop a class
-  in the rules list" — no service-level changes.
+- Adding a new rule is "drop a class in the matching rules list"
+  — no service-level changes.
 - The rule_id documented on the class is the stable identifier
   used in audit logs, CLI filtering, and M12 reports.
 
@@ -40,14 +47,17 @@ schema gains health-check sections.
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import UTC, datetime
 from typing import Any, Self
 
 from ..clients.direct import DirectService
 from ..config import Settings
 from ..models.campaigns import Campaign, CampaignState
 from ..models.health import Finding, HealthReport, Severity
+from ..models.health_history import HealthSnapshot
 from ..models.keywords import Keyword
 from ..models.metrika import CampaignPerformance, DateRange
+from .health_history_store import HealthHistoryStore
 from .reporting import ReportingService
 
 
@@ -287,6 +297,170 @@ class LowCtrRule(_Rule):
         )
 
 
+class _HistoricalRule:
+    """Base for rules that compare current perf against a previous snapshot.
+
+    Distinct from ``_Rule`` because the input shape is different
+    (``CampaignPerformance`` for now + ``HealthSnapshot | None``
+    for the historical baseline) and the lifecycle is different
+    (the service must load history before invoking and save
+    snapshots after — neither concern belongs in ``_Rule``).
+
+    Stateless; safe to instantiate once. Receives ``settings`` for
+    parity with ``_Rule`` even though the only current implementation
+    (``CtrDriftRule``) uses class-level constants.
+    """
+
+    rule_id: str = ""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    def check(
+        self,
+        perf: CampaignPerformance,
+        *,
+        previous_snapshot: HealthSnapshot | None,
+    ) -> Finding | None:
+        raise NotImplementedError
+
+
+class CtrDriftRule(_HistoricalRule):
+    """Flag campaigns whose CTR dropped sharply week-over-week.
+
+    Drift = relative drop, not absolute change:
+    ``(prev_ctr - current_ctr) / prev_ctr * 100``. A 2.0% → 1.4%
+    week is a 30% drop; same as 1.0% → 0.7%. Operators think in
+    relative terms ("CTR fell by a third"), so the rule speaks
+    that language.
+
+    Pre-conditions (all required, all silent skips):
+
+    - ``previous_snapshot`` must not be None — first-ever run for
+      a campaign has nothing to compare against. The snapshot
+      gets persisted by the service for the next run.
+    - Both windows must meet ``MIN_IMPRESSIONS`` (1000). A
+      previous-week sample of 200 impressions is statistical
+      noise; comparing against it produces false positives. Same
+      asymmetry guard for the current week (campaign paused
+      mid-week → low impressions → would falsely fire).
+    - ``previous_snapshot.ctr_pct`` must not be None. None means
+      previous week had impressions=0; we cannot compute a drop
+      from undefined.
+    - The relative drop must EXCEED ``MAX_CTR_DROP_PCT`` (30.0).
+      At-or-below the threshold is a pass (operator already sees
+      smaller drift in the standard week-over-week reports).
+
+    Severity: WARNING. Not HIGH because legitimate week-over-week
+    drift happens (Black Friday week vs the week after, brand
+    campaign ramp-down). The operator decides whether to act.
+
+    Why drop-only, not a symmetric absolute change rule: CTR
+    going UP is good news. A symmetric rule would surface every
+    optimisation win as an "alert" and train the operator to
+    ignore the channel. Asymmetry is deliberate.
+    """
+
+    rule_id = "ctr_drift"
+
+    # 30% relative drop is the threshold media-buyers use as a
+    # "this needs attention" gate in their weekly reviews. Smaller
+    # drops are noise on most accounts; larger drops signal
+    # creative fatigue, ad-rotation issue, or competitive pressure.
+    # Becomes a Settings.policy knob in a follow-up.
+    MAX_CTR_DROP_PCT: float = 30.0
+
+    # Same statistical-significance gate as ``LowCtrRule`` —
+    # consistent threshold across CTR-related rules makes the
+    # operator's mental model simple ("CTR rules need 1000+
+    # impressions").
+    MIN_IMPRESSIONS: int = 1000
+
+    def check(
+        self,
+        perf: CampaignPerformance,
+        *,
+        previous_snapshot: HealthSnapshot | None,
+    ) -> Finding | None:
+        if previous_snapshot is None:
+            return None
+        if previous_snapshot.ctr_pct is None:
+            return None
+        if previous_snapshot.impressions < self.MIN_IMPRESSIONS:
+            return None
+        if perf.impressions < self.MIN_IMPRESSIONS:
+            return None
+        # Defensive divisor guard — the MIN_IMPRESSIONS gate above
+        # implies impressions > 0, but a future regression that
+        # lowered the threshold to 0 must not silently divide by
+        # zero. Same shape as LowCtrRule.
+        if perf.impressions == 0:
+            return None
+
+        previous_ctr = previous_snapshot.ctr_pct
+        # previous_ctr is float (None caught above); divisor guard
+        # via MIN_IMPRESSIONS implies it's strictly > 0 in any
+        # realistic scenario — but pin explicitly so a synthetic
+        # test pinning ctr_pct=0.0 doesn't ZeroDivisionError us.
+        if previous_ctr <= 0.0:
+            return None
+
+        current_ctr = perf.clicks / perf.impressions * 100.0
+        if current_ctr >= previous_ctr:
+            # CTR went up or stayed the same — not drift, not an alert.
+            return None
+
+        drop_pct = (previous_ctr - current_ctr) / previous_ctr * 100.0
+        if drop_pct <= self.MAX_CTR_DROP_PCT:
+            return None
+
+        message = (
+            f"campaign '{perf.campaign_name}' CTR dropped "
+            f"{drop_pct:.0f}% week-over-week: "
+            f"{previous_ctr:.1f}% → {current_ctr:.1f}% "
+            f"({perf.clicks} clicks / {perf.impressions} impressions "
+            f"this week vs {previous_snapshot.clicks} / "
+            f"{previous_snapshot.impressions} previously)"
+        )
+        return Finding(
+            rule_id=self.rule_id,
+            severity=Severity.WARNING,
+            campaign_id=perf.campaign_id,
+            campaign_name=perf.campaign_name,
+            message=message,
+            # estimated_impact_rub=None because lost-clicks-equivalent
+            # in RUB requires CPC, which we don't carry on the perf
+            # row (cost_rub is window-aggregated, not per-click).
+            # A future enhancement could derive avg-CPC from
+            # cost_rub / clicks of the previous week and multiply
+            # by the lost click delta — out of scope for slice 1.
+            estimated_impact_rub=None,
+        )
+
+
+def _perf_to_snapshot(
+    perf: CampaignPerformance,
+    *,
+    snapshot_at: datetime,
+) -> HealthSnapshot:
+    """Convert a current-week ``CampaignPerformance`` into a snapshot
+    suitable for ``HealthHistoryStore.append``.
+
+    CTR computed here (not on the perf row) because perf rows
+    don't carry CTR — it's the rule's domain knowledge. ``None``
+    when impressions == 0, matching the documented contract.
+    """
+    ctr_pct = (perf.clicks / perf.impressions * 100.0) if perf.impressions > 0 else None
+    return HealthSnapshot(
+        snapshot_at=snapshot_at,
+        date_range=perf.date_range,
+        campaign_id=perf.campaign_id,
+        clicks=perf.clicks,
+        impressions=perf.impressions,
+        ctr_pct=ctr_pct,
+    )
+
+
 class _DirectStateRule:
     """Base for rules that consume Direct API state (not Metrika perf).
 
@@ -451,10 +625,16 @@ class RejectedKeywordsRule(_DirectStateRule):
 
 
 class HealthCheckService:
-    """Run a battery of rules over Metrika perf + Direct state."""
+    """Run a battery of rules over Metrika perf + Direct state + history."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        history_store: HealthHistoryStore | None = None,
+    ) -> None:
         self._settings = settings
+        self._history_store = history_store
         # Order matters for the operator's reading: HIGH-severity rules
         # first so the most-actionable findings cluster at the top of
         # the per-campaign output before the CLI re-sorts globally.
@@ -466,6 +646,9 @@ class HealthCheckService:
         self._direct_rules: list[_DirectStateRule] = [
             RejectedAdsRule(settings),
             RejectedKeywordsRule(settings),
+        ]
+        self._historical_rules: list[_HistoricalRule] = [
+            CtrDriftRule(settings),
         ]
 
     async def __aenter__(self) -> Self:
@@ -480,13 +663,31 @@ class HealthCheckService:
         date_range: DateRange,
         goal_id: int | None = None,
     ) -> HealthReport:
-        """Run all rules over the account overview + Direct state.
+        """Run all rules over the account overview + Direct state + history.
 
         ``goal_id`` is optional but most perf-rules are pre-conditioned
         on it — without conversions data, the conclusions degrade to
         cost-only signals that produce false positives. Direct-state
-        rules don't need it (rejection status is goal-independent).
+        rules and the historical rules don't need it (rejection
+        status is goal-independent; CTR is purely
+        impressions / clicks).
+
+        Lifecycle when ``history_store`` is wired in:
+        1. Load latest-per-campaign snapshots BEFORE running any rules.
+        2. Run perf-rules + direct-state-rules (existing behaviour).
+        3. Run historical rules with each campaign's previous snapshot
+           injected (or None if first-ever sighting).
+        4. Append current overview as new snapshots so the next run
+           has a baseline.
+
+        With ``history_store=None`` (default), step 1, 3, and 4 are
+        no-ops — preserves the M15.5.x ``--no-llm`` mode contract for
+        callers that haven't been updated to wire in history yet.
         """
+        previous_by_campaign: dict[int, HealthSnapshot] = {}
+        if self._history_store is not None:
+            previous_by_campaign = self._history_store.load_latest_per_campaign()
+
         async with ReportingService(self._settings) as reporting:
             overview = await reporting.account_overview(
                 date_range=date_range,
@@ -499,6 +700,16 @@ class HealthCheckService:
                 finding = rule.check(perf, goal_id=goal_id)
                 if finding is not None:
                     findings.append(finding)
+
+            if self._history_store is not None and self._historical_rules:
+                previous = previous_by_campaign.get(perf.campaign_id)
+                for historical_rule in self._historical_rules:
+                    historical_finding = historical_rule.check(
+                        perf,
+                        previous_snapshot=previous,
+                    )
+                    if historical_finding is not None:
+                        findings.append(historical_finding)
 
         if self._direct_rules:
             async with DirectService(self._settings) as direct:
@@ -513,14 +724,28 @@ class HealthCheckService:
                     rule_findings = await direct_rule.collect_findings(direct, campaigns=active)
                     findings.extend(rule_findings)
 
+        # Persist current overview as snapshots for the next run.
+        # Done AFTER rule execution so a rule that crashes mid-run
+        # doesn't pollute the history with a half-evaluated week.
+        # (A real crash propagates here and the snapshot save is
+        # skipped — the next run will then see the older baseline,
+        # which is correct: we never crashed past the rule, so we
+        # never observed this week.)
+        if self._history_store is not None and overview:
+            now = datetime.now(UTC)
+            snapshots = [_perf_to_snapshot(perf, snapshot_at=now) for perf in overview]
+            self._history_store.append(snapshots)
+
         return HealthReport(date_range=date_range, findings=findings)
 
 
 # Re-export so monkeypatch in tests targets a stable name.
 __all__ = [
     "BurningCampaignRule",
+    "CtrDriftRule",
     "DirectService",
     "HealthCheckService",
+    "HealthHistoryStore",
     "HighCpaRule",
     "LowCtrRule",
     "RejectedAdsRule",
