@@ -1,30 +1,33 @@
-"""Tests for ``yadirect-agent schedule ...`` CLI subapp (M15.6 slices 1+2).
+"""Tests for ``yadirect-agent schedule ...`` CLI subapp (M15.6 slices 1+2+3).
 
 Three commands operators run by hand:
 
 - ``schedule install [--platform=auto/macos/linux/windows]``
-  — generate plists or systemd unit files, write them to the
-  platform's standard location, call ``launchctl load -w`` or
-  ``systemctl --user enable --now``. macOS + Linux ship in
-  slices 1+2; Windows still prints a "shipping in slice 3"
-  message and exits 2.
-- ``schedule status`` — read the on-disk plists / unit files,
-  report installed / not installed (paths included so the
+  — generate plists, systemd unit files, or Task Scheduler XML,
+  write them to the platform's standard location, then call
+  ``launchctl load -w`` (macOS), ``systemctl --user enable
+  --now`` (Linux), or ``schtasks /Create /XML /F`` (Windows).
+  All three platforms ship; auto-detection picks the right
+  branch from ``sys.platform``.
+- ``schedule status`` — read the on-disk plists / unit files /
+  XML, report installed / not installed (paths included so the
   operator can tail the logs).
 - ``schedule remove`` — call ``launchctl unload`` + delete the
-  plist files (macOS), or ``systemctl --user disable --now`` +
-  delete the unit files (Linux). Idempotent on fresh accounts.
+  plist files (macOS), ``systemctl --user disable --now`` +
+  delete unit files (Linux), or ``schtasks /Delete`` + delete
+  XML files (Windows). Idempotent on fresh accounts.
 
-Tests patch ``MacOSScheduler`` / ``LinuxScheduler`` with in-memory
-spies; the actual plist / unit-file generation + subprocess
-behaviour is covered in
-``tests/unit/services/scheduler/test_macos.py`` and
-``test_linux.py``.
+Tests patch ``MacOSScheduler`` / ``LinuxScheduler`` /
+``WindowsScheduler`` with in-memory spies; the actual plist /
+unit-file / XML generation + subprocess behaviour is covered in
+``tests/unit/services/scheduler/test_macos.py``,
+``test_linux.py``, and ``test_windows.py``.
 
 Exit-code conventions:
 - 0 — success (install completed, status read, remove completed).
-- 2 — platform not yet supported (Windows until slice 3) OR
-  install failure (subprocess error from launchctl / systemctl).
+- 2 — unsupported platform (cygwin, aix, etc.) OR install
+  failure (subprocess error from launchctl / systemctl /
+  schtasks).
 """
 
 from __future__ import annotations
@@ -112,6 +115,39 @@ def fake_linux_scheduler(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Mag
     return instance
 
 
+@pytest.fixture
+def fake_windows_scheduler(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> MagicMock:
+    """Replace ``WindowsScheduler`` with a MagicMock so CLI tests
+    don't depend on real schtasks.
+
+    Mirrors ``fake_scheduler`` (macOS) / ``fake_linux_scheduler``
+    (Linux); returns realistic ``WindowsInstallResult`` /
+    ``ScheduleStatus`` instances so the rendering layer (which
+    reads attributes off them) gets the right shape.
+    """
+    from yadirect_agent.services.scheduler.windows import (
+        ScheduleStatus,
+        WindowsInstallResult,
+    )
+
+    instance = MagicMock()
+    instance.install.return_value = WindowsInstallResult(
+        daily_xml_path=tmp_path / "yadirect-agent-daily.xml",
+        hourly_xml_path=tmp_path / "yadirect-agent-hourly.xml",
+        log_dir=tmp_path / "logs",
+    )
+    instance.status.return_value = ScheduleStatus(
+        installed=True,
+        daily_xml_path=tmp_path / "yadirect-agent-daily.xml",
+        hourly_xml_path=tmp_path / "yadirect-agent-hourly.xml",
+    )
+    instance.remove.return_value = None
+
+    cls = MagicMock(return_value=instance)
+    monkeypatch.setattr("yadirect_agent.cli.main.WindowsScheduler", cls)
+    return instance
+
+
 class TestScheduleInstall:
     def test_install_macos_explicit_succeeds(
         self,
@@ -185,14 +221,45 @@ class TestScheduleInstall:
         assert result.exit_code == 0, result.output
         fake_linux_scheduler.install.assert_called_once()
 
-    def test_install_windows_prints_not_yet_supported_and_exits_2(
+    def test_install_windows_explicit_succeeds(
         self,
         runner: CliRunner,
+        fake_windows_scheduler: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # Slice 3 ships Task Scheduler. Operators on Windows now
+        # get the same install / status / remove surface as
+        # macOS + Linux — the platform branch is no longer a
+        # stub. ``--platform=windows`` skips auto-detection so
+        # the test runs the right branch on a non-Windows CI box.
+        monkeypatch.setattr("shutil.which", lambda _: r"C:\opt\yadirect-agent.exe")
+
         result = runner.invoke(app, ["schedule", "install", "--platform=windows"])
 
-        assert result.exit_code == 2, result.output
-        assert "windows" in result.output.lower()
+        assert result.exit_code == 0, result.output
+        # Operator-visible summary mentions both XML files + the
+        # log dir, mirroring the macOS / Linux install summaries.
+        assert "daily" in result.stdout.lower()
+        assert "hourly" in result.stdout.lower()
+        # The fake WindowsScheduler's install was actually called.
+        fake_windows_scheduler.install.assert_called_once()
+
+    def test_install_auto_uses_windows_on_win32(
+        self,
+        runner: CliRunner,
+        fake_windows_scheduler: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # ``sys.platform == "win32"`` auto-resolves to the Task
+        # Scheduler dispatch — operators on Windows don't need
+        # to pass ``--platform`` on a normal install.
+        monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr("shutil.which", lambda _: r"C:\opt\yadirect-agent.exe")
+
+        result = runner.invoke(app, ["schedule", "install"])
+
+        assert result.exit_code == 0, result.output
+        fake_windows_scheduler.install.assert_called_once()
 
     def test_install_auto_unknown_platform_exits_2(
         self,
@@ -321,6 +388,52 @@ class TestScheduleStatus:
         assert result.exit_code == 0, result.output
         assert "not installed" in result.stdout.lower()
 
+    def test_status_windows_reports_installed(
+        self,
+        runner: CliRunner,
+        fake_windows_scheduler: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Slice 3 wires the windows dispatch — status prints
+        # both XML pairs so the operator can ``schtasks /Query
+        # /TN yadirect-agent-daily`` or tail the log dir.
+        # Same line-wrap caveat as the linux test: rich.Console
+        # may wrap long paths on narrow CI terminals, so we pin
+        # short tokens (daily / hourly) rather than full filenames.
+        monkeypatch.setattr("sys.platform", "win32")
+
+        result = runner.invoke(app, ["schedule", "status"])
+
+        assert result.exit_code == 0, result.output
+        assert "installed" in result.stdout.lower()
+        assert "daily" in result.stdout.lower()
+        assert "hourly" in result.stdout.lower()
+        # The fake WindowsScheduler.status was actually called —
+        # pins that the dispatch routes status through the
+        # windows path, not silently through macos / linux.
+        fake_windows_scheduler.status.assert_called_once()
+
+    def test_status_windows_reports_not_installed(
+        self,
+        runner: CliRunner,
+        fake_windows_scheduler: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Same exit-0 contract as macOS / Linux: "not installed"
+        # is a valid state.
+        from yadirect_agent.services.scheduler.windows import ScheduleStatus
+
+        monkeypatch.setattr("sys.platform", "win32")
+        fake_windows_scheduler.status.return_value = ScheduleStatus(
+            installed=False,
+            daily_xml_path=Path(r"C:\fake\daily.xml"),
+            hourly_xml_path=Path(r"C:\fake\hourly.xml"),
+        )
+
+        result = runner.invoke(app, ["schedule", "status"])
+        assert result.exit_code == 0, result.output
+        assert "not installed" in result.stdout.lower()
+
 
 class TestScheduleRemove:
     def test_remove_succeeds(
@@ -366,3 +479,22 @@ class TestScheduleRemove:
 
         assert result.exit_code == 0, result.output
         fake_linux_scheduler.remove.assert_called_once()
+
+    def test_remove_windows_succeeds(
+        self,
+        runner: CliRunner,
+        fake_windows_scheduler: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Parity with macOS / Linux remove: slice 3 routes
+        # ``remove`` to ``WindowsScheduler.remove`` which itself
+        # is idempotent at the service layer. The CLI returns
+        # exit 0 even on a fresh account (``schtasks /Delete``
+        # returns non-zero when the task doesn't exist; the
+        # service tolerates that and proceeds to file cleanup).
+        monkeypatch.setattr("sys.platform", "win32")
+
+        result = runner.invoke(app, ["schedule", "remove"])
+
+        assert result.exit_code == 0, result.output
+        fake_windows_scheduler.remove.assert_called_once()

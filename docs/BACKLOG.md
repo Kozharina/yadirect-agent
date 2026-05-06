@@ -45,15 +45,15 @@ demo-only, technically; it cannot be handed to a non-developer.
       policy YAML proposal, ``onboarding_completed`` audit
       event, first health-check rollup. M15.4 architecturally
       complete.
-- [ ] **M15.6 — Built-in scheduler** (split into per-platform
-      slices because LaunchAgent / systemd timer / Task
-      Scheduler have nothing in common but the high-level
-      concept):
+- [x] ~~**M15.6 — Built-in scheduler**~~ — closed architecturally
+      (3/3 slices shipped). Operators on macOS / Linux / Windows
+      now get the same ``yadirect-agent schedule install / status
+      / remove`` surface; auto-detection picks the right backend
+      from ``sys.platform``.
   - [x] ~~**slice 1 — macOS LaunchAgent**~~ — shipped, see Done.
   - [x] ~~**slice 2 — Linux systemd --user timer**~~ — shipped,
         see Done.
-  - [ ] **slice 3 — Windows Task Scheduler**: ``schtasks``
-        XML + create/query/delete. Same contract.
+  - [x] ~~**slice 3 — Windows Task Scheduler**~~ — shipped, see Done.
 - [x] ~~**M20 — Human-readable rationale (slice 1)**~~ — shipped,
       see Done. Model + store + soft-optional emission +
       ``yadirect-agent rationale show/list`` CLI.
@@ -828,6 +828,105 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M15.6 slice 3 — Windows Task Scheduler scheduler**
+      (Phase 0+1 release 0.2.0). Mirror of slice 1 (#65) and
+      slice 2 (#71) for the Windows path: same ``install`` /
+      ``status`` / ``remove`` CLI surface, same atomic-write
+      contract (sibling tempfile + ``os.replace``), same single
+      indirection point for the platform CLI (``run_schtasks`` ↔
+      ``run_systemctl`` ↔ ``run_launchctl``). Operators on
+      Windows now get the full ``yadirect-agent schedule ...``
+      surface; **M15.6 closed architecturally (3/3 slices)**.
+
+      Wire format: two Task Scheduler XML 1.4 documents in
+      ``%LOCALAPPDATA%\yadirect-agent\schedule`` (default
+      ``~\AppData\Local\yadirect-agent\schedule``):
+
+      - ``yadirect-agent-daily.xml`` — ``CalendarTrigger`` +
+        ``ScheduleByDay`` ``DaysInterval=1`` with
+        ``StartBoundary=2024-01-01T08:00:00`` (fires next 08:00
+        local time, every day; deterministic past-date so XML is
+        identical across re-installs). Action wraps
+        ``yadirect-agent.exe health --days=7 --json`` inside
+        ``cmd.exe /c "..."`` so ``>> daily.log 2>> daily.err``
+        redirects work — Task Scheduler has no
+        ``StandardOutput=append:...`` analogue.
+      - ``yadirect-agent-hourly.xml`` — ``TimeTrigger`` with
+        ``Repetition.Interval=PT1H`` (ISO 8601 one-hour
+        repetition); same ``cmd.exe`` wrapper, ``--days=1``
+        window.
+
+      Settings pinned on both: ``MultipleInstancesPolicy=IgnoreNew``
+      (overlap is a smell), ``DisallowStartIfOnBatteries=false`` +
+      ``StopIfGoingOnBatteries=false`` (laptop on battery still
+      runs), ``StartWhenAvailable=true`` (analogue of slice 2's
+      ``Persistent=true`` — fires missed runs after sleep),
+      ``Enabled=true`` (active immediately on register).
+
+      Encoding: UTF-16 LE with BOM (``b"\xff\xfe"`` prefix), what
+      Microsoft's Task Scheduler GUI exporter emits and what every
+      legacy schtasks version accepts. Forced LE explicitly
+      because Python's stdlib ``"utf-16"`` codec picks endianness
+      from the host's native byte order; on a big-endian host it
+      would emit UTF-16 BE which schtasks rejects.
+
+      Logs: ``%LOCALAPPDATA%\yadirect-agent\logs`` —
+      LocalAppData (non-roaming) is the right bucket because tasks
+      are per-machine in the Windows Task Store; roaming AppData
+      would create drift between the on-disk XML on machine A and
+      the registered tasks on machine B if the operator logs into
+      multiple machines under the same account.
+
+      Lifecycle: install does mkdir → atomic-write 2 XML files →
+      ``schtasks /Create /TN <name> /XML <path> /F`` for each
+      task (``/F`` makes re-install idempotent — overwrites
+      without prompting); remove does ``schtasks /Delete /TN
+      <name> /F`` for each (``CalledProcessError`` tolerated and
+      logged — same shape as slice 2's ``systemctl disable``
+      tolerance and slice 1's ``launchctl unload`` tolerance) →
+      ``unlink(missing_ok=True)`` for each XML.
+
+      Hard-coded ``C:\Windows\System32\schtasks.exe`` and
+      ``C:\Windows\System32\cmd.exe`` paths mirror slice 1's
+      ``/bin/launchctl`` / slice 2's ``/usr/bin/systemctl`` choice
+      (canonical Microsoft locations). Non-standard Windows
+      installs (Windows on D:, custom %SystemRoot%) override
+      ``run_schtasks`` directly — same escape hatch the macOS /
+      Linux modules document.
+
+      ``_validate_executable`` uses ``PureWindowsPath`` (not the
+      platform-native ``Path``) so the validator gives consistent
+      answers on macOS / Linux dev boxes AND on Windows
+      production: ``PureWindowsPath("C:\\...")`` is absolute
+      everywhere; ``Path("C:\\...")`` on POSIX is relative
+      (PosixPath doesn't know about drive letters), which would
+      have rejected valid production-Windows inputs in any cross-
+      platform invocation.
+
+      Final shared-Protocol decision recorded in
+      ``services/scheduler/__init__.py`` docstring: NOT promoting
+      to a common base class. ``InstallResult`` cardinalities
+      differ across platforms (2 vs 4 vs 2 paths + task names);
+      ``ScheduleStatus`` path-attribute names are platform-
+      specific and collapsing them would lose the domain-readable
+      naming. Per-platform duplication sits at ~10 lines
+      (``_validate_executable`` + ``_atomic_write``) — below the
+      cost of an abstraction that would obscure the per-platform
+      reasoning docstrings each module carries.
+
+      Tests: 19 service-layer tests pin XML directives
+      (``CalendarTrigger``, ``ScheduleByDay/DaysInterval=1``,
+      ``TimeTrigger``, ``Repetition/Interval=PT1H``,
+      ``cmd.exe`` wrapper, all five Settings, log redirects,
+      task names, executable absoluteness), atomic install with
+      schtasks spy, all-or-nothing status, idempotent remove,
+      delete-failure tolerance, UTF-16 LE BOM verification on
+      disk. 5 new CLI tests via a ``fake_windows_scheduler``
+      fixture mirroring ``fake_scheduler`` / ``fake_linux_scheduler``;
+      the previous ``test_install_windows_prints_not_yet_supported``
+      stub-test is now ``test_install_windows_explicit_succeeds``.
+      1110 tests green; mypy strict; ruff clean.
 
 - [x] **M15.6 slice 2 — Linux systemd ``--user`` scheduler**
       (Phase 0+1 release 0.2.0). Mirror of slice 1 (#65) for the

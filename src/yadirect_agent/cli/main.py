@@ -63,6 +63,8 @@ from ..services.health_check import HealthCheckService
 from ..services.scheduler.linux import LinuxScheduler
 from ..services.scheduler.linux import ScheduleStatus as LinuxScheduleStatus
 from ..services.scheduler.macos import MacOSScheduler, ScheduleStatus
+from ..services.scheduler.windows import ScheduleStatus as WindowsScheduleStatus
+from ..services.scheduler.windows import WindowsScheduler
 from .auth import (
     LOGIN_BROWSER_FALLBACK_HINT,
     LOGIN_EXCHANGE_ERROR_PREFIX,
@@ -1304,42 +1306,39 @@ async def _run_mcp_stdio(handle: Any) -> None:
 
 
 # --------------------------------------------------------------------------
-# `schedule` subapp — built-in cross-platform scheduler (M15.6 slices 1+2).
+# `schedule` subapp — built-in cross-platform scheduler (M15.6 slices 1+2+3).
 #
 # Slice 1 shipped macOS LaunchAgent; slice 2 shipped Linux systemd
-# ``--user`` timers. Windows still surfaces a clear "shipping in slice 3"
-# message and exits 2. The CLI surface is final (install / status /
-# remove); slice 3 adds the Windows platform branch without changing
-# the command shape.
+# ``--user`` timers; slice 3 shipped Windows Task Scheduler. The CLI
+# surface is uniform across platforms (install / status / remove) and
+# auto-detects the right backend from ``sys.platform``.
 # --------------------------------------------------------------------------
 
 
 schedule_app = typer.Typer(
     name="schedule",
     help=(
-        "Manage the built-in scheduler. Slices 1+2 ship macOS LaunchAgent + "
-        "Linux systemd --user timers; Windows is shipping in slice 3."
+        "Manage the built-in scheduler. macOS LaunchAgent, Linux systemd "
+        "--user timers, and Windows Task Scheduler all share the same "
+        "install / status / remove surface."
     ),
     no_args_is_help=True,
 )
 app.add_typer(schedule_app, name="schedule")
 
 # Module-level constants for the message strings — kept here rather than
-# in cli/schedule.py because the count is small (3 strings) and inlining
+# in cli/schedule.py because the count is small (2 strings) and inlining
 # makes the platform-dispatch logic locally readable. If the count grows
 # past ~10, promote to cli/schedule.py.
-_SCHEDULE_WINDOWS_PENDING = (
-    "Windows scheduler (Task Scheduler) is shipping in slice 3 of M15.6. "
-    "Run ``yadirect-agent health`` from a scheduled .bat in the meantime."
-)
 _SCHEDULE_UNSUPPORTED_PLATFORM = (
-    "Unsupported platform: {platform!r}. Supported: macos, linux. Windows is shipping in slice 3."
+    "Unsupported platform: {platform!r}. Supported: macos, linux, windows."
 )
 _SCHEDULE_EXECUTABLE_MISSING = (
     "Cannot find ``yadirect-agent`` on PATH. The scheduler needs an "
-    "absolute executable path because launchd resolves arguments "
-    "relative to /, not your shell. Activate the venv that has "
-    "yadirect-agent installed, or pass --executable=<absolute path>."
+    "absolute executable path because launchd / systemd / Task Scheduler "
+    "resolve arguments relative to a fixed CWD, not your shell. Activate "
+    "the venv that has yadirect-agent installed, or pass "
+    "--executable=<absolute path>."
 )
 
 
@@ -1421,6 +1420,30 @@ def _resolve_linux_paths() -> tuple[Path, Path]:
     )
 
 
+def _resolve_windows_paths() -> tuple[Path, Path]:
+    """Standard Windows locations for Task Scheduler XML + logs.
+
+    - ``%LOCALAPPDATA%\\yadirect-agent\\schedule`` — where the
+      generated Task Scheduler XML files live. ``schtasks /Create
+      /XML`` reads them at install time; ``schedule status``
+      reads them at probe time.
+    - ``%LOCALAPPDATA%\\yadirect-agent\\logs`` — where cmd.exe
+      append-redirects (``>> daily.log``) write run output.
+
+    LocalAppData (non-roaming) is the correct bucket: tasks are
+    per-machine in the Windows Task Store, so roaming AppData
+    would create drift between the on-disk XML on machine A and
+    the registered tasks on machine B if the operator logs into
+    multiple machines under the same account.
+    """
+    import os as _os
+
+    local_appdata = _os.environ.get("LOCALAPPDATA")
+    base = Path(local_appdata) if local_appdata else (Path.home() / "AppData" / "Local")
+    root = base / "yadirect-agent"
+    return (root / "schedule", root / "logs")
+
+
 @schedule_app.command("install")
 def schedule_install_cmd(
     platform: Annotated[
@@ -1446,17 +1469,17 @@ def schedule_install_cmd(
 ) -> None:
     """Install the daily + hourly scheduled jobs.
 
-    Generates two LaunchAgent plists (daily 08:00 + hourly health),
-    writes them atomically to ``~/Library/LaunchAgents``, and calls
-    ``launchctl load -w`` for each. Idempotent: re-running re-writes
-    both plists with current values (e.g. after a venv path change).
+    Generates two artefacts per platform (LaunchAgent plists on macOS,
+    systemd ``.service`` + ``.timer`` units on Linux, Task Scheduler
+    XML on Windows), writes them atomically to the platform's
+    standard location, and registers them with the OS scheduler
+    (``launchctl load -w``, ``systemctl --user enable --now``, or
+    ``schtasks /Create /XML /F``). Idempotent: re-running re-writes
+    the artefacts with current values (e.g. after a venv path change).
     """
     target = _detect_platform_for_scheduler(platform)
 
-    if target == "windows":
-        _err.print(f"[yellow]{_SCHEDULE_WINDOWS_PENDING}[/yellow]")
-        raise typer.Exit(code=2)
-    if target not in ("macos", "linux"):
+    if target not in ("macos", "linux", "windows"):
         _err.print(f"[red]{_SCHEDULE_UNSUPPORTED_PLATFORM.format(platform=target)}[/red]")
         raise typer.Exit(code=2)
 
@@ -1481,6 +1504,26 @@ def schedule_install_cmd(
             "every hour. Tail the log dir to follow runs, or use "
             "``journalctl --user -u yadirect-agent-daily`` for systemd's "
             "view.[/dim]"
+        )
+        return
+
+    if target == "windows":
+        xml_dir, win_log_dir = _resolve_windows_paths()
+        windows_scheduler = WindowsScheduler(
+            xml_dir=xml_dir,
+            log_dir=win_log_dir,
+            executable=exec_path,
+        )
+        windows_result = windows_scheduler.install()
+        _out.print("[green]Scheduler installed.[/green]")
+        _out.print(f"  daily xml:  {windows_result.daily_xml_path}")
+        _out.print(f"  hourly xml: {windows_result.hourly_xml_path}")
+        _out.print(f"  log dir:    {windows_result.log_dir}")
+        _out.print(
+            "[dim]The agent will run health checks daily at 08:00 and "
+            "every hour. Tail the log dir to follow runs, or use "
+            "``schtasks /Query /TN yadirect-agent-daily /FO LIST /V`` for "
+            "Task Scheduler's view.[/dim]"
         )
         return
 
@@ -1515,10 +1558,7 @@ def schedule_status_cmd(
 ) -> None:
     """Report whether the scheduled jobs are installed."""
     target = _detect_platform_for_scheduler(platform)
-    if target == "windows":
-        _err.print(f"[yellow]{_SCHEDULE_WINDOWS_PENDING}[/yellow]")
-        raise typer.Exit(code=2)
-    if target not in ("macos", "linux"):
+    if target not in ("macos", "linux", "windows"):
         _err.print(f"[red]{_SCHEDULE_UNSUPPORTED_PLATFORM.format(platform=target)}[/red]")
         raise typer.Exit(code=2)
 
@@ -1544,6 +1584,32 @@ def schedule_status_cmd(
             _out.print(
                 "[dim]Run ``yadirect-agent schedule install`` to set up the "
                 "daily + hourly timers.[/dim]"
+            )
+        return
+
+    if target == "windows":
+        xml_dir, win_log_dir = _resolve_windows_paths()
+        # Placeholder-executable mirrors the macos / linux pattern:
+        # status is read-only and doesn't invoke the executable, but
+        # ``WindowsScheduler.__init__`` validates absoluteness for
+        # symmetry with install. Pin a placeholder absolute Windows
+        # path so the validator (``PureWindowsPath.is_absolute``)
+        # accepts it on every platform the test runs on.
+        windows_scheduler = WindowsScheduler(
+            xml_dir=xml_dir,
+            log_dir=win_log_dir,
+            executable=r"C:\opt\yadirect-agent.exe",
+        )
+        windows_status: WindowsScheduleStatus = windows_scheduler.status()
+        if windows_status.installed:
+            _out.print("[green]Scheduler installed.[/green]")
+            _out.print(f"  daily xml:  {windows_status.daily_xml_path}")
+            _out.print(f"  hourly xml: {windows_status.hourly_xml_path}")
+        else:
+            _out.print("[yellow]Scheduler not installed.[/yellow]")
+            _out.print(
+                "[dim]Run ``yadirect-agent schedule install`` to set up the "
+                "daily + hourly tasks.[/dim]"
             )
         return
 
@@ -1588,10 +1654,7 @@ def schedule_remove_cmd(
     about leftover state.
     """
     target = _detect_platform_for_scheduler(platform)
-    if target == "windows":
-        _err.print(f"[yellow]{_SCHEDULE_WINDOWS_PENDING}[/yellow]")
-        raise typer.Exit(code=2)
-    if target not in ("macos", "linux"):
+    if target not in ("macos", "linux", "windows"):
         _err.print(f"[red]{_SCHEDULE_UNSUPPORTED_PLATFORM.format(platform=target)}[/red]")
         raise typer.Exit(code=2)
 
@@ -1603,6 +1666,17 @@ def schedule_remove_cmd(
             executable="/usr/local/bin/yadirect-agent",
         )
         linux_scheduler.remove()
+        _out.print("[green]Scheduler removed.[/green]")
+        return
+
+    if target == "windows":
+        xml_dir, win_log_dir = _resolve_windows_paths()
+        windows_scheduler = WindowsScheduler(
+            xml_dir=xml_dir,
+            log_dir=win_log_dir,
+            executable=r"C:\opt\yadirect-agent.exe",
+        )
+        windows_scheduler.remove()
         _out.print("[green]Scheduler removed.[/green]")
         return
 
