@@ -5,7 +5,7 @@
 #
 # `make check` is what CI runs. If it's green locally, CI should be green.
 
-.PHONY: help install install-hooks test test-cov evals lint fix type check run-cli run-mcp clean
+.PHONY: help install install-hooks test test-cov evals acceptance lint fix type check run-cli run-mcp clean
 
 SHELL := /bin/bash
 PYTHON ?= python3.11
@@ -35,6 +35,9 @@ test-cov:  ## Run tests with coverage report (HTML at htmlcov/index.html)
 
 evals:  ## Run agent evals only, verbose. See tests/evals/README.md.
 	@$(BIN)/pytest tests/evals/ -v
+
+acceptance:  ## Run end-to-end acceptance tests (Anna's full journey, M15.7).
+	@$(BIN)/pytest tests/acceptance/ -v
 
 lint:  ## Ruff check + format check (no writes)
 	@$(BIN)/ruff check .
