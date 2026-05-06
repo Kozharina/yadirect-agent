@@ -51,14 +51,20 @@ class TestInstallCmd:
         # Config has our entry.
         data = json.loads(config_path.read_text())
         assert "yadirect-agent" in data["mcpServers"]
-        # Output mentions what happened + the path. We pin only the
-        # filename, not the full ``str(config_path)``: rich.Console
-        # wraps long lines at 80 cols by default, and on CI runners
-        # with deep tmpdirs the absolute path overflows and gets
-        # split across a newline (e.g. ``yadirect-ag\nent``). Same
-        # wrap-width gotcha as the M15.6 slice 2 status assertion.
-        assert "added" in result.output.lower() or "installed" in result.output.lower()
-        assert config_path.name in result.output
+        # Output mentions what happened + the path. We strip newlines
+        # from the captured output before the substring check because
+        # rich.Console wraps long lines at 80 cols by default, and
+        # on CI runners with deep tmpdirs the absolute path overflows
+        # and gets split across a newline — even the bare filename
+        # ``claude_desktop_config.json`` can land on the wrap boundary
+        # and be split into ``claude_desktop_co\nnfig.json``. Stripping
+        # newlines normalises around the wrap regardless of where the
+        # split lands. Same wrap-width gotcha as the M15.6 slice 2
+        # status assertion (substring), but more aggressive because
+        # the install-cmd path is deeper.
+        normalised = result.output.replace("\n", "")
+        assert "added" in normalised.lower() or "installed" in normalised.lower()
+        assert str(config_path) in normalised
 
     def test_already_installed_is_idempotent(
         self,
