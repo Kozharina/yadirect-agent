@@ -76,7 +76,7 @@ def render_show_json(rationale: Rationale) -> str:
 def render_list_text(console: Console, rationales: list[Rationale]) -> None:
     """Tabular listing for ``rationale list``."""
     if not rationales:
-        console.print("[dim]no rationales[/dim]")
+        console.print("[dim]обоснований ещё нет[/dim]")
         return
 
     table = Table(show_header=True, header_style="bold")

@@ -21,6 +21,11 @@ from yadirect_agent.cli.main import app
 
 @pytest.fixture
 def runner() -> CliRunner:
+    # Modern typer ``CliRunner`` (>=0.12) keeps stderr separate from
+    # stdout by default — so tests that need to assert "log line is
+    # NOT in stdout" can read ``result.stdout`` and ``result.stderr``
+    # independently. The old ``mix_stderr=False`` kwarg was removed
+    # upstream; nothing to opt into.
     return CliRunner()
 
 
@@ -210,3 +215,37 @@ class TestUninstallCmd:
 
         assert result.exit_code == 0, result.output
         assert "not installed" in result.output.lower() or "nothing" in result.output.lower()
+
+
+def test_install_does_not_leak_structlog_to_stdout(
+    runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    # M15.x acceptance polish: ``install_into_claude_desktop_cmd``
+    # didn't call ``_bootstrap_settings()``, so structlog stayed on
+    # its default factory which writes to stdout. Anna on a fresh
+    # machine saw a noisy log line BEFORE the operator-facing
+    # confirmation:
+    #
+    #   2026-05-06 16:49:42 [info  ] claude_desktop.config.installed ...
+    #   ✓ Added yadirect-agent to /tmp/claude_desktop_config.json
+    #
+    # The fix is a global ``configure_logging`` in the root callback
+    # so every command — including those that never touch Settings —
+    # gets stderr-routed logs. This test pins the contract: the
+    # structured event name must NOT appear in stdout, only in
+    # stderr (or the audit log path); operator-facing text must.
+    config_path = tmp_path / "claude_desktop_config.json"
+    result = runner.invoke(
+        app,
+        ["install-into-claude-desktop", "--config-path", str(config_path)],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # Operator-visible (stdout) — clean human text, no structured
+    # event names, no ISO timestamps prefixed with ``[info``.
+    assert "claude_desktop.config.installed" not in result.stdout
+    assert "[info" not in result.stdout
+    # Operator confirmation must still be there.
+    normalised = result.stdout.replace("\n", "")
+    assert "added yadirect-agent" in normalised.lower()
