@@ -1262,7 +1262,7 @@ cron). Каждый — точка отвала. M15 убирает все, кр
 
 - CLI: `yadirect-agent rationale show <decision_id>` (✅ shipped)
   или `rationale why --campaign=<id> --on=<date>` (планируется).
-- MCP-tool: `explain_decision(decision_id)` (slice 3, в работе).
+- MCP-tool: `explain_decision(decision_id)` (✅ shipped, M20 slice 3).
 - В чате: *«почему ты вчера снизил ставку на ключе X?»* — агент
   достаёт `Rationale`, **не сочиняет на лету**.
 
