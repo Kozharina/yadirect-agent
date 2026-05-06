@@ -493,3 +493,104 @@ class TestAccountOverview:
         async with ReportingService(settings) as svc:  # counter_id stays None
             with pytest.raises(ConfigError, match="counter"):
                 await svc.account_overview(date_range=_WEEK, goal_id=100)
+
+    async def test_requests_impressions_metric(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # ``LowCtrRule`` (M15.5.4) needs the impressions side of CTR.
+        # Metrika exposes it as ``ym:ad:impressions`` in the same
+        # ad-namespace ``ym:ad:directCost`` already lives in.
+        # Without this assertion, a refactor that drops the metric
+        # from the request would silently break LowCtrRule's gate
+        # (``perf.impressions == 0`` always means MIN_IMPRESSIONS
+        # filter rejects).
+        fake = _FakeMetrikaService(report_rows=[])
+        _patch_metrika(monkeypatch, fake)
+
+        async with ReportingService(_settings_with_counter(settings)) as svc:
+            await svc.account_overview(date_range=_WEEK, goal_id=100)
+
+        called_metrics = fake.report_calls[0]["metrics"]
+        assert "ym:ad:impressions" in called_metrics
+
+    async def test_extracts_impressions_from_metrika_row(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # End-to-end: a Metrika row carrying impressions in its
+        # ``metrics`` list reaches ``CampaignPerformance.impressions``
+        # untouched. Position of the impressions metric in the
+        # response is determined by the position in the request,
+        # which the implementation pins (after conversions when
+        # goal_id is set, after cost otherwise).
+        fake = _FakeMetrikaService(
+            report_rows=[
+                ReportRow(
+                    dimensions=[{"id": 42, "name": "brand"}],
+                    # [visits, cost, conversions, impressions]
+                    metrics=[120.0, 850.5, 5.0, 24_000.0],
+                ),
+            ],
+        )
+        _patch_metrika(monkeypatch, fake)
+
+        async with ReportingService(_settings_with_counter(settings)) as svc:
+            results = await svc.account_overview(date_range=_WEEK, goal_id=100)
+
+        assert len(results) == 1
+        assert results[0].impressions == 24_000
+
+    async def test_extracts_impressions_without_goal_id(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # When goal_id is None, the conversions metric isn't requested
+        # so impressions sits in position [2] (right after cost).
+        # Pin both the position-shift logic AND the no-goal happy path.
+        fake = _FakeMetrikaService(
+            report_rows=[
+                ReportRow(
+                    dimensions=[{"id": 42, "name": "brand"}],
+                    # [visits, cost, impressions] — no conversions
+                    metrics=[120.0, 850.5, 24_000.0],
+                ),
+            ],
+        )
+        _patch_metrika(monkeypatch, fake)
+
+        async with ReportingService(_settings_with_counter(settings)) as svc:
+            results = await svc.account_overview(date_range=_WEEK, goal_id=None)
+
+        assert len(results) == 1
+        assert results[0].impressions == 24_000
+        assert results[0].conversions == 0  # default when goal_id None
+
+    async def test_impressions_defaults_to_zero_when_metric_absent(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Defensive: a Metrika response shorter than expected (legacy
+        # endpoint, account without impression data, sandbox quirk)
+        # must not crash with IndexError. Fall back to 0; LowCtrRule's
+        # MIN_IMPRESSIONS gate then rejects without a false-positive
+        # finding.
+        fake = _FakeMetrikaService(
+            report_rows=[
+                ReportRow(
+                    dimensions=[{"id": 42, "name": "brand"}],
+                    metrics=[120.0, 850.5, 5.0],  # impressions missing
+                ),
+            ],
+        )
+        _patch_metrika(monkeypatch, fake)
+
+        async with ReportingService(_settings_with_counter(settings)) as svc:
+            results = await svc.account_overview(date_range=_WEEK, goal_id=100)
+
+        assert len(results) == 1
+        assert results[0].impressions == 0
