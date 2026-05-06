@@ -125,12 +125,34 @@ class DirectService:
 
     # ---------------- Ads ----------------
 
-    async def get_ads(self, adgroup_ids: list[int], limit: int = 1000) -> list[dict[str, Any]]:
+    async def get_ads(
+        self,
+        adgroup_ids: list[int],
+        *,
+        statuses: list[str] | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Read ad rows.
+
+        ``statuses`` (e.g. ``["REJECTED"]``) is plumbed through as
+        ``SelectionCriteria.Statuses`` so ``RejectedAdsRule`` can ask
+        Direct for moderation-rejected ads only — server-side filtering
+        keeps bandwidth + per-call row counts bounded on healthy
+        accounts that can have thousands of approved ads. Default
+        ``None`` preserves the existing wire shape for callers that
+        want every ad regardless of moderation state.
+        """
+        selection: dict[str, Any] = {"AdGroupIds": adgroup_ids}
+        if statuses:
+            # Direct rejects empty arrays in some paths; only attach
+            # the key when non-empty. ``if statuses`` covers both
+            # ``None`` and ``[]``.
+            selection["Statuses"] = statuses
         result = await self._api.call(
             "ads",
             "get",
             {
-                "SelectionCriteria": {"AdGroupIds": adgroup_ids},
+                "SelectionCriteria": selection,
                 "FieldNames": ["Id", "AdGroupId", "CampaignId", "Status", "State", "Type"],
                 "TextAdFieldNames": ["Title", "Title2", "Text", "Href", "DisplayUrlPath"],
                 "Page": {"Limit": limit},
@@ -145,6 +167,7 @@ class DirectService:
         adgroup_ids: list[int] | None = None,
         *,
         keyword_ids: list[int] | None = None,
+        statuses: list[str] | None = None,
         limit: int = 10_000,
     ) -> list[Keyword]:
         """Read keyword rows including the bid + productivity fields the
@@ -155,6 +178,12 @@ class DirectService:
         for an AND filter. At least one is required — an unfiltered
         ``keywords.get`` would either error or return the whole
         account, neither of which any caller wants.
+
+        ``statuses`` (e.g. ``["REJECTED"]``) is plumbed through as
+        ``SelectionCriteria.Statuses`` so ``RejectedKeywordsRule`` can
+        ask Direct for moderation-rejected keywords only. Same
+        reasoning as ``get_ads``: server-side filter is the only sane
+        approach on accounts with thousands of keywords.
 
         Returned ``Keyword`` rows expose ``current_search_bid_rub``,
         ``current_network_bid_rub`` and ``quality_score`` via computed
@@ -170,6 +199,8 @@ class DirectService:
             selection["AdGroupIds"] = adgroup_ids
         if keyword_ids:
             selection["Ids"] = keyword_ids
+        if statuses:
+            selection["Statuses"] = statuses
 
         result = await self._api.call(
             "keywords",
@@ -191,6 +222,53 @@ class DirectService:
             },
         )
         return [Keyword.model_validate(k) for k in result.get("Keywords", [])]
+
+    # ---------------- Rejected-entity scans (M15.5.2-3) ----------------
+
+    async def scan_rejected_ads(self, campaign_ids: list[int]) -> list[dict[str, Any]]:
+        """Find ads with ``Status=REJECTED`` across the given campaigns.
+
+        Two-step walk: ``adgroups.get`` resolves campaign_ids →
+        adgroup_ids, then ``ads.get`` filters server-side by
+        ``Statuses=[REJECTED]``. The walk is unavoidable — Direct's
+        ``ads.get`` accepts ``AdGroupIds`` but not ``CampaignIds``,
+        so the campaign → group → ad hierarchy must be flattened
+        client-side.
+
+        Returns the raw ad-row dicts (not a typed model) because
+        ``ads.get`` already returns dicts and the rule layer renders
+        a free-form message — no need to invent a typed shape just
+        to immediately stringify it.
+
+        Empty ``campaign_ids`` short-circuits to ``[]`` (no work
+        means no HTTP). Empty adgroups (campaign exists but has no
+        ad-groups) also short-circuits — Direct rejects empty
+        ``AdGroupIds`` selectors with a confusing error.
+        """
+        if not campaign_ids:
+            return []
+        adgroups = await self.get_adgroups(campaign_ids=campaign_ids)
+        adgroup_ids = [int(g["Id"]) for g in adgroups if "Id" in g]
+        if not adgroup_ids:
+            return []
+        return await self.get_ads(adgroup_ids=adgroup_ids, statuses=["REJECTED"])
+
+    async def scan_rejected_keywords(self, campaign_ids: list[int]) -> list[Keyword]:
+        """Find keywords with ``Status=REJECTED`` across the given campaigns.
+
+        Symmetric to ``scan_rejected_ads`` but ends with
+        ``keywords.get``. Returns ``Keyword`` model instances (not
+        dicts) because ``get_keywords`` already routes through the
+        typed model — ``RejectedKeywordsRule`` benefits from the
+        Pydantic field access.
+        """
+        if not campaign_ids:
+            return []
+        adgroups = await self.get_adgroups(campaign_ids=campaign_ids)
+        adgroup_ids = [int(g["Id"]) for g in adgroups if "Id" in g]
+        if not adgroup_ids:
+            return []
+        return await self.get_keywords(adgroup_ids=adgroup_ids, statuses=["REJECTED"])
 
     async def add_keywords(self, keywords: list[dict[str, Any]]) -> dict[str, Any]:
         """keywords: list of {'AdGroupId': int, 'Keyword': str, 'Bid': int?}"""

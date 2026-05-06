@@ -21,7 +21,9 @@ from typing import Any, Self
 import pytest
 
 from yadirect_agent.config import Settings
+from yadirect_agent.models.campaigns import Campaign, CampaignState
 from yadirect_agent.models.health import Severity
+from yadirect_agent.models.keywords import Keyword
 from yadirect_agent.models.metrika import CampaignPerformance, DateRange
 from yadirect_agent.services import health_check as health_check_module
 from yadirect_agent.services.health_check import HealthCheckService
@@ -62,6 +64,28 @@ def _patch_reporting(
         health_check_module,
         "ReportingService",
         lambda _settings: fake,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _autopatch_direct(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Autouse: replace ``DirectService`` with an empty fake by default.
+
+    M15.5.2-3 made ``HealthCheckService.run_account_check`` always
+    call ``DirectService`` (after the perf-rule loop, for the
+    direct-state rules). Without this autouse patch, every existing
+    perf-rule test would hit a real ``DirectService`` constructor →
+    AuthError on the OAuth token. The default fake returns no
+    campaigns, so the direct-state rules emit zero findings and
+    don't perturb the perf-rule assertions. Tests that exercise
+    direct-state rules call ``_patch_direct(...)`` after this
+    fixture has run; ``monkeypatch.setattr`` is last-write-wins,
+    so the explicit patch takes effect.
+    """
+    monkeypatch.setattr(
+        health_check_module,
+        "DirectService",
+        lambda _settings: _FakeDirectService(campaigns=[]),
     )
 
 
@@ -538,3 +562,389 @@ class TestHighCpaRule:
 
         high_cpa_findings = [f for f in report.findings if f.rule_id == "high_cpa"]
         assert high_cpa_findings == []
+
+
+# --------------------------------------------------------------------------
+# Direct-state rules (M15.5.2-3): rejected ads + rejected keywords.
+# --------------------------------------------------------------------------
+#
+# These rules differ from BurningCampaign / HighCpa in their data source —
+# Direct API state, not Metrika performance. The base class is
+# ``_DirectStateRule`` with an async ``collect_findings(direct, *,
+# campaigns)`` method. Tests substitute a ``_FakeDirectService`` for the
+# real ``DirectService`` so no HTTP fires.
+
+
+class _FakeDirectService:
+    """In-memory replacement for ``DirectService``.
+
+    Returns whatever the test set up; mirrors the API surface
+    ``HealthCheckService`` exercises (``get_campaigns`` +
+    ``scan_rejected_ads`` + ``scan_rejected_keywords``). Other
+    DirectService methods aren't reachable on the rule path and
+    are deliberately absent — adding them would invite tests that
+    accidentally couple to call sites that don't exist.
+    """
+
+    def __init__(
+        self,
+        *,
+        campaigns: list[Campaign] | None = None,
+        rejected_ads_by_campaign: dict[int, list[dict[str, Any]]] | None = None,
+        rejected_keywords_by_campaign: dict[int, list[Keyword]] | None = None,
+    ) -> None:
+        self._campaigns = campaigns or []
+        self._rejected_ads = rejected_ads_by_campaign or {}
+        self._rejected_keywords = rejected_keywords_by_campaign or {}
+        self.scan_ads_calls: list[list[int]] = []
+        self.scan_keywords_calls: list[list[int]] = []
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+    async def get_campaigns(self, *args: Any, **kwargs: Any) -> list[Campaign]:
+        return list(self._campaigns)
+
+    async def scan_rejected_ads(self, *, campaign_ids: list[int]) -> list[dict[str, Any]]:
+        self.scan_ads_calls.append(list(campaign_ids))
+        out: list[dict[str, Any]] = []
+        for cid in campaign_ids:
+            out.extend(self._rejected_ads.get(cid, []))
+        return out
+
+    async def scan_rejected_keywords(self, *, campaign_ids: list[int]) -> list[Keyword]:
+        self.scan_keywords_calls.append(list(campaign_ids))
+        out: list[Keyword] = []
+        for cid in campaign_ids:
+            out.extend(self._rejected_keywords.get(cid, []))
+        return out
+
+
+def _patch_direct(monkeypatch: pytest.MonkeyPatch, fake: _FakeDirectService) -> None:
+    monkeypatch.setattr(
+        health_check_module,
+        "DirectService",
+        lambda _settings: fake,
+    )
+
+
+def _campaign(
+    *,
+    campaign_id: int,
+    name: str = "test-campaign",
+    state: CampaignState = CampaignState.ON,
+) -> Campaign:
+    return Campaign(id=campaign_id, name=name, state=state)
+
+
+def _rejected_ad(
+    *,
+    ad_id: int,
+    campaign_id: int,
+    title: str | None = "ad-title",
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "Id": ad_id,
+        "AdGroupId": 100,
+        "CampaignId": campaign_id,
+        "Status": "REJECTED",
+        "State": "ON",
+    }
+    if title is not None:
+        payload["TextAd"] = {"Title": title}
+    return payload
+
+
+def _rejected_keyword(*, kw_id: int, campaign_id: int, text: str = "купить слона") -> Keyword:
+    return Keyword(
+        Id=kw_id,
+        AdGroupId=100,
+        CampaignId=campaign_id,
+        Keyword=text,
+        State="ON",
+        Status="REJECTED",
+    )
+
+
+# --------------------------------------------------------------------------
+# RejectedAdsRule.
+# --------------------------------------------------------------------------
+
+
+class TestRejectedAdsRule:
+    async def test_no_rejected_ads_emits_no_findings(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Healthy account: scan returns []; no findings, no noise.
+        # Validates the rule short-circuits on empty scan rather than
+        # pushing through aggregation logic that would crash on
+        # missing keys.
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[]))
+        _patch_direct(
+            monkeypatch,
+            _FakeDirectService(campaigns=[_campaign(campaign_id=7, name="brand")]),
+        )
+
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=_WEEK)
+
+        rejected_findings = [f for f in report.findings if f.rule_id == "rejected_ads"]
+        assert rejected_findings == []
+
+    async def test_single_rejected_ad_emits_high_severity_finding(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Canonical rejection: one ad in one campaign. Severity HIGH
+        # because rejected ads silently lose impressions until the
+        # operator notices — same urgency tier as a burning campaign.
+        # The message must include the campaign name (operators don't
+        # remember IDs) and quote the ad title (helps triage which
+        # creative to fix).
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[]))
+        _patch_direct(
+            monkeypatch,
+            _FakeDirectService(
+                campaigns=[_campaign(campaign_id=7, name="brand")],
+                rejected_ads_by_campaign={
+                    7: [_rejected_ad(ad_id=5001, campaign_id=7, title="купите кошку дёшево")],
+                },
+            ),
+        )
+
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=_WEEK)
+
+        rejected = [f for f in report.findings if f.rule_id == "rejected_ads"]
+        assert len(rejected) == 1
+        finding = rejected[0]
+        assert finding.severity == Severity.HIGH
+        assert finding.campaign_id == 7
+        assert finding.campaign_name == "brand"
+        assert "brand" in finding.message
+        # Title quoted in message so the operator can match it against
+        # what they see in Direct without an extra round trip.
+        assert "купите кошку" in finding.message
+
+    async def test_multiple_rejected_in_one_campaign_aggregates_to_one_finding(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Two rejected ads in one campaign → ONE Finding with count
+        # in the message (not two separate findings). Rationale: the
+        # operator's mental model is "campaign X has issues", not
+        # "ad 5001 has an issue, also ad 5002 has an issue". One
+        # actionable line per campaign is more usable.
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[]))
+        _patch_direct(
+            monkeypatch,
+            _FakeDirectService(
+                campaigns=[_campaign(campaign_id=7, name="brand")],
+                rejected_ads_by_campaign={
+                    7: [
+                        _rejected_ad(ad_id=5001, campaign_id=7, title="ad-one"),
+                        _rejected_ad(ad_id=5002, campaign_id=7, title="ad-two"),
+                    ],
+                },
+            ),
+        )
+
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=_WEEK)
+
+        rejected = [f for f in report.findings if f.rule_id == "rejected_ads"]
+        assert len(rejected) == 1
+        # Count in message (operator sees "2 ad(s)..."), both titles
+        # quoted (under sample-limit so all fit).
+        assert "2 ad" in rejected[0].message
+        assert "ad-one" in rejected[0].message
+        assert "ad-two" in rejected[0].message
+
+    async def test_more_than_sample_limit_truncates_with_count_suffix(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Five rejected ads, sample limit is 3 → message lists 3 with
+        # "+2 more" suffix. Without truncation the message becomes
+        # unreadable on long-tail accounts where one moderation event
+        # rejects 50+ creatives at once.
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[]))
+        ads = [_rejected_ad(ad_id=i, campaign_id=7, title=f"ad-{i}") for i in range(1, 6)]
+        _patch_direct(
+            monkeypatch,
+            _FakeDirectService(
+                campaigns=[_campaign(campaign_id=7, name="brand")],
+                rejected_ads_by_campaign={7: ads},
+            ),
+        )
+
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=_WEEK)
+
+        [finding] = [f for f in report.findings if f.rule_id == "rejected_ads"]
+        assert "5 ad" in finding.message
+        # 5 - 3 = 2 ads omitted; pinned token ``+2`` so we don't
+        # accidentally drift to ``... and 2 more`` and break aud
+        # log-grep regressions.
+        assert "+2" in finding.message
+
+
+# --------------------------------------------------------------------------
+# RejectedKeywordsRule.
+# --------------------------------------------------------------------------
+
+
+class TestRejectedKeywordsRule:
+    async def test_no_rejected_keywords_emits_no_findings(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[]))
+        _patch_direct(
+            monkeypatch,
+            _FakeDirectService(campaigns=[_campaign(campaign_id=7, name="brand")]),
+        )
+
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=_WEEK)
+
+        rejected = [f for f in report.findings if f.rule_id == "rejected_keywords"]
+        assert rejected == []
+
+    async def test_single_rejected_keyword_emits_high_severity_finding(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Symmetric to the ads single-rejection test: one keyword,
+        # one campaign, HIGH severity. Message quotes the keyword
+        # text so the operator can find it in Direct's keyword editor.
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[]))
+        _patch_direct(
+            monkeypatch,
+            _FakeDirectService(
+                campaigns=[_campaign(campaign_id=7, name="brand")],
+                rejected_keywords_by_campaign={
+                    7: [_rejected_keyword(kw_id=999, campaign_id=7, text="оружие купить")],
+                },
+            ),
+        )
+
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=_WEEK)
+
+        rejected = [f for f in report.findings if f.rule_id == "rejected_keywords"]
+        assert len(rejected) == 1
+        finding = rejected[0]
+        assert finding.severity == Severity.HIGH
+        assert finding.campaign_id == 7
+        assert finding.campaign_name == "brand"
+        assert "оружие" in finding.message
+
+    async def test_aggregates_multiple_per_campaign(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Mirror of the ads aggregation test — one Finding per campaign
+        # regardless of count.
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[]))
+        _patch_direct(
+            monkeypatch,
+            _FakeDirectService(
+                campaigns=[_campaign(campaign_id=7, name="brand")],
+                rejected_keywords_by_campaign={
+                    7: [
+                        _rejected_keyword(kw_id=1, campaign_id=7, text="kw-one"),
+                        _rejected_keyword(kw_id=2, campaign_id=7, text="kw-two"),
+                        _rejected_keyword(kw_id=3, campaign_id=7, text="kw-three"),
+                    ],
+                },
+            ),
+        )
+
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=_WEEK)
+
+        rejected = [f for f in report.findings if f.rule_id == "rejected_keywords"]
+        assert len(rejected) == 1
+        assert "3 keyword" in rejected[0].message
+
+
+# --------------------------------------------------------------------------
+# Direct-state integration via HealthCheckService.
+# --------------------------------------------------------------------------
+
+
+class TestHealthCheckServiceDirectStateIntegration:
+    async def test_archived_campaigns_excluded_from_scan(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Archived campaigns don't burn budget; their rejected ads /
+        # keywords aren't actionable. The service must filter them
+        # out BEFORE calling scan_rejected_*, otherwise the rule
+        # would emit findings the operator can't act on.
+        archived = _campaign(campaign_id=99, name="old", state=CampaignState.ARCHIVED)
+        active = _campaign(campaign_id=7, name="brand", state=CampaignState.ON)
+        fake = _FakeDirectService(
+            campaigns=[archived, active],
+            # If the scan IS called with the archived id, the test
+            # detects it via scan_ads_calls assertion below.
+            rejected_ads_by_campaign={
+                99: [_rejected_ad(ad_id=1, campaign_id=99, title="ancient")],
+                7: [_rejected_ad(ad_id=2, campaign_id=7, title="current")],
+            },
+        )
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[]))
+        _patch_direct(monkeypatch, fake)
+
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=_WEEK)
+
+        # Service called scan_rejected_ads exactly once, with ONLY
+        # the active campaign id.
+        assert fake.scan_ads_calls == [[7]]
+        # And the surviving finding is for the active campaign only.
+        rejected = [f for f in report.findings if f.rule_id == "rejected_ads"]
+        assert len(rejected) == 1
+        assert rejected[0].campaign_id == 7
+
+    async def test_both_direct_rules_run_in_a_single_check(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # End-to-end: a single ``run_account_check`` triggers both
+        # RejectedAdsRule AND RejectedKeywordsRule, plus the
+        # existing perf-rule loop continues to work for empty
+        # overview. The service must NOT short-circuit on the
+        # first direct-state rule.
+        fake = _FakeDirectService(
+            campaigns=[_campaign(campaign_id=7, name="brand")],
+            rejected_ads_by_campaign={
+                7: [_rejected_ad(ad_id=5001, campaign_id=7, title="bad-ad")],
+            },
+            rejected_keywords_by_campaign={
+                7: [_rejected_keyword(kw_id=999, campaign_id=7, text="bad-kw")],
+            },
+        )
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[]))
+        _patch_direct(monkeypatch, fake)
+
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=_WEEK)
+
+        rule_ids = {f.rule_id for f in report.findings}
+        assert "rejected_ads" in rule_ids
+        assert "rejected_keywords" in rule_ids

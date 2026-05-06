@@ -77,14 +77,13 @@ demo-only, technically; it cannot be handed to a non-developer.
 - [x] ~~**M15.5 — `account_health()` MCP tool mirror**~~ — shipped,
       see Done. Closes the Phase 0 chat surface for "how is my
       account?".
-- [ ] **M15.5.2-5 — Health check rule expansion** (remaining from
-      the original M15.5.2-6 bundle): low-CTR rule (needs
-      impressions from Direct reports), rejected-ads /
-      rejected-keywords rule (needs Direct ad/keyword status
-      readers), CTR-drift rule (needs week-over-week comparison
-      = small history store), ``@requires_llm`` decorator pattern
-      for tools that gate on Anthropic key presence. Each is a
-      separate small PR.
+- [x] ~~**M15.5.2-3 — rejected-ads / rejected-keywords rules**~~ —
+      shipped, see Done.
+- [ ] **M15.5.4-5 — remaining health rule expansion**: low-CTR
+      rule (needs impressions from Direct reports), CTR-drift
+      rule (needs week-over-week comparison = small history
+      store), ``@requires_llm`` decorator pattern for tools that
+      gate on Anthropic key presence. Each is a separate small PR.
 
 ### 🛡️ Phase 2 (Assist) — release 0.3.0
 
@@ -828,6 +827,76 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M15.5.2-3 — rejected-ads / rejected-keywords rules**
+      (Phase 0+1 release 0.2.0). Two new HIGH-severity health
+      checks, plus the parallel ``_DirectStateRule`` interface
+      that future Direct-state rules (e.g. paused-but-burning,
+      stuck-in-moderation timing) will live on.
+
+      **Why these next**: media-buyer pain point. Yandex moderates
+      aggressively; rejected-but-running campaigns silently lose
+      impressions until the operator notices. Categorical signal
+      (APPROVED/REJECTED/MODERATED) — no threshold tuning needed,
+      lower false-positive risk than the deferred low-CTR /
+      CTR-drift rules.
+
+      **DirectService scan helpers** (``clients/direct.py``):
+      - ``scan_rejected_ads(campaign_ids)`` — two-step walk
+        (adgroups.get → ads.get with ``Statuses=[REJECTED]``).
+        Empty ``campaign_ids`` short-circuits; empty adgroups
+        also short-circuit (Direct rejects empty selectors).
+      - ``scan_rejected_keywords(campaign_ids)`` — symmetric,
+        ends with keywords.get + ``Statuses=[REJECTED]``;
+        returns ``Keyword`` model rows.
+      - Both compose existing ``get_adgroups`` / ``get_ads`` /
+        ``get_keywords`` rather than introducing new endpoints.
+      - ``get_ads`` and ``get_keywords`` gained an optional
+        ``statuses: list[str] | None`` parameter; default-None
+        omits the field for backward compat.
+
+      **HealthCheckService architecture** (``services/health_check.py``):
+      Added a parallel ``_DirectStateRule`` base class alongside
+      the existing ``_Rule``. Two parallel rule lists, two clear
+      contracts, rather than one overloaded interface where the
+      data shape would force ``Optional`` everywhere or push tribal
+      knowledge of "which rules consume what" into every
+      construction site.
+
+      ``run_account_check`` now does the perf-rule loop, then
+      opens a ``DirectService``, fetches campaigns, filters out
+      ARCHIVED (their rejected entities aren't actionable, and
+      pre-filtering also saves one adgroup-walk per archived
+      campaign), and runs each ``_DirectStateRule`` against the
+      active set.
+
+      **Rules** (``RejectedAdsRule``, ``RejectedKeywordsRule``):
+      Aggregate per-campaign — one ``Finding`` per campaign with
+      N rejected entities, not N findings. Operator's mental
+      model is "campaign X has issues", not per-entity. Sample-
+      limited message (``SAMPLE_LIMIT=3``) with ``+N more``
+      suffix keeps CLI output readable when one moderation event
+      rejects 50+ creatives at once.
+
+      **Tests**: 8 new client tests in ``test_direct.py`` (the
+      ``statuses`` filter on get_ads/get_keywords, scan helpers'
+      walk shape, empty-selector short-circuits, ad get_ads
+      smoke pin tests folded in per BACKLOG coverage debt). 9
+      new service tests in ``test_health_check.py`` (per-rule
+      no-op / single / aggregation / sample-limit cases for
+      both rules + 2 integration tests for archived-campaign
+      filtering and both-rules-in-one-check). Plus an autouse
+      ``_autopatch_direct`` fixture replacing ``DirectService``
+      with an empty fake by default — without it, every existing
+      perf-rule test would hit a real OAuth refresh on
+      ``HealthCheckService`` constructor and fail with AuthError.
+      1130 tests green; mypy strict; ruff clean.
+
+      **Deferred**: low-CTR rule (needs Direct reports impression
+      reader + threshold tuning), CTR-drift rule (needs
+      history-store), ``@requires_llm`` decorator (waiting for
+      first real LLM-gated consumer per "no design for hypothetical
+      future requirement" non-negotiable).
 
 - [x] **M15.6 slice 3 — Windows Task Scheduler scheduler**
       (Phase 0+1 release 0.2.0). Mirror of slice 1 (#65) and

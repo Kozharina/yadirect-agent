@@ -1,10 +1,24 @@
-"""Account health check service (M15.5.1).
+"""Account health check service (M15.5.1, M15.5.2-3).
 
-Consumes ``CampaignPerformance`` rows from the M6
-``ReportingService.account_overview`` and applies a battery of
-rule-based checks. Each rule is an independent class with a
-``check(perf)`` method returning zero or one ``Finding``; the
-service runs them all and aggregates into a ``HealthReport``.
+Consumes data from two sources and applies a battery of rule-based
+checks:
+
+1. **Metrika perf rows** — ``CampaignPerformance`` from the M6
+   ``ReportingService.account_overview``. Each ``_Rule`` subclass
+   has a synchronous ``check(perf)`` method returning zero or one
+   ``Finding``. Used for cost/conversion-based rules
+   (BurningCampaign, HighCpa).
+2. **Direct API state** — moderation status of ads / keywords.
+   Each ``_DirectStateRule`` subclass has an async
+   ``collect_findings(direct, *, campaigns)`` method returning
+   any number of findings (typically aggregated per-campaign).
+   Used for state-based rules (RejectedAds, RejectedKeywords).
+
+Two parallel rule lists rather than one unified interface because
+the data shapes differ enough that a common base class would
+either require Optional fields everywhere or push tribal knowledge
+of "which rules consume what" into every site that builds a rule
+list. Two lists, two clear contracts.
 
 Why rules-as-classes rather than a flat function:
 
@@ -12,8 +26,8 @@ Why rules-as-classes rather than a flat function:
   ``HIGH_CPA_MULTIPLIER``, etc.) that are easier to override per
   test or per future ``agent_policy.yml`` knob when they live as
   class-level constants.
-- Adding a new rule (M15.5.2 low-CTR, M15.5.3 query-drift, etc.)
-  is "drop a class in the rules list" — no service-level changes.
+- Adding a new rule (M15.5.4 CTR-drift, etc.) is "drop a class
+  in the rules list" — no service-level changes.
 - The rule_id documented on the class is the stable identifier
   used in audit logs, CLI filtering, and M12 reports.
 
@@ -25,10 +39,14 @@ schema gains health-check sections.
 
 from __future__ import annotations
 
-from typing import Self
+from collections import defaultdict
+from typing import Any, Self
 
+from ..clients.direct import DirectService
 from ..config import Settings
+from ..models.campaigns import Campaign, CampaignState
 from ..models.health import Finding, HealthReport, Severity
+from ..models.keywords import Keyword
 from ..models.metrika import CampaignPerformance, DateRange
 from .reporting import ReportingService
 
@@ -185,8 +203,171 @@ class HighCpaRule(_Rule):
         )
 
 
+class _DirectStateRule:
+    """Base for rules that consume Direct API state (not Metrika perf).
+
+    The two implementations (``RejectedAdsRule``, ``RejectedKeywordsRule``)
+    differ from ``_Rule`` subclasses in three ways:
+
+    1. **Async** — they walk Direct API endpoints (``adgroups.get`` →
+       ``ads.get`` / ``keywords.get``); a sync interface would force
+       ``HealthCheckService`` to block its event loop.
+    2. **Account-scoped, not per-row** — the input is the full list
+       of active campaigns, not a single ``CampaignPerformance``;
+       rules typically aggregate findings per-campaign rather than
+       returning one finding per scanned entity.
+    3. **Multiple findings per call** — the return type is
+       ``list[Finding]``, not ``Finding | None``, because one
+       campaign can have many rejected entities and we still want
+       to emit a (single, aggregated) finding for it.
+
+    The ``campaigns`` argument is pre-filtered to active (non-archived)
+    campaigns by ``HealthCheckService.run_account_check`` — rules
+    don't have to repeat the filter.
+    """
+
+    rule_id: str = ""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    async def collect_findings(
+        self,
+        direct: DirectService,
+        *,
+        campaigns: list[Campaign],
+    ) -> list[Finding]:
+        raise NotImplementedError
+
+
+class RejectedAdsRule(_DirectStateRule):
+    """Flag campaigns containing ads rejected by moderation.
+
+    Aggregates per-campaign: one ``Finding`` per campaign with N
+    rejected ads, not N findings. Rationale: the operator's mental
+    model is "campaign X has issues", not "ad 5001 has an issue,
+    also ad 5002 has an issue". One actionable line per campaign
+    keeps the CLI table readable on accounts where one moderation
+    event rejects 50+ creatives at once.
+    """
+
+    rule_id = "rejected_ads"
+
+    # How many ad titles to quote inline before truncating with
+    # "+N more". Three is enough for the operator to recognise the
+    # affected campaign theme without overflowing a terminal line.
+    SAMPLE_LIMIT: int = 3
+
+    async def collect_findings(
+        self,
+        direct: DirectService,
+        *,
+        campaigns: list[Campaign],
+    ) -> list[Finding]:
+        if not campaigns:
+            return []
+        campaign_ids = [c.id for c in campaigns]
+        rejected = await direct.scan_rejected_ads(campaign_ids=campaign_ids)
+        if not rejected:
+            return []
+
+        name_by_id = {c.id: c.name for c in campaigns}
+        grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for ad in rejected:
+            cid = ad.get("CampaignId")
+            # Skip orphan rows (CampaignId mismatch with our
+            # active-campaigns set) — defensive against API drift
+            # where the scan returns campaigns we didn't ask for.
+            if isinstance(cid, int) and cid in name_by_id:
+                grouped[cid].append(ad)
+
+        findings: list[Finding] = []
+        for cid, ads in grouped.items():
+            campaign_name = name_by_id[cid]
+            sample = []
+            for ad in ads[: self.SAMPLE_LIMIT]:
+                title = (ad.get("TextAd") or {}).get("Title")
+                if title:
+                    sample.append(f"'{title}'")
+                else:
+                    # Some ad types (image, dynamic) don't have a
+                    # ``TextAd.Title``; fall back to the bare ID
+                    # so the operator still has a handle.
+                    sample.append(f"ad_id={ad.get('Id')}")
+            extra_count = len(ads) - self.SAMPLE_LIMIT
+            extra = f" (+{extra_count} more)" if extra_count > 0 else ""
+            message = (
+                f"{len(ads)} ad(s) rejected by moderation in campaign "
+                f"'{campaign_name}': {', '.join(sample)}{extra}"
+            )
+            findings.append(
+                Finding(
+                    rule_id=self.rule_id,
+                    severity=Severity.HIGH,
+                    campaign_id=cid,
+                    campaign_name=campaign_name,
+                    message=message,
+                    estimated_impact_rub=None,
+                )
+            )
+        return findings
+
+
+class RejectedKeywordsRule(_DirectStateRule):
+    """Flag campaigns containing keywords rejected by moderation.
+
+    Symmetric to ``RejectedAdsRule``: aggregated per-campaign,
+    HIGH severity, sample-limited message.
+    """
+
+    rule_id = "rejected_keywords"
+
+    SAMPLE_LIMIT: int = 3
+
+    async def collect_findings(
+        self,
+        direct: DirectService,
+        *,
+        campaigns: list[Campaign],
+    ) -> list[Finding]:
+        if not campaigns:
+            return []
+        campaign_ids = [c.id for c in campaigns]
+        rejected = await direct.scan_rejected_keywords(campaign_ids=campaign_ids)
+        if not rejected:
+            return []
+
+        name_by_id = {c.id: c.name for c in campaigns}
+        grouped: dict[int, list[Keyword]] = defaultdict(list)
+        for kw in rejected:
+            if kw.campaign_id is not None and kw.campaign_id in name_by_id:
+                grouped[kw.campaign_id].append(kw)
+
+        findings: list[Finding] = []
+        for cid, kws in grouped.items():
+            campaign_name = name_by_id[cid]
+            sample = [f"'{kw.keyword}'" for kw in kws[: self.SAMPLE_LIMIT]]
+            extra_count = len(kws) - self.SAMPLE_LIMIT
+            extra = f" (+{extra_count} more)" if extra_count > 0 else ""
+            message = (
+                f"{len(kws)} keyword(s) rejected by moderation in campaign "
+                f"'{campaign_name}': {', '.join(sample)}{extra}"
+            )
+            findings.append(
+                Finding(
+                    rule_id=self.rule_id,
+                    severity=Severity.HIGH,
+                    campaign_id=cid,
+                    campaign_name=campaign_name,
+                    message=message,
+                    estimated_impact_rub=None,
+                )
+            )
+        return findings
+
+
 class HealthCheckService:
-    """Run a battery of rules over the M6 account_overview output."""
+    """Run a battery of rules over Metrika perf + Direct state."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -196,6 +377,10 @@ class HealthCheckService:
         self._rules: list[_Rule] = [
             BurningCampaignRule(settings),
             HighCpaRule(settings),
+        ]
+        self._direct_rules: list[_DirectStateRule] = [
+            RejectedAdsRule(settings),
+            RejectedKeywordsRule(settings),
         ]
 
     async def __aenter__(self) -> Self:
@@ -210,11 +395,12 @@ class HealthCheckService:
         date_range: DateRange,
         goal_id: int | None = None,
     ) -> HealthReport:
-        """Run all rules over the account overview.
+        """Run all rules over the account overview + Direct state.
 
-        ``goal_id`` is optional but most rules are pre-conditioned on
-        it — without conversions data, the conclusions degrade to
-        cost-only signals that produce false positives.
+        ``goal_id`` is optional but most perf-rules are pre-conditioned
+        on it — without conversions data, the conclusions degrade to
+        cost-only signals that produce false positives. Direct-state
+        rules don't need it (rejection status is goal-independent).
         """
         async with ReportingService(self._settings) as reporting:
             overview = await reporting.account_overview(
@@ -229,13 +415,29 @@ class HealthCheckService:
                 if finding is not None:
                     findings.append(finding)
 
+        if self._direct_rules:
+            async with DirectService(self._settings) as direct:
+                campaigns = await direct.get_campaigns()
+                # Active = anything not archived. Archived campaigns
+                # don't burn budget; their rejected entities aren't
+                # actionable, so excluding them up-front is both a
+                # signal-quality fix AND a bandwidth saver (one less
+                # adgroup-walk per archived campaign).
+                active = [c for c in campaigns if c.state != CampaignState.ARCHIVED]
+                for direct_rule in self._direct_rules:
+                    rule_findings = await direct_rule.collect_findings(direct, campaigns=active)
+                    findings.extend(rule_findings)
+
         return HealthReport(date_range=date_range, findings=findings)
 
 
 # Re-export so monkeypatch in tests targets a stable name.
 __all__ = [
     "BurningCampaignRule",
+    "DirectService",
     "HealthCheckService",
     "HighCpaRule",
+    "RejectedAdsRule",
+    "RejectedKeywordsRule",
     "ReportingService",
 ]
