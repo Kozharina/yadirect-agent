@@ -79,11 +79,16 @@ demo-only, technically; it cannot be handed to a non-developer.
       account?".
 - [x] ~~**M15.5.2-3 — rejected-ads / rejected-keywords rules**~~ —
       shipped, see Done.
-- [ ] **M15.5.4-5 — remaining health rule expansion**: low-CTR
-      rule (needs impressions from Direct reports), CTR-drift
-      rule (needs week-over-week comparison = small history
-      store), ``@requires_llm`` decorator pattern for tools that
-      gate on Anthropic key presence. Each is a separate small PR.
+- [x] ~~**M15.5.4 — low-CTR rule**~~ — shipped, see Done.
+- [ ] **M15.5.5 — CTR-drift rule**: week-over-week CTR comparison,
+      needs a mini history-store for last-week's per-campaign
+      CTR. Larger PR than M15.5.4 because of the history
+      infrastructure.
+- [ ] **`@requires_llm` decorator** (deferred): pattern for tools
+      that gate on Anthropic key presence. Waiting for the first
+      real LLM-gated consumer (M8 creatives or M12 reports) per
+      the "no design for hypothetical future requirement"
+      non-negotiable.
 
 ### 🛡️ Phase 2 (Assist) — release 0.3.0
 
@@ -827,6 +832,64 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M15.5.4 — low-CTR rule** (Phase 0+1 release 0.2.0). Third
+      perf-rule on the M15.5 health-check pipeline, alongside
+      ``BurningCampaignRule`` and ``HighCpaRule``.
+
+      **Why this next**: real signal for Anna — "campaign shows
+      but doesn't get clicked" is a creative-iteration prompt
+      that's currently invisible unless the operator manually
+      computes CTR per campaign in Direct. Threshold-based but
+      with a hard ``MIN_IMPRESSIONS=1000`` statistical-significance
+      gate so noise doesn't drown signal. Severity WARNING (not
+      HIGH) because legitimate brand/awareness campaigns can sit
+      below threshold; the rule surfaces candidates, the operator
+      decides.
+
+      **Implementation** (``services/health_check.py``):
+      ``LowCtrRule(_Rule)`` is a synchronous perf-row rule that
+      consumes ``CampaignPerformance.impressions`` and computes
+      ``CTR = clicks / impressions * 100``. Pre-conditions:
+      impressions >= MIN_IMPRESSIONS (1000), impressions > 0
+      (defensive divisor guard), ctr_pct < MIN_CTR_PCT (0.5%).
+      Goal-id-independent — first rule of its kind; future
+      creative-side rules (low CR, high bounce) will share the
+      goal-independence.
+
+      **Plumbing**: ``CampaignPerformance.impressions: int = 0``
+      added with the same non-negative validator as ``clicks`` /
+      ``cost_rub`` / ``conversions``; default-0 keeps backward
+      compat with every construction site that predates this PR.
+      ``ReportingService.account_overview`` and
+      ``campaign_performance`` now request ``ym:ad:impressions``
+      after the conversions metric (load-bearing position so
+      legacy fixtures with shorter metric arrays fall off the
+      end and parser defaults to 0). Position-aware parser
+      handles both ``goal_id`` set (impressions at index 3) and
+      None (impressions at index 2).
+
+      **Tests**: 3 new model tests in ``test_metrika.py`` (field
+      carries through, defaults to 0, negative rejected). 4 new
+      reporting tests in ``test_reporting.py`` (metric requested,
+      extracted with goal_id, extracted without goal_id, defaults
+      to 0 when metric absent). 6 new health-check tests in
+      ``test_health_check.py`` (flags low CTR, healthy CTR
+      ignored, MIN_IMPRESSIONS gate, zero-impressions defensive,
+      no goal_id required, threshold boundary). 1143 tests green;
+      mypy strict; ruff clean.
+
+      **Why Metrika ``ym:ad:impressions`` and not Direct Reports
+      TSV**: Metrika exposes it in the ad-namespace alongside
+      ``ym:ad:directCost`` we already use, so no new wire shape
+      to parse. Direct Reports endpoint (``fetch_report``,
+      async TSV polling) remains the right tool for keyword-grain
+      reports — out of scope for campaign-grain CTR which Metrika
+      handles cleanly.
+
+      **Deferred**: CTR-drift rule (needs history-store —
+      week-over-week CTR delta), ``@requires_llm`` decorator
+      (needs first LLM-gated consumer).
 
 - [x] **M15.5.2-3 — rejected-ads / rejected-keywords rules**
       (Phase 0+1 release 0.2.0). Two new HIGH-severity health

@@ -101,6 +101,7 @@ def _perf(
     conversions: int = 5,
     cpa_rub: float | None = 100.0,
     cr_pct: float | None = 5.0,
+    impressions: int = 0,
 ) -> CampaignPerformance:
     return CampaignPerformance(
         campaign_id=campaign_id,
@@ -111,6 +112,7 @@ def _perf(
         conversions=conversions,
         cpa_rub=cpa_rub,
         cr_pct=cr_pct,
+        impressions=impressions,
     )
 
 
@@ -948,3 +950,192 @@ class TestHealthCheckServiceDirectStateIntegration:
         rule_ids = {f.rule_id for f in report.findings}
         assert "rejected_ads" in rule_ids
         assert "rejected_keywords" in rule_ids
+
+
+# --------------------------------------------------------------------------
+# LowCtrRule (M15.5.4).
+# --------------------------------------------------------------------------
+
+
+class TestLowCtrRule:
+    async def test_flags_campaign_with_low_ctr(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 50 clicks / 50_000 impressions = 0.1% CTR — well below
+        # the 0.5% threshold, with enough impressions to be
+        # statistically meaningful. Severity WARNING (not HIGH)
+        # because low CTR is a creative-iteration signal, not a
+        # money-burn alarm — the operator may have legitimate
+        # reasons for it (brand campaign, broad-match awareness).
+        low_ctr = _perf(
+            campaign_id=51,
+            name="non-brand",
+            clicks=50,
+            cost_rub=500.0,
+            impressions=50_000,
+            conversions=2,
+            cpa_rub=250.0,
+            cr_pct=4.0,
+        )
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[low_ctr]))
+
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=_WEEK, goal_id=100)
+
+        low_ctr_findings = [f for f in report.findings if f.rule_id == "low_ctr"]
+        assert len(low_ctr_findings) == 1
+        finding = low_ctr_findings[0]
+        assert finding.severity == Severity.WARNING
+        assert finding.campaign_id == 51
+        assert finding.campaign_name == "non-brand"
+        # Message should include the actual CTR percentage and the
+        # raw clicks/impressions split so the operator can quickly
+        # decide whether the data is real or sampling noise.
+        assert "0.10%" in finding.message or "0.1%" in finding.message
+        assert "50" in finding.message
+        assert "50000" in finding.message or "50,000" in finding.message
+
+    async def test_does_not_flag_campaign_with_healthy_ctr(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 1500 clicks / 50_000 impressions = 3% CTR — well above
+        # threshold. Must NOT fire even though the campaign has
+        # plenty of impressions.
+        healthy = _perf(
+            campaign_id=42,
+            name="brand",
+            clicks=1500,
+            cost_rub=850.0,
+            impressions=50_000,
+            conversions=10,
+        )
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[healthy]))
+
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=_WEEK, goal_id=100)
+
+        low_ctr_findings = [f for f in report.findings if f.rule_id == "low_ctr"]
+        assert low_ctr_findings == []
+
+    async def test_skips_campaign_below_min_impressions_threshold(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 1 click / 100 impressions = 1% CTR but the impressions
+        # sample is too small to be meaningful (one click could
+        # easily be a bot or a misclick). Statistical-significance
+        # gate (MIN_IMPRESSIONS=1000) keeps this kind of noise
+        # from drowning the signal. Operator's CLI table shouldn't
+        # surface "campaign X has CTR=0% with 5 impressions" — the
+        # next day's data could shift the verdict to 60%.
+        too_small = _perf(
+            campaign_id=99,
+            name="new-campaign",
+            clicks=0,
+            cost_rub=10.0,
+            impressions=100,
+            conversions=0,
+        )
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[too_small]))
+
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=_WEEK, goal_id=100)
+
+        low_ctr_findings = [f for f in report.findings if f.rule_id == "low_ctr"]
+        assert low_ctr_findings == []
+
+    async def test_skips_campaign_with_zero_impressions(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Defensive: a campaign with zero impressions (paused, not
+        # yet running, no Direct→Metrika linkage) must NOT crash
+        # with ZeroDivisionError on ``clicks / impressions``. Same
+        # contract as ``BurningCampaignRule``: silent skip is the
+        # right behaviour for "no data to act on".
+        no_data = _perf(
+            campaign_id=200,
+            name="paused",
+            clicks=0,
+            cost_rub=0.0,
+            impressions=0,
+            conversions=0,
+            cpa_rub=None,
+            cr_pct=None,
+        )
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[no_data]))
+
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=_WEEK, goal_id=100)
+
+        low_ctr_findings = [f for f in report.findings if f.rule_id == "low_ctr"]
+        assert low_ctr_findings == []
+
+    async def test_does_not_require_goal_id(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Unlike BurningCampaignRule and HighCpaRule, LowCtrRule
+        # works without conversions data — CTR is purely
+        # impressions / clicks based. An operator who hasn't
+        # configured a Metrika goal still gets the low-CTR signal.
+        low_ctr_no_goal = _perf(
+            campaign_id=51,
+            name="non-brand",
+            clicks=50,
+            cost_rub=500.0,
+            impressions=50_000,
+            conversions=0,  # no goal_id → no conversions data
+            cpa_rub=None,
+            cr_pct=None,
+        )
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[low_ctr_no_goal]))
+
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=_WEEK, goal_id=None)
+
+        low_ctr_findings = [f for f in report.findings if f.rule_id == "low_ctr"]
+        assert len(low_ctr_findings) == 1
+
+    async def test_threshold_boundary_at_min_impressions(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Boundary check: exactly MIN_IMPRESSIONS-1 must skip;
+        # MIN_IMPRESSIONS itself must evaluate. Documented
+        # explicitly because it's the kind of off-by-one a future
+        # refactor (e.g. switching ``<`` to ``<=``) would break
+        # without anyone noticing.
+        from yadirect_agent.services.health_check import LowCtrRule
+
+        below = _perf(
+            campaign_id=1,
+            clicks=0,
+            cost_rub=10.0,
+            impressions=LowCtrRule.MIN_IMPRESSIONS - 1,
+        )
+        at = _perf(
+            campaign_id=2,
+            clicks=0,
+            cost_rub=10.0,
+            impressions=LowCtrRule.MIN_IMPRESSIONS,
+        )
+        _patch_reporting(monkeypatch, _FakeReportingService(overview=[below, at]))
+
+        async with HealthCheckService(settings) as svc:
+            report = await svc.run_account_check(date_range=_WEEK, goal_id=100)
+
+        low_ctr_findings = [f for f in report.findings if f.rule_id == "low_ctr"]
+        # ``below`` skipped, ``at`` evaluated → only one finding
+        # (for campaign_id=2 since 0 clicks / N impressions = 0%
+        # CTR which is below threshold).
+        assert len(low_ctr_findings) == 1
+        assert low_ctr_findings[0].campaign_id == 2

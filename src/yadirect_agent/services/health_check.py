@@ -203,6 +203,90 @@ class HighCpaRule(_Rule):
         )
 
 
+class LowCtrRule(_Rule):
+    """Flag campaigns whose CTR is too low to be effective.
+
+    CTR = clicks / impressions * 100%. A campaign that shows but
+    rarely gets clicked is a creative-iteration signal: the ad
+    text/headline isn't connecting with the auction's audience,
+    or the keyword targeting is broader than the creative
+    expects. WARNING severity (not HIGH) because the operator may
+    have legitimate reasons (brand campaigns on broad terms,
+    awareness plays); the rule surfaces the candidate, the
+    operator decides.
+
+    Pre-conditions:
+
+    - ``perf.impressions`` must meet ``MIN_IMPRESSIONS`` (1000) so
+      a near-empty campaign isn't flagged on noise. ``5 impressions
+      with 0 clicks = 0% CTR`` is statistically meaningless; the
+      next day's data could shift to 60%.
+    - ``perf.impressions > 0`` to avoid ZeroDivisionError on
+      campaigns with no impression data at all (paused, not yet
+      running, no Direct→Metrika linkage in Settings).
+    - The computed CTR must be strictly below ``MIN_CTR_PCT``
+      (0.5%). At-or-above is a pass.
+
+    Unlike ``BurningCampaignRule`` and ``HighCpaRule``, this rule
+    does NOT require ``goal_id`` — CTR is purely impressions /
+    clicks; an operator who hasn't configured a Metrika goal still
+    gets the low-CTR signal. This is the first rule of its kind;
+    future creative-side rules (low CR, high bounce) will share
+    the goal-independence.
+    """
+
+    rule_id = "low_ctr"
+
+    # 0.5% is conservative — the typical Direct ad-network baseline
+    # is 1-3% on broad keywords, 5%+ on tight branded keywords.
+    # 0.5% catches the "nobody is clicking" case without flagging
+    # legitimate brand/awareness campaigns on broad terms. Becomes
+    # a Settings.policy knob in a follow-up.
+    MIN_CTR_PCT: float = 0.5
+
+    # Statistical-significance gate. 1000 impressions over a 7-day
+    # window gives the operator something concrete to act on; below
+    # this, the CTR sample is too noisy. (Operator-side: a fresh
+    # campaign with <1000 impressions in a week is itself a signal,
+    # but a different one — "this campaign isn't getting served"
+    # belongs to a future "lost-impression-share" rule, not here.)
+    MIN_IMPRESSIONS: int = 1000
+
+    def check(
+        self,
+        perf: CampaignPerformance,
+        *,
+        goal_id: int | None,
+    ) -> Finding | None:
+        # Goal-independent: CTR doesn't need conversions.
+        if perf.impressions < self.MIN_IMPRESSIONS:
+            return None
+        # Defensive divisor guard. ``MIN_IMPRESSIONS >= 1`` covers
+        # the math, but the explicit check makes the intent
+        # readable for future maintainers and survives a regression
+        # that lowered the threshold to 0.
+        if perf.impressions == 0:
+            return None
+        ctr_pct = perf.clicks / perf.impressions * 100.0
+        if ctr_pct >= self.MIN_CTR_PCT:
+            return None
+
+        message = (
+            f"campaign '{perf.campaign_name}' has low CTR "
+            f"{ctr_pct:.2f}% ({perf.clicks} clicks / {perf.impressions} "
+            f"impressions over {perf.date_range.start.isoformat()} to "
+            f"{perf.date_range.end.isoformat()})"
+        )
+        return Finding(
+            rule_id=self.rule_id,
+            severity=Severity.WARNING,
+            campaign_id=perf.campaign_id,
+            campaign_name=perf.campaign_name,
+            message=message,
+            estimated_impact_rub=None,
+        )
+
+
 class _DirectStateRule:
     """Base for rules that consume Direct API state (not Metrika perf).
 
@@ -377,6 +461,7 @@ class HealthCheckService:
         self._rules: list[_Rule] = [
             BurningCampaignRule(settings),
             HighCpaRule(settings),
+            LowCtrRule(settings),
         ]
         self._direct_rules: list[_DirectStateRule] = [
             RejectedAdsRule(settings),
@@ -437,6 +522,7 @@ __all__ = [
     "DirectService",
     "HealthCheckService",
     "HighCpaRule",
+    "LowCtrRule",
     "RejectedAdsRule",
     "RejectedKeywordsRule",
     "ReportingService",

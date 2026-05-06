@@ -35,6 +35,12 @@ _log = structlog.get_logger(component="services.reporting")
 # imports rather than silently returning zeros (the agent worst case).
 _METRIC_VISITS = "ym:s:visits"
 _METRIC_DIRECT_COST = "ym:ad:directCost"
+# Direct ad-namespace impressions, distinct from session visits.
+# LowCtrRule (M15.5.4) needs this to compute CTR = clicks /
+# impressions. Always requested even when goal_id is None — there's
+# no harm in an extra metric, and an unconditional request keeps
+# the parsing logic simpler than a conditional one.
+_METRIC_IMPRESSIONS = "ym:ad:impressions"
 # Goal-specific conversion metric is composed at call time:
 #   f"ym:s:goal{goal_id}conversions"
 
@@ -122,9 +128,16 @@ class ReportingService:
         """
         counter_id = self._require_counter_id()
 
+        # Request order is load-bearing for parsing: visits[0],
+        # cost[1], conversions[2 if goal_id else absent],
+        # impressions[after conversions]. Position-after-conversions
+        # keeps backward compat with existing test fixtures that
+        # supply only [visits, cost, conversions]; impressions falls
+        # off the end and the parser defaults to 0.
         metrics = [_METRIC_VISITS, _METRIC_DIRECT_COST]
         if goal_id is not None:
             metrics.append(f"ym:s:goal{goal_id}conversions")
+        metrics.append(_METRIC_IMPRESSIONS)
 
         # Filter to this single campaign — without it, ym:ad:directCost
         # would be account-wide, not per-campaign. Same for visits.
@@ -156,7 +169,15 @@ class ReportingService:
         m = row.metrics
         clicks = int(m[0]) if len(m) > 0 else 0
         cost_rub = float(m[1]) if len(m) > 1 else 0.0
-        conversions = int(m[2]) if len(m) > 2 and goal_id is not None else 0
+        # Conversions sits at position [2] only when goal_id was
+        # supplied; otherwise impressions slides up to that slot.
+        if goal_id is not None:
+            conversions = int(m[2]) if len(m) > 2 else 0
+            impressions_idx = 3
+        else:
+            conversions = 0
+            impressions_idx = 2
+        impressions = int(m[impressions_idx]) if len(m) > impressions_idx else 0
 
         return CampaignPerformance(
             campaign_id=campaign_id,
@@ -167,6 +188,7 @@ class ReportingService:
             conversions=conversions,
             cpa_rub=_compute_cpa(cost_rub, conversions),
             cr_pct=_compute_cr_pct(clicks, conversions),
+            impressions=impressions,
         )
 
     async def account_overview(
@@ -199,6 +221,11 @@ class ReportingService:
         metrics = [_METRIC_VISITS, _METRIC_DIRECT_COST]
         if goal_id is not None:
             metrics.append(f"ym:s:goal{goal_id}conversions")
+        # Same trailing-position rule as ``campaign_performance``:
+        # impressions go after conversions so legacy fixtures with
+        # 2-3 metric values fall off the end and the parser
+        # defaults impressions to 0.
+        metrics.append(_METRIC_IMPRESSIONS)
 
         async with MetrikaService(self._settings) as mc:
             rows = await mc.get_report(
@@ -254,7 +281,13 @@ class ReportingService:
             m = row.metrics
             clicks = int(m[0]) if len(m) > 0 else 0
             cost_rub = float(m[1]) if len(m) > 1 else 0.0
-            conversions = int(m[2]) if len(m) > 2 and goal_id is not None else 0
+            if goal_id is not None:
+                conversions = int(m[2]) if len(m) > 2 else 0
+                impressions_idx = 3
+            else:
+                conversions = 0
+                impressions_idx = 2
+            impressions = int(m[impressions_idx]) if len(m) > impressions_idx else 0
 
             results.append(
                 CampaignPerformance(
@@ -266,6 +299,7 @@ class ReportingService:
                     conversions=conversions,
                     cpa_rub=_compute_cpa(cost_rub, conversions),
                     cr_pct=_compute_cr_pct(clicks, conversions),
+                    impressions=impressions,
                 ),
             )
         return results

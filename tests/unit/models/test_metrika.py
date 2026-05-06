@@ -137,6 +137,60 @@ class TestCampaignPerformance:
                 cr_pct=None,
             )
 
+    def test_impressions_field_carries_through(self) -> None:
+        # Direct ads namespace exposes ``ym:ad:impressions`` separately
+        # from the ``ym:s:visits`` clicks-equivalent. ``LowCtrRule``
+        # (M15.5.4) needs the impressions side to compute
+        # ``CTR = clicks / impressions``. Default 0 keeps backward
+        # compatibility for callers that don't supply the field
+        # (no risk of silently breaking pre-existing CampaignPerformance
+        # construction sites).
+        perf = CampaignPerformance(
+            campaign_id=42,
+            campaign_name="brand",
+            date_range=DateRange(start=date(2026, 4, 1), end=date(2026, 4, 7)),
+            clicks=120,
+            cost_rub=850.50,
+            conversions=5,
+            cpa_rub=170.10,
+            cr_pct=4.17,
+            impressions=24_000,
+        )
+        assert perf.impressions == 24_000
+
+    def test_impressions_defaults_to_zero(self) -> None:
+        # Backward compat: existing call sites that don't pass
+        # impressions get 0 (a value LowCtrRule's MIN_IMPRESSIONS
+        # gate filters out, so no false-positive risk).
+        perf = CampaignPerformance(
+            campaign_id=42,
+            campaign_name="brand",
+            date_range=DateRange(start=date(2026, 4, 1), end=date(2026, 4, 7)),
+            clicks=120,
+            cost_rub=850.50,
+            conversions=5,
+            cpa_rub=170.10,
+            cr_pct=4.17,
+        )
+        assert perf.impressions == 0
+
+    def test_negative_impressions_rejected(self) -> None:
+        # Same defensive invariant as clicks / cost_rub /
+        # conversions: a negative impressions count would invert
+        # CTR semantics in LowCtrRule (negative CTR is nonsensical).
+        with pytest.raises(ValueError, match="impressions must be non-negative"):
+            CampaignPerformance(
+                campaign_id=42,
+                campaign_name="brand",
+                date_range=DateRange(start=date(2026, 4, 1), end=date(2026, 4, 7)),
+                clicks=0,
+                cost_rub=0.0,
+                conversions=0,
+                cpa_rub=None,
+                cr_pct=None,
+                impressions=-1,
+            )
+
     def test_zero_conversions_carries_none_cpa(self) -> None:
         # The model itself doesn't enforce this — it just types it.
         # The service is responsible for setting None on zero conversions;

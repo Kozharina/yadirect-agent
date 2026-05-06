@@ -175,6 +175,12 @@ class CampaignPerformance:
     conversions: int
     cpa_rub: float | None
     cr_pct: float | None
+    # ``impressions`` defaults to 0 for backward compat with every
+    # construction site that predates M15.5.4 (LowCtrRule). When the
+    # Metrika reporting layer can't find an ``ym:ad:impressions``
+    # value, the dataclass still constructs cleanly — the rule's
+    # MIN_IMPRESSIONS gate handles "data missing or insignificant".
+    impressions: int = 0
 
     def __post_init__(self) -> None:
         # Frozen dataclasses don't enforce field types at construction.
@@ -195,4 +201,7 @@ class CampaignPerformance:
             raise ValueError(msg)
         if self.cost_rub < 0:
             msg = f"cost_rub must be non-negative, got {self.cost_rub}"
+            raise ValueError(msg)
+        if self.impressions < 0:
+            msg = f"impressions must be non-negative, got {self.impressions}"
             raise ValueError(msg)
