@@ -15,6 +15,7 @@ env resolution — `Settings()` would otherwise fail without `.env` secrets.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -1000,3 +1001,64 @@ def test_health_rejects_negative_goal_id(runner: CliRunner) -> None:
     result = runner.invoke(app, ["health", "--goal-id", "-1"])
 
     assert result.exit_code != 0
+
+
+def test_health_passes_history_store_to_service(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # M15.5.5: the CLI must wire a HealthHistoryStore into
+    # HealthCheckService so the CTR-drift rule has somewhere to
+    # read previous-week snapshots from. Without this assertion,
+    # a regression that dropped the kwarg silently disables drift
+    # detection — every account stays "no drift findings" forever
+    # because there's never a baseline to compare against.
+    from typing import Self
+
+    from yadirect_agent import cli as _cli_pkg
+    from yadirect_agent.models.health import HealthReport
+    from yadirect_agent.models.metrika import DateRange
+    from yadirect_agent.services.health_history_store import HealthHistoryStore
+
+    captured: dict[str, object] = {}
+
+    class _SpyService:
+        def __init__(
+            self,
+            settings: object,
+            *,
+            history_store: HealthHistoryStore | None = None,
+        ) -> None:
+            captured["history_store"] = history_store
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def run_account_check(
+            self,
+            *,
+            date_range: DateRange,
+            goal_id: int | None = None,
+        ) -> HealthReport:
+            return HealthReport(date_range=date_range, findings=[])
+
+    # Bootstrap settings to a tmp-path-only Settings so the CLI
+    # doesn't trip on missing audit_log_path on the real disk.
+    monkeypatch.setenv("YANDEX_DIRECT_TOKEN", "x")
+    monkeypatch.setenv("YANDEX_METRIKA_TOKEN", "x")
+    monkeypatch.setenv("YANDEX_METRIKA_COUNTER_ID", "1")
+    monkeypatch.setenv("AGENT_POLICY_PATH", str(tmp_path / "policy.yml"))
+    monkeypatch.setenv("AUDIT_LOG_PATH", str(tmp_path / "logs" / "audit.jsonl"))
+
+    monkeypatch.setattr(_cli_pkg.main, "HealthCheckService", _SpyService)
+
+    result = runner.invoke(app, ["health", "--days", "7"])
+
+    assert result.exit_code == 0, result.output
+    assert isinstance(captured["history_store"], HealthHistoryStore), (
+        f"expected HealthHistoryStore, got {captured['history_store']!r}"
+    )
