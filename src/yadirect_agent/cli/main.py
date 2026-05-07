@@ -1731,5 +1731,64 @@ def schedule_remove_cmd(
     _out.print("[green]Scheduler removed.[/green]")
 
 
+# --------------------------------------------------------------------------
+# `notify` subapp — outbound notification sinks (M18 slice 1).
+#
+# Slice 1 ships `notify test` only, against the Telegram sink. Slices 2-4
+# will add `notify setup telegram` (M18.4 wizard) plus Slack / email sinks
+# behind the same subapp.
+# --------------------------------------------------------------------------
+
+
+notify_app = typer.Typer(
+    name="notify",
+    help=(
+        "Manage outbound notification channels. Slice 1: Telegram only, "
+        "outbound (no approvals yet)."
+    ),
+    no_args_is_help=True,
+)
+app.add_typer(notify_app, name="notify")
+
+
+@notify_app.command("test")
+def notify_test_cmd() -> None:
+    """Send a test notification via the configured Telegram sink.
+
+    Operator runs this once after setting
+    ``YADIRECT_TELEGRAM_BOT_TOKEN`` and ``YADIRECT_TELEGRAM_CHAT_ID``
+    to verify the round-trip works (sink construction + Bot API
+    send + delivery to the target chat). Exit codes:
+
+    - 0 — message delivered.
+    - 2 — sink unconfigured (one or both env vars missing).
+    """
+    from ..models.health import Severity
+    from ..models.notification import Notification
+    from ..services.notify.telegram import TelegramSink
+
+    settings = _bootstrap_settings()
+    sink = TelegramSink.from_settings(settings)
+    if sink is None:
+        _err.print(
+            "[yellow]Telegram-уведомления не настроены.[/yellow]\n"
+            "[dim]Задайте две переменные: "
+            "``YADIRECT_TELEGRAM_BOT_TOKEN`` и ``YADIRECT_TELEGRAM_CHAT_ID`` "
+            "(.env или окружение) и запустите снова.[/dim]"
+        )
+        raise typer.Exit(code=2)
+
+    test_notification = Notification(
+        severity=Severity.INFO,
+        title="yadirect-agent: тестовое сообщение",
+        body=(
+            "Если вы видите это сообщение — Telegram-канал настроен корректно. "
+            "Алёрты от health-check и плановые подтверждения будут приходить сюда."
+        ),
+    )
+    asyncio.run(sink.send(test_notification))
+    _out.print("[green]✓ Тестовое сообщение отправлено в Telegram.[/green]")
+
+
 if __name__ == "__main__":  # pragma: no cover
     app()
