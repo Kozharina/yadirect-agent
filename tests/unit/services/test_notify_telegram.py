@@ -20,10 +20,10 @@ import httpx
 import pytest
 import respx
 from pydantic import SecretStr
-from yadirect_agent.models.notification import Notification
-from yadirect_agent.services.notify.telegram import TelegramSink
 
 from yadirect_agent.models.health import Severity
+from yadirect_agent.models.notification import Notification
+from yadirect_agent.services.notify.telegram import TelegramSink
 
 _BOT_TOKEN = SecretStr("123456:ABC-fake-test-token")
 _CHAT_ID = "987654321"
