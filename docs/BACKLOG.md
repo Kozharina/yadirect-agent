@@ -832,6 +832,102 @@ turn actually comes.
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
 
+- [x] **v0.2.0 release shipped to PyPI**
+      (Phase 0+1 release 0.2.0). The first cut a non-developer can
+      `pip install`. PyPI: https://pypi.org/project/yadirect-agent/0.2.0/
+
+      Live as of 2026-05-06. ``release.yml`` workflow took ~1m
+      end-to-end (build sdist + wheel → publish to PyPI via
+      Trusted Publisher → create GitHub release with artefacts).
+      Anna's command surface jumps from 10 commands in 0.1.0 to
+      15 in 0.2.0: adds ``auth`` (M15.3 OAuth + keyring),
+      ``install-into-claude-desktop`` / ``uninstall-from-claude-desktop``
+      (M15.2), ``cost`` (M21), ``schedule`` (M15.6 cross-platform).
+
+      Verified via clean-venv smoke after publish: ``pip install
+      yadirect-agent`` resolves 0.2.0; ``--version`` reports 0.2.0;
+      ``health`` exits 2 with a Russian hint instead of a Python
+      traceback (M15.x acceptance polish, #79); MCP
+      ``start_onboarding`` returns the structured ``needs_oauth``
+      envelope with no Anthropic key required (M15.4 contract);
+      ``install-into-claude-desktop`` writes the conventional
+      MCP-server entry to ``claude_desktop_config.json`` and
+      keeps stdout clean of structlog noise (#79).
+
+      What landed since v0.1.0 (the packaging-pipeline proof of
+      2026-04-28): M15.2, M15.3, M15.4 (5 slices), M15.5.1-5 (5
+      health rules + history-store), M15.6.1-3 (macOS / Linux /
+      Windows scheduler), M15.7 acceptance test, M20.1-4
+      (rationale + ``explain_decision`` + auto policy_slack), M21
+      cost tracking + 5 OAuth refresh / install / acceptance
+      polish follow-ups.
+
+      Manual Anna walkthrough is the next product gate (a real
+      human on a clean Mac with Claude Desktop). Automated
+      acceptance test ``tests/acceptance/test_anna_journey.py``
+      runs ~50ms per PR to catch regressions in the assembled
+      flow; manual smoke covers the UX subjectivity that no
+      automated test can.
+
+- [x] **M15.x acceptance polish — quiet logs, friendly errors,
+      Russian operator text** (#79). Three smoke-walkthrough
+      findings bundled into one persona-driven story:
+
+      - ``health`` on no-Metrika now catches ``ConfigError`` and
+        surfaces a Russian operator hint + ``raise typer.Exit(code=2)``
+        instead of a full Python traceback + exit 0. Mirrors the
+        MCP ``account_health`` tool's structured ``unconfigured``
+        envelope; cron-style ``health || alert-ops`` works.
+      - ``_root`` callback now runs ``configure_logging(get_settings())``
+        so EVERY command — including those that don't call
+        ``_bootstrap_settings()`` (``install-into-claude-desktop``,
+        ``auth logout``, etc.) — gets stderr-routed structlog
+        output. The previous behaviour leaked
+        ``[info ] claude_desktop.config.installed action=added ...``
+        right next to the ``✓ Added`` operator line.
+      - Three "no data" / "not configured" CLI states translated
+        to Russian: ``Расписание не настроено.``, ``Запусков
+        агента ещё не было — данных пока нет.``, ``обоснований
+        ещё нет``. CLAUDE.md ``<language_conventions>`` gained
+        an explicit policy bullet documenting operator-facing
+        Russian as the default + the English-by-convention
+        exceptions (structlog event names, exception classes,
+        typer ``--option`` help, MCP envelopes that the LLM
+        translates to chat output).
+
+      Out of scope (tracked as separate follow-ups): ``doctor``
+      UX cleanup (5 JSON noise lines on stdout, exit 0 on fail,
+      leaked ``Bearer `` httpx error); MCP
+      ``start_onboarding.reason`` field translation; full sweep
+      of remaining ~30 English operator-facing strings.
+
+      1170 tests green. RED→GREEN pair preserved per
+      CLAUDE.md non-negotiable #5.
+
+- [x] **M15.7 — end-to-end acceptance test for Anna's journey**
+      (#77). New top-level ``tests/acceptance/`` directory with
+      ``test_anna_journey_to_first_health_finding`` locking down
+      the conversational path from a fresh keyring-saved token
+      to a structured ``account_health()`` finding, in ~50ms with
+      mocked Direct/Metrika. Catches regressions in
+      ``start_onboarding`` envelope shape, ``HealthCheckService``
+      lifecycle (M15.5.5 history-store wiring), BusinessProfile
+      → policy proposal pipeline, response keys the LLM in
+      Claude Desktop reads, and any catastrophic perf regression
+      via a 30s budget. ``make acceptance`` target added; default
+      ``make check`` already includes ``tests/`` so acceptance
+      runs every PR.
+
+- [x] **v0.2.0 version bump + initial CHANGELOG** (#78). PyPI
+      had only 0.1.0 from 2026-04-28; smoke walkthrough as Anna
+      caught that the bump never happened despite massive
+      post-0.1.0 work. ``pyproject.toml`` and
+      ``__init__.py`` flipped to ``0.2.0``; new ``CHANGELOG.md``
+      in [Keep a Changelog] format; 0.1.0 entry retroactively
+      reframed as "packaging-pipeline proof". Tag pushed
+      separately by the operator after merge to trigger the
+      auto-publish workflow.
+
 - [x] **M15.5.4 — low-CTR rule** (Phase 0+1 release 0.2.0). Third
       perf-rule on the M15.5 health-check pipeline, alongside
       ``BurningCampaignRule`` and ``HighCpaRule``.
