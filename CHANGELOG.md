@@ -12,6 +12,61 @@ top — promoted to a numbered version on release-cut.
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-05-07
+
+### Added
+
+- **M18 slice 1** — first step of the notifications & approvals
+  milestone (Phase 2 release 0.3.0 work landing in the 0.2.x line
+  to unblock the M21.2 alert path):
+  - `Notification` model (`models/notification.py`) with severity
+    reused from `models/health.py:Severity`.
+  - `TelegramSink` (`services/notify/telegram.py`): outbound Bot
+    API send with httpx + tenacity retry (4 attempts, exp backoff
+    up to 30 s), HTML parse_mode + stdlib `html.escape`, severity
+    emoji prefixes (🔴 / 🟡 / 🔵), `from_settings()` classmethod
+    returning `None` when unconfigured.
+  - Settings fields `telegram_bot_token` (`SecretStr | None`,
+    env `TELEGRAM_BOT_TOKEN`) and `telegram_chat_id`
+    (`str | None`, env `TELEGRAM_CHAT_ID`).
+  - CLI subcommand `yadirect-agent notify test` for operator
+    verification after first BotFather setup. Russian operator
+    text per CLAUDE.md `<language_conventions>`.
+
+### Fixed
+
+- **M18 slice 1 doc/CLI bug**: docstrings + `notify test`
+  unconfigured hint message documented env vars as
+  `YADIRECT_TELEGRAM_BOT_TOKEN` / `YADIRECT_TELEGRAM_CHAT_ID`,
+  but pydantic-settings (no `env_prefix` on Settings) actually
+  resolves field names uppercased without prefix —
+  `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`. Fixed across
+  `config.py`, `services/notify/telegram.py`, and the CLI hint.
+  An operator following the documented variable names from
+  v0.2.0's CLI message would have seen the sink stay
+  unconfigured forever; v0.2.1 fixes the documented names so
+  the env-var path actually wires through.
+- **M18 slice 1 traceback bug**: `yadirect-agent notify test`
+  with a wrong token / wrong chat_id used to dump the full
+  Python traceback from `httpx.HTTPStatusError` to stderr.
+  Fixed: CLI now catches `HTTPStatusError` (401 / 400 / 403)
+  and `httpx.HTTPError` (network failures) and translates each
+  into a one-line Russian operator message + non-zero exit
+  (1 for sink-rejected, 2 for unconfigured). Sink itself still
+  raises by design — the future Dispatcher (slice 5) needs
+  the exception class to fall back to other sinks. Only the
+  CLI surface translates.
+
+### Why a patch release (0.2.1, not 0.3.0)
+
+M18 slice 1 ships outbound notifications only; no behaviour
+change for v0.2.0 callers (M15.x acceptance path stays
+identical). The `notify test` CLI is a new opt-in surface,
+not a breaking addition. SemVer: minor "added new optional
+feature" would also fit pre-1.0, but patch is honest about
+the scope (no rule changes, no protocol changes, no Settings
+required-field additions).
+
 ## [0.2.0] — 2026-05-06
 
 ### Anna's path (M15.x acceptance)
@@ -92,6 +147,7 @@ M0–M3 + early M15.5.1 work; no `auth`, no `install-into-claude-desktop`,
 no scheduler, no onboarding tool. Released as a release-management
 checkpoint, not a user-ready cut.
 
-[Unreleased]: https://github.com/Kozharina/yadirect-agent/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Kozharina/yadirect-agent/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/Kozharina/yadirect-agent/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Kozharina/yadirect-agent/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Kozharina/yadirect-agent/releases/tag/v0.1.0
