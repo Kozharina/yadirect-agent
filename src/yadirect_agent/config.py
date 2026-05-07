@@ -89,8 +89,12 @@ class Settings(BaseSettings):
     # construct via ``TelegramSink.from_settings``; either missing →
     # sink is None and the feature is gracefully disabled.
     #
+    # Env-var names follow the codebase convention (no ``YADIRECT_``
+    # prefix; pydantic-settings without ``env_prefix`` resolves field
+    # names uppercased): ``TELEGRAM_BOT_TOKEN`` and
+    # ``TELEGRAM_CHAT_ID``.
+    #
     # Storage trade-off (slice 1): both fields read from env vars
-    # (``YADIRECT_TELEGRAM_BOT_TOKEN``, ``YADIRECT_TELEGRAM_CHAT_ID``)
     # via the standard pydantic-settings ``.env`` resolver. M18.4
     # setup wizard will migrate the bot token to keyring storage with
     # env-var fallback for headless / CI / Docker contexts (same shape

@@ -32,10 +32,11 @@ What slice 1 does NOT ship:
 - HMAC anti-injection → M18.3, paired with the approval flow.
 - Setup wizard (``yadirect-agent notify setup telegram``) → M18.4.
   Slice 1 reads the token / chat_id from env vars
-  (``YADIRECT_TELEGRAM_BOT_TOKEN``, ``YADIRECT_TELEGRAM_CHAT_ID``)
-  via Settings; slice 4 will migrate to keyring storage with
-  env-var fallback for headless / CI / Docker contexts (same
-  shape as the M15.3 OAuth tokens).
+  (``TELEGRAM_BOT_TOKEN``, ``TELEGRAM_CHAT_ID`` — no
+  ``YADIRECT_`` prefix; pydantic-settings without ``env_prefix``
+  resolves field names uppercased) via Settings; slice 4 will
+  migrate to keyring storage with env-var fallback for headless
+  / CI / Docker contexts (same shape as the M15.3 OAuth tokens).
 - Dispatcher / routing → M18.1 second part. Slice 1 callers
   construct the sink and call ``send`` directly; slice 2 wires
   the Dispatcher in front of the sinks.
