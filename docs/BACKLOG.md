@@ -94,12 +94,35 @@ demo-only, technically; it cannot be handed to a non-developer.
 Anna is in assist; the agent does reversible work, asks for
 mutating work via tappable approvals.
 
-- [ ] **M18 — Notifications & approvals** (§M18): Telegram /
-      Slack / email sinks, inline-keyboard Apply/Reject/Why
-      cards, HMAC-signed callback_data, 24h plan timeout,
-      `notify setup telegram` wizard. **Phase 2 is impossible
+- [ ] **M18 — Notifications & approvals** (§M18): split into
+      slices because the surface is broad (4 sinks + dispatcher
+      + approval flow + setup wizards). **Phase 2 is impossible
       without this** — terminal-only approval is unrealistic
       for a real user.
+  - [x] ~~**slice 1 — TelegramSink (outbound only)**~~ — shipped,
+        see Done. ``Notification`` model + ``TelegramSink`` with
+        retry / HTML escaping / severity emoji prefixes +
+        ``yadirect-agent notify test`` CLI smoke command.
+  - [ ] **slice 2 — Approval flow** (§M18.2): inline-keyboard
+        Apply/Reject/Why cards, callback_data → local socket /
+        pipe → ``apply-plan``, 24h plan timeout, audit
+        actor=``telegram:<user_id>``. Big slice — needs a bot
+        polling thread / process running alongside the agent.
+  - [ ] **slice 3 — Anti-injection** (§M18.3): HMAC-SHA256
+        signature on callback_data, KS#-revalidation at apply
+        time, ``notify.signature_mismatch`` audit event.
+        Locks down slice 2 against forged taps.
+  - [ ] **slice 4 — Setup wizards** (§M18.4):
+        ``yadirect-agent notify setup telegram`` (BotFather
+        helper, keyring storage, ``/start`` chat_id capture);
+        analogous for Slack incoming webhook and SMTP for
+        email digests.
+  - [ ] **slice 5 — Slack + Email + Chat sinks** (§M18.1
+        remainder): ``SlackSink`` (Incoming Webhook +
+        ``/yadirect-approve <plan_id>`` slashcommand),
+        ``EmailSink`` (SMTP for weekly/monthly), ``ChatSink``
+        (MCP tool result fallback). Plus ``NotificationDispatcher``
+        wiring severity → channels per ``agent_policy.yml``.
 - [ ] **M19 — Rollback / time machine** (§M19): per-run snapshot
       of dangerous fields (budgets, statuses, strategies, bids,
       adjustments), `rollback --to=<run_id>` (re-uses safety
@@ -831,6 +854,65 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M18 slice 1 — Notification model + TelegramSink + CLI smoke**
+      (Phase 2 release 0.3.0 first step). Foundation of the M18
+      notify pipeline; ships outbound-only Telegram notifications
+      and a one-line operator self-check. Approval flow + HMAC +
+      setup wizard + Slack/email come in slices 2-5.
+
+      Three pieces:
+
+      - ``models/notification.py`` — frozen dataclass
+        ``Notification`` with ``severity: Severity`` (reused from
+        ``models/health.py`` for consistent operator mental
+        model), ``title``, ``body``, optional
+        ``actions: tuple[str, ...]`` (default empty for slice 1;
+        slice 2 will populate it for inline-keyboard rendering).
+        Tuple instead of list for type-level immutability.
+      - ``services/notify/telegram.py`` — ``TelegramSink`` with
+        ``send(Notification) -> None``. Bot API ``sendMessage``
+        via httpx + tenacity retry on transient 5xx + 429 (4
+        attempts, exp backoff up to 30 s; same retry posture as
+        Direct/Metrika clients). ``parse_mode=HTML`` (not
+        Markdown — operator-controlled body text containing
+        ``_``/``*``/``[`` would mis-render under Markdown);
+        bodies HTML-escaped via stdlib. Severity emoji prefix
+        per level (🔴 HIGH / 🟡 WARNING / 🔵 INFO) for
+        scannability. ``from_settings`` returns ``None`` when
+        unconfigured (caller does ``if sink is None: skip``);
+        constructor rejects empty token / empty chat_id at
+        startup so config bugs don't waste retry budget.
+      - ``services/notify/__init__.py`` package docstring
+        records the slice roadmap so future contributors land
+        slice 2/3/4/5 in the right place without re-deciding the
+        layout.
+
+      Settings: ``telegram_bot_token: SecretStr | None`` and
+      ``telegram_chat_id: str | None`` via env vars
+      ``YADIRECT_TELEGRAM_BOT_TOKEN`` / ``YADIRECT_TELEGRAM_CHAT_ID``
+      (M18.4 setup wizard will migrate token to keyring storage
+      with env-var fallback for headless / Docker contexts —
+      same shape as M15.3 OAuth tokens).
+
+      CLI: ``yadirect-agent notify test`` constructs the sink
+      and sends an INFO test notification. Russian operator text
+      per CLAUDE.md ``<language_conventions>``; exit 2 on
+      unconfigured matches the ``auth login`` / ``health``
+      "user-actionable misconfiguration" convention.
+
+      Out of scope (deferred slices, see Active queue):
+      - Inline keyboards / callback_data → slice 2 (M18.2).
+      - HMAC anti-injection → slice 3 (M18.3).
+      - Setup wizards (Telegram/Slack/SMTP) → slice 4 (M18.4).
+      - Slack/Email/Chat sinks + Dispatcher → slice 5
+        (M18.1 second part).
+      - Wiring HealthCheckService findings into the dispatcher
+        → cross-cutting follow-up after slice 5.
+
+      13 new tests green (10 sink + 1 model + 2 CLI); full suite
+      1183 tests; mypy strict; ruff clean. Three honest
+      RED→GREEN pairs in PR history: model+sink, then CLI.
 
 - [x] **v0.2.0 release shipped to PyPI**
       (Phase 0+1 release 0.2.0). The first cut a non-developer can

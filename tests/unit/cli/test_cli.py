@@ -1113,3 +1113,73 @@ def test_health_catches_config_error_with_friendly_message(
     # Operator-friendly Russian hint mentioning the next step.
     output_lower = result.output.lower()
     assert "metrika" in output_lower or "metrika_counter_id" in output_lower
+
+
+# --------------------------------------------------------------------------
+# `notify test` (M18 slice 1) — verifies a configured Telegram sink can
+# actually reach the operator's chat. Cheap operator check after first
+# setting `YADIRECT_TELEGRAM_BOT_TOKEN` and `YADIRECT_TELEGRAM_CHAT_ID`.
+# --------------------------------------------------------------------------
+
+
+def test_notify_test_sends_when_configured(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Configured = both env vars set. The CLI must construct a
+    # `TelegramSink` and call `send` exactly once. Mocks the sink
+    # to avoid real Bot API traffic; integration with the real
+    # API is covered by the Telegram unit tests via respx.
+    from yadirect_agent.services.notify import telegram as _tg_mod
+
+    sent: list[object] = []
+
+    class _SpySink:
+        async def send(self, notification: object) -> None:
+            sent.append(notification)
+
+    def _from_settings_spy(_settings: object) -> object:
+        return _SpySink()
+
+    monkeypatch.setattr(_tg_mod.TelegramSink, "from_settings", _from_settings_spy)
+
+    monkeypatch.setenv("YANDEX_DIRECT_TOKEN", "x")
+    monkeypatch.setenv("YANDEX_METRIKA_TOKEN", "x")
+    monkeypatch.setenv("YADIRECT_TELEGRAM_BOT_TOKEN", "123:ABC")
+    monkeypatch.setenv("YADIRECT_TELEGRAM_CHAT_ID", "42")
+    monkeypatch.setenv("AGENT_POLICY_PATH", str(tmp_path / "policy.yml"))
+    monkeypatch.setenv("AUDIT_LOG_PATH", str(tmp_path / "logs" / "audit.jsonl"))
+
+    result = runner.invoke(app, ["notify", "test"])
+
+    assert result.exit_code == 0, result.output
+    assert len(sent) == 1
+    # Operator gets a green confirmation in the terminal so they
+    # know the round-trip worked (sink construction + Bot API send).
+    assert "✓" in result.stdout or "отправ" in result.stdout.lower()
+
+
+def test_notify_test_unconfigured_fails_gracefully(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Unconfigured = neither env var set. The CLI must NOT crash
+    # — instead, surface a clear Russian instruction telling the
+    # operator which two env vars to set. exit 2 matches the
+    # `auth login` / `health` convention for user-actionable
+    # misconfiguration.
+    monkeypatch.setenv("YANDEX_DIRECT_TOKEN", "x")
+    monkeypatch.setenv("YANDEX_METRIKA_TOKEN", "x")
+    monkeypatch.delenv("YADIRECT_TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("YADIRECT_TELEGRAM_CHAT_ID", raising=False)
+    monkeypatch.setenv("AGENT_POLICY_PATH", str(tmp_path / "policy.yml"))
+    monkeypatch.setenv("AUDIT_LOG_PATH", str(tmp_path / "logs" / "audit.jsonl"))
+
+    result = runner.invoke(app, ["notify", "test"])
+
+    assert result.exit_code == 2, result.output
+    # Russian operator hint mentioning the env-var names.
+    assert "TELEGRAM_BOT_TOKEN" in result.output
+    assert "TELEGRAM_CHAT_ID" in result.output
