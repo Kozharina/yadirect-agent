@@ -82,6 +82,24 @@ class Settings(BaseSettings):
     # PR M2.4 MEDIUM-1.
     agent_max_daily_budget_rub: int = Field(default=10_000, ge=1)
 
+    # --- M18 notify ---
+
+    # Telegram bot token + target chat for outbound notifications
+    # (slice 1: ``TelegramSink``). Both must be set for the sink to
+    # construct via ``TelegramSink.from_settings``; either missing →
+    # sink is None and the feature is gracefully disabled.
+    #
+    # Storage trade-off (slice 1): both fields read from env vars
+    # (``YADIRECT_TELEGRAM_BOT_TOKEN``, ``YADIRECT_TELEGRAM_CHAT_ID``)
+    # via the standard pydantic-settings ``.env`` resolver. M18.4
+    # setup wizard will migrate the bot token to keyring storage with
+    # env-var fallback for headless / CI / Docker contexts (same shape
+    # as the M15.3 OAuth tokens). chat_id stays in env / config because
+    # it's not secret — losing it just means notifications fail to
+    # deliver, not credential exposure.
+    telegram_bot_token: SecretStr | None = None
+    telegram_chat_id: str | None = None
+
     # --- Observability ---
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_format: Literal["json", "console"] = "json"
