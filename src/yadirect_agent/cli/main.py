@@ -1761,8 +1761,14 @@ def notify_test_cmd() -> None:
     send + delivery to the target chat). Exit codes:
 
     - 0 — message delivered.
+    - 1 — sink rejected the request (bad token, wrong chat_id,
+      Telegram down). The CLI surfaces a short Russian message
+      and the structured ``notify.telegram.send_failed`` event
+      goes to stderr via structlog for ops-side investigation.
     - 2 — sink unconfigured (one or both env vars missing).
     """
+    import httpx
+
     from ..models.health import Severity
     from ..models.notification import Notification
     from ..services.notify.telegram import TelegramSink
@@ -1773,7 +1779,7 @@ def notify_test_cmd() -> None:
         _err.print(
             "[yellow]Telegram-уведомления не настроены.[/yellow]\n"
             "[dim]Задайте две переменные: "
-            "``YADIRECT_TELEGRAM_BOT_TOKEN`` и ``YADIRECT_TELEGRAM_CHAT_ID`` "
+            "``TELEGRAM_BOT_TOKEN`` и ``TELEGRAM_CHAT_ID`` "
             "(.env или окружение) и запустите снова.[/dim]"
         )
         raise typer.Exit(code=2)
@@ -1786,7 +1792,39 @@ def notify_test_cmd() -> None:
             "Алёрты от health-check и плановые подтверждения будут приходить сюда."
         ),
     )
-    asyncio.run(sink.send(test_notification))
+    try:
+        asyncio.run(sink.send(test_notification))
+    except httpx.HTTPStatusError as exc:
+        # Sink "errors propagate by design" so the future Dispatcher
+        # (slice 5) can fall back to other sinks. CLI surface
+        # translates the raw HTTPStatusError into a one-line
+        # operator-friendly Russian message + non-zero exit.
+        # Common causes: 401 = wrong bot token; 400 = wrong chat_id
+        # (chat not found, bot was kicked); 403 = bot blocked by
+        # the user.
+        status = exc.response.status_code
+        _err.print(
+            f"[yellow]Telegram отклонил отправку (HTTP {status}).[/yellow]\n"
+            "[dim]Чаще всего: неверный TELEGRAM_BOT_TOKEN (401), "
+            "неверный TELEGRAM_CHAT_ID или бот был заблокирован пользователем (400/403). "
+            "Проверьте переменные и состояние бота, затем повторите.[/dim]"
+        )
+        raise typer.Exit(code=1) from exc
+    except httpx.HTTPError as exc:
+        # Catch-all for network-level failures (timeout, DNS,
+        # connection refused) after retry budget is exhausted.
+        # ``# noqa: RUF001`` — operator-facing Russian text;
+        # ruff's ambiguous-cyrillic check fires on the
+        # ``api.telegram.org`` boundary even though the surrounding
+        # text is unambiguously Cyrillic.
+        _err.print(
+            "[yellow]Сбой связи с Telegram API.[/yellow]\n"  # noqa: RUF001
+            "[dim]Проверьте сеть и доступность api.telegram.org "
+            "(в России может потребоваться VPN на хосте). "
+            "Подробности в потоке ошибок: structlog event "
+            "``notify.telegram.send_failed``.[/dim]"
+        )
+        raise typer.Exit(code=1) from exc
     _out.print("[green]✓ Тестовое сообщение отправлено в Telegram.[/green]")
 
 

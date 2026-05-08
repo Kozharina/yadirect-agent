@@ -1170,16 +1170,80 @@ def test_notify_test_unconfigured_fails_gracefully(
     # operator which two env vars to set. exit 2 matches the
     # `auth login` / `health` convention for user-actionable
     # misconfiguration.
+    #
+    # Real env-var names are ``TELEGRAM_BOT_TOKEN`` and
+    # ``TELEGRAM_CHAT_ID`` (no ``YADIRECT_`` prefix); pydantic-
+    # settings without ``env_prefix`` resolves field names
+    # uppercased. Earlier version of this test deleted
+    # ``YADIRECT_TELEGRAM_*`` variants which were never set,
+    # so it passed for the wrong reason.
     monkeypatch.setenv("YANDEX_DIRECT_TOKEN", "x")
     monkeypatch.setenv("YANDEX_METRIKA_TOKEN", "x")
-    monkeypatch.delenv("YADIRECT_TELEGRAM_BOT_TOKEN", raising=False)
-    monkeypatch.delenv("YADIRECT_TELEGRAM_CHAT_ID", raising=False)
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
     monkeypatch.setenv("AGENT_POLICY_PATH", str(tmp_path / "policy.yml"))
     monkeypatch.setenv("AUDIT_LOG_PATH", str(tmp_path / "logs" / "audit.jsonl"))
 
     result = runner.invoke(app, ["notify", "test"])
 
     assert result.exit_code == 2, result.output
-    # Russian operator hint mentioning the env-var names.
+    # Russian operator hint mentioning the actual env-var names
+    # (no YADIRECT_ prefix). A regression that re-documented the
+    # prefix would surface here immediately.
     assert "TELEGRAM_BOT_TOKEN" in result.output
     assert "TELEGRAM_CHAT_ID" in result.output
+    assert "YADIRECT_TELEGRAM" not in result.output, (
+        f"Hint should not mention YADIRECT_ prefix (real env vars are "
+        f"prefix-less): {result.output!r}"
+    )
+
+
+def test_notify_test_bad_token_surfaces_clean_error_not_traceback(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # M18 slice 1 smoke walkthrough on 2026-05-07 found that
+    # ``notify test`` with a bad token would dump a full Python
+    # traceback to stderr (httpx.HTTPStatusError 401 propagated
+    # straight from the sink). Anna sees a stack trace instead
+    # of "your token is wrong, check it".
+    #
+    # Pin the contract: bad-token / network-failure path emits a
+    # short Russian operator message + exit non-zero, no
+    # ``Traceback`` markers, no ``HTTPStatusError`` substring.
+    import httpx
+
+    from yadirect_agent.services.notify import telegram as _tg_mod
+
+    class _FailingSink:
+        async def send(self, _notification: object) -> None:
+            request = httpx.Request("POST", "https://api.telegram.org/bot/sendMessage")
+            response = httpx.Response(401, request=request)
+            raise httpx.HTTPStatusError(
+                "401 Unauthorized",
+                request=request,
+                response=response,
+            )
+
+    def _from_settings_spy(_settings: object) -> object:
+        return _FailingSink()
+
+    monkeypatch.setattr(_tg_mod.TelegramSink, "from_settings", _from_settings_spy)
+
+    monkeypatch.setenv("YANDEX_DIRECT_TOKEN", "x")
+    monkeypatch.setenv("YANDEX_METRIKA_TOKEN", "x")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bad")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "1")
+    monkeypatch.setenv("AGENT_POLICY_PATH", str(tmp_path / "policy.yml"))
+    monkeypatch.setenv("AUDIT_LOG_PATH", str(tmp_path / "logs" / "audit.jsonl"))
+
+    result = runner.invoke(app, ["notify", "test"])
+
+    assert result.exit_code != 0
+    # No Python crash artefacts in operator-visible output.
+    assert "Traceback" not in result.output
+    assert "HTTPStatusError" not in result.output
+    # Operator-facing Russian guidance mentioning the token.
+    output_lower = result.output.lower()
+    assert "telegram" in output_lower

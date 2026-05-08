@@ -239,3 +239,71 @@ class TestTelegramSinkSend:
         sink = TelegramSink.from_settings(settings)
         assert sink is not None
         assert isinstance(sink, TelegramSink)
+
+
+class TestTelegramEnvVarIntegration:
+    """End-to-end check that env vars actually wire into Settings →
+    TelegramSink.from_settings. Catches the full pipe (env var
+    name → field name → from_settings → sink instance), which
+    isolated unit tests above miss because they construct Settings
+    directly with kwargs.
+
+    Found via M18 slice 1 smoke walkthrough on 2026-05-07: the
+    docstrings + CLI hint message documented
+    ``YADIRECT_TELEGRAM_BOT_TOKEN`` / ``YADIRECT_TELEGRAM_CHAT_ID``
+    but pydantic-settings (no ``env_prefix`` configured on
+    Settings) actually picks up ``TELEGRAM_BOT_TOKEN`` /
+    ``TELEGRAM_CHAT_ID`` (field name uppercased). All other
+    fields follow the same convention (``YANDEX_DIRECT_TOKEN`` =
+    ``yandex_direct_token``); the ``YADIRECT_*`` prefix in the
+    M18 docs was a typo. These tests pin the actual env-var
+    names so a regression introducing an env_prefix or a typo
+    surfaces immediately.
+    """
+
+    def test_real_env_vars_resolve_into_settings(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Set env vars exactly as a real operator would, then
+        # construct Settings without any kwargs and verify both
+        # fields are populated.
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "real-env-token")
+        monkeypatch.setenv("TELEGRAM_CHAT_ID", "real-env-chat-id")
+        # Suppress reading the project ``.env`` so a developer
+        # with their own values in the file doesn't poison the
+        # test isolation.
+        monkeypatch.setattr(
+            "yadirect_agent.config.Settings.model_config",
+            {"env_file": None, "extra": "ignore"},
+        )
+
+        from yadirect_agent.config import Settings
+
+        settings = Settings()
+
+        assert settings.telegram_bot_token is not None
+        assert settings.telegram_bot_token.get_secret_value() == "real-env-token"
+        assert settings.telegram_chat_id == "real-env-chat-id"
+
+    def test_real_env_vars_construct_sink_via_from_settings(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The full pipe: env vars → Settings → from_settings →
+        # TelegramSink instance. This is what the CLI ``notify
+        # test`` command exercises end-to-end.
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "real-env-token")
+        monkeypatch.setenv("TELEGRAM_CHAT_ID", "real-env-chat-id")
+        monkeypatch.setattr(
+            "yadirect_agent.config.Settings.model_config",
+            {"env_file": None, "extra": "ignore"},
+        )
+
+        from yadirect_agent.config import Settings
+
+        settings = Settings()
+        sink = TelegramSink.from_settings(settings)
+
+        assert sink is not None
+        assert isinstance(sink, TelegramSink)
