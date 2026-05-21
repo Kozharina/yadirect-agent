@@ -35,10 +35,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import SecretStr
-from yadirect_agent.services.notify.dispatcher import NotificationDispatcher
 
 from yadirect_agent.models.health import Severity
 from yadirect_agent.models.notification import Notification
+from yadirect_agent.services.notify.dispatcher import NotificationDispatcher
 
 
 def _make_notification() -> Notification:
@@ -148,31 +148,43 @@ class TestDispatcherPartialFailure:
         await dispatcher.send(_make_notification())  # must not raise
 
     @pytest.mark.asyncio
-    async def test_send_logs_warning_per_failed_sink(
-        self,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
+    async def test_send_logs_warning_per_failed_sink(self) -> None:
         # Each per-sink failure must emit a distinct structlog event
         # so ops-side dashboards can count "delivery failures by
         # channel". A single rolled-up event would lose the channel
         # attribution.
-        import logging
+        #
+        # ``structlog.testing.capture_logs`` is the right capture
+        # tool here (not pytest ``caplog``): structlog's processor
+        # chain does NOT route through stdlib ``logging`` by default
+        # in this project, so ``caplog`` sees zero records even when
+        # the events are emitted. Same pattern as
+        # ``test_reporting.py`` malformed-row tests.
+        from structlog.testing import capture_logs
 
-        caplog.set_level(logging.WARNING)
         dispatcher = NotificationDispatcher(
             sinks=[
                 _FailingSink(RuntimeError("boom-1")),
                 _FailingSink(RuntimeError("boom-2")),
             ],
         )
-        await dispatcher.send(_make_notification())
+        with capture_logs() as captured:
+            await dispatcher.send(_make_notification())
 
-        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-        # Two warnings, one per failed sink. Substring check on the
-        # event name keeps the assertion robust against structlog's
-        # rendering format (JSON vs console).
-        sink_failed_count = sum(1 for m in warning_messages if "dispatcher.sink_failed" in m)
-        assert sink_failed_count == 2
+        failed_events = [
+            log
+            for log in captured
+            if log.get("event") == "notify.dispatcher.sink_failed"
+            and log.get("log_level") == "warning"
+        ]
+        assert len(failed_events) == 2
+        # Each event carries the failing sink's class name so
+        # downstream dashboards can attribute per-channel.
+        assert all(e["sink"] == "_FailingSink" for e in failed_events)
+        # Error strings round-trip distinctly so an operator can
+        # see "boom-1" vs "boom-2" in the structured log stream.
+        errors = sorted(e["error"] for e in failed_events)
+        assert errors == ["boom-1", "boom-2"]
 
 
 class TestDispatcherIsEnabled:
