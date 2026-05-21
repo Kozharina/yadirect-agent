@@ -25,10 +25,9 @@ from __future__ import annotations
 
 from datetime import date
 
-from yadirect_agent.services.notify.render import health_report_to_notification
-
 from yadirect_agent.models.health import Finding, HealthReport, Severity
 from yadirect_agent.models.metrika import DateRange
+from yadirect_agent.services.notify.render import health_report_to_notification
 
 _WEEK = DateRange(start=date(2026, 5, 14), end=date(2026, 5, 20))
 

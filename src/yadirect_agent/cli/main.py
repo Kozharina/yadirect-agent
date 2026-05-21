@@ -287,6 +287,17 @@ def health_cmd(
             help="Emit JSON to stdout instead of a table.",
         ),
     ] = False,
+    notify: Annotated[
+        bool,
+        typer.Option(
+            "--notify/--no-notify",
+            help=(
+                "Send a summary notification through configured channels "
+                "(M18 slice 5a — currently TelegramSink only). Default on; "
+                "--no-notify suppresses the dispatch for ad-hoc CLI checks."
+            ),
+        ),
+    ] = True,
 ) -> None:
     """Run rule-based account health check, emit findings.
 
@@ -294,6 +305,16 @@ def health_cmd(
     Use this for the first read of a new account and as a daily probe
     in cron. Exit code is 0 if no HIGH-severity findings, 1 if any
     HIGH finding fired (suitable for cron alerting).
+
+    M18 slice 5a: after rendering the table, the report is folded
+    into one summary Notification and fanned out through
+    ``NotificationDispatcher.from_settings`` — operators with
+    Telegram envs configured get the summary in their chat without
+    any further setup. Dispatch failures are swallowed by the
+    Dispatcher (structlog ``notify.dispatcher.sink_failed`` events
+    capture them for ops-side observability); they NEVER fail the
+    CLI command, because punishing the operator's exit code for a
+    delivery hiccup is the wrong contract.
     """
     settings = _bootstrap_settings()
 
@@ -336,6 +357,23 @@ def health_cmd(
         typer.echo(render_report_json(report))
     else:
         render_report_text(_out, report)
+
+    # M18 slice 5a: fan-out the report to whatever notification
+    # channels the operator has configured. ``--no-notify`` opts
+    # out entirely. An empty report (``health_report_to_notification``
+    # returns None) silently skips dispatch — no "all clear" pings.
+    # An unconfigured dispatcher (no TELEGRAM_* envs) also silently
+    # skips — first-run operators who haven't set up notifications
+    # yet see no extra output.
+    if notify:
+        from ..services.notify.dispatcher import NotificationDispatcher
+        from ..services.notify.render import health_report_to_notification
+
+        notification = health_report_to_notification(report)
+        if notification is not None:
+            dispatcher = NotificationDispatcher.from_settings(settings)
+            if dispatcher.is_enabled:
+                asyncio.run(dispatcher.send(notification))
 
     from ..models.health import Severity as _Sev
 
