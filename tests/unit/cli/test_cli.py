@@ -1116,9 +1116,233 @@ def test_health_catches_config_error_with_friendly_message(
 
 
 # --------------------------------------------------------------------------
+# `health` → NotificationDispatcher wiring (M18 slice 5a).
+#
+# Closes the loop: findings produced by HealthCheckService are folded
+# (via ``services/notify/render``) into a summary Notification and
+# fanned out through ``NotificationDispatcher.from_settings`` — so an
+# operator who set ``TELEGRAM_BOT_TOKEN`` + ``TELEGRAM_CHAT_ID`` gets
+# the daily health summary in their chat without any further config.
+# --------------------------------------------------------------------------
+
+
+def _stub_health_service_returning(
+    monkeypatch: pytest.MonkeyPatch,
+    findings: list,  # type: ignore[type-arg]
+) -> None:
+    """Replace HealthCheckService with a sync stub that returns the given findings.
+
+    The dispatcher-wiring tests don't care about real Direct / Metrika
+    HTTP — they only care about "given a HealthReport, did the CLI
+    invoke Dispatcher.send correctly?". Stub the service to control
+    the findings list deterministically.
+    """
+    from typing import Self
+
+    from yadirect_agent import cli as _cli_pkg
+    from yadirect_agent.models.health import HealthReport
+    from yadirect_agent.models.metrika import DateRange
+
+    class _StubService:
+        def __init__(self, settings: object, *, history_store: object = None) -> None:
+            self._date_range: DateRange | None = None
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def run_account_check(
+            self,
+            *,
+            date_range: DateRange,
+            goal_id: int | None = None,
+        ) -> HealthReport:
+            return HealthReport(date_range=date_range, findings=list(findings))
+
+    monkeypatch.setattr(_cli_pkg.main, "HealthCheckService", _StubService)
+
+
+def test_health_dispatches_summary_when_telegram_configured(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # With Telegram envs set + at least one finding, the CLI must
+    # call Dispatcher.send with a non-None summary Notification.
+    # Without this assertion, the operator's configured Telegram
+    # channel stays silent on findings even though the CLI table
+    # shows them — exactly the dead-code state slice 5a is built
+    # to eliminate.
+    from yadirect_agent.models.health import Finding, Severity
+    from yadirect_agent.models.notification import Notification
+    from yadirect_agent.services.notify import dispatcher as _dispatcher_module
+
+    findings = [
+        Finding(
+            rule_id="burning_campaign",
+            severity=Severity.HIGH,
+            campaign_id=42,
+            campaign_name="brand",
+            message="campaign 'brand' burned 2400 RUB",
+            estimated_impact_rub=2400.0,
+        ),
+    ]
+    _stub_health_service_returning(monkeypatch, findings)
+
+    sent: list[Notification] = []
+
+    async def _fake_send(self: object, notification: Notification) -> None:
+        sent.append(notification)
+
+    # Patch Dispatcher.send rather than constructing a fake sink so
+    # the test exercises the real ``from_settings`` path too — that's
+    # where a regression that broke Settings → Dispatcher wiring
+    # would surface.
+    monkeypatch.setattr(_dispatcher_module.NotificationDispatcher, "send", _fake_send)
+
+    monkeypatch.setenv("YANDEX_DIRECT_TOKEN", "x")
+    monkeypatch.setenv("YANDEX_METRIKA_TOKEN", "x")
+    monkeypatch.setenv("YANDEX_METRIKA_COUNTER_ID", "1")
+    monkeypatch.setenv("AGENT_POLICY_PATH", str(tmp_path / "policy.yml"))
+    monkeypatch.setenv("AUDIT_LOG_PATH", str(tmp_path / "logs" / "audit.jsonl"))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:ABC")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "777")
+
+    result = runner.invoke(app, ["health", "--days", "7"])
+
+    # Non-zero exit because we have a HIGH finding — but dispatch
+    # must have already happened by then.
+    assert result.exit_code == 1, result.output
+    assert len(sent) == 1, f"expected one dispatch, got {len(sent)}"
+    notification = sent[0]
+    assert notification.severity == Severity.HIGH
+    assert "burned 2400 RUB" in notification.body
+
+
+def test_health_does_not_dispatch_when_no_findings(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Empty report → render_to_notification returns None → CLI
+    # must NOT call Dispatcher.send. Pings on "all clear" days
+    # train the operator to mute the channel.
+    from yadirect_agent.models.notification import Notification
+    from yadirect_agent.services.notify import dispatcher as _dispatcher_module
+
+    _stub_health_service_returning(monkeypatch, [])
+
+    sent: list[Notification] = []
+
+    async def _fake_send(self: object, notification: Notification) -> None:
+        sent.append(notification)
+
+    monkeypatch.setattr(_dispatcher_module.NotificationDispatcher, "send", _fake_send)
+
+    monkeypatch.setenv("YANDEX_DIRECT_TOKEN", "x")
+    monkeypatch.setenv("YANDEX_METRIKA_TOKEN", "x")
+    monkeypatch.setenv("YANDEX_METRIKA_COUNTER_ID", "1")
+    monkeypatch.setenv("AGENT_POLICY_PATH", str(tmp_path / "policy.yml"))
+    monkeypatch.setenv("AUDIT_LOG_PATH", str(tmp_path / "logs" / "audit.jsonl"))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:ABC")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "777")
+
+    result = runner.invoke(app, ["health", "--days", "7"])
+
+    assert result.exit_code == 0, result.output
+    assert sent == []
+
+
+def test_health_no_notify_flag_skips_dispatch(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # ``--no-notify`` lets an operator suppress the dispatcher pass
+    # for an ad-hoc CLI check (e.g. debugging on a Saturday — they
+    # don't want their weekend Telegram to buzz). Even with findings
+    # AND configured Telegram, dispatch is skipped.
+    from yadirect_agent.models.health import Finding, Severity
+    from yadirect_agent.models.notification import Notification
+    from yadirect_agent.services.notify import dispatcher as _dispatcher_module
+
+    findings = [
+        Finding(
+            rule_id="burning_campaign",
+            severity=Severity.HIGH,
+            campaign_id=42,
+            campaign_name="brand",
+            message="x",
+        ),
+    ]
+    _stub_health_service_returning(monkeypatch, findings)
+
+    sent: list[Notification] = []
+
+    async def _fake_send(self: object, notification: Notification) -> None:
+        sent.append(notification)
+
+    monkeypatch.setattr(_dispatcher_module.NotificationDispatcher, "send", _fake_send)
+
+    monkeypatch.setenv("YANDEX_DIRECT_TOKEN", "x")
+    monkeypatch.setenv("YANDEX_METRIKA_TOKEN", "x")
+    monkeypatch.setenv("YANDEX_METRIKA_COUNTER_ID", "1")
+    monkeypatch.setenv("AGENT_POLICY_PATH", str(tmp_path / "policy.yml"))
+    monkeypatch.setenv("AUDIT_LOG_PATH", str(tmp_path / "logs" / "audit.jsonl"))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:ABC")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "777")
+
+    result = runner.invoke(app, ["health", "--days", "7", "--no-notify"])
+
+    assert result.exit_code == 1, result.output  # HIGH finding still raises exit 1
+    assert sent == []
+
+
+def test_health_does_not_fail_when_dispatcher_unconfigured(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # No TELEGRAM_* envs → Dispatcher.from_settings returns an
+    # empty Dispatcher. CLI must NOT crash, must NOT print a
+    # "channel not configured" warning (operator who never wanted
+    # notifications shouldn't see noise), and must still render
+    # the health table.
+    from yadirect_agent.models.health import Finding, Severity
+
+    findings = [
+        Finding(
+            rule_id="low_ctr",
+            severity=Severity.WARNING,
+            campaign_id=1,
+            campaign_name="search",
+            message="low ctr finding",
+        ),
+    ]
+    _stub_health_service_returning(monkeypatch, findings)
+
+    monkeypatch.setenv("YANDEX_DIRECT_TOKEN", "x")
+    monkeypatch.setenv("YANDEX_METRIKA_TOKEN", "x")
+    monkeypatch.setenv("YANDEX_METRIKA_COUNTER_ID", "1")
+    monkeypatch.setenv("AGENT_POLICY_PATH", str(tmp_path / "policy.yml"))
+    monkeypatch.setenv("AUDIT_LOG_PATH", str(tmp_path / "logs" / "audit.jsonl"))
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+
+    result = runner.invoke(app, ["health", "--days", "7"])
+
+    assert result.exit_code == 0, result.output  # WARNING-only → exit 0
+    # The CLI table renders normally; no dispatcher-related noise.
+    assert "low ctr finding" in result.output
+    assert "channel not configured" not in result.output.lower()
+
+
+# --------------------------------------------------------------------------
 # `notify test` (M18 slice 1) — verifies a configured Telegram sink can
 # actually reach the operator's chat. Cheap operator check after first
-# setting `YADIRECT_TELEGRAM_BOT_TOKEN` and `YADIRECT_TELEGRAM_CHAT_ID`.
+# setting `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
 # --------------------------------------------------------------------------
 
 
