@@ -35,7 +35,18 @@ class NotifySink(Protocol):
     """Anything the dispatcher can route a Notification to."""
 
     async def send(self, notification: Notification) -> None:  # pragma: no cover
-        ...
+        """Deliver a notification through this sink's medium.
+
+        Per-sink concerns (transport, escaping, retries, rate
+        limiting) live in the implementing class; the Protocol
+        only pins the entry-point shape so the Dispatcher can
+        fan out without knowing what's underneath.
+
+        Implementers MAY raise on transport failure — the
+        ``NotificationDispatcher`` swallows per-sink errors and
+        logs ``notify.dispatcher.sink_failed`` so the failure of
+        one channel does not block delivery to the others.
+        """
 
 
 __all__ = ["NotifySink"]
