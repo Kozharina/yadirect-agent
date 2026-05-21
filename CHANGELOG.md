@@ -12,6 +12,38 @@ top — promoted to a numbered version on release-cut.
 
 ## [Unreleased]
 
+### Added
+
+- **M18 slice 5a** — closes the read-only Phase 1 notification
+  loop. Findings produced by `HealthCheckService` now reach the
+  operator's configured channels automatically (no extra setup
+  beyond M18 slice 1's `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`).
+  Also lifts the M21.2 alert-path blocker — budget-enforcement
+  notifications can now build on top of the same Dispatcher.
+  - `services/notify/protocol.py` — `NotifySink` Protocol. One
+    method (`async send(Notification) -> None`); 3rd-party sinks
+    and test doubles need zero couplings to this codebase.
+  - `services/notify/dispatcher.py` — `NotificationDispatcher`
+    with fan-out + partial-failure tolerance. Per-sink failures
+    swallowed, logged as `notify.dispatcher.sink_failed`
+    structlog warnings with the sink class name for per-channel
+    attribution. `from_settings` aggregates whatever per-sink
+    `from_settings` returns non-None for (today just
+    `TelegramSink`; symmetric block-per-sink scales).
+  - `services/notify/render.py` — `health_report_to_notification`
+    folds a `HealthReport` into ONE summary `Notification`
+    (operator inbox protection; empty report ⇒ None ⇒ no "no
+    news" pings). Severity = max, title carries scale + HIGH
+    count when present, body lists per-finding with severity
+    markers capped at 10 lines + overflow trailer + date-range
+    footer.
+  - `health` CLI: new `--notify/--no-notify` flag (default on);
+    after rendering the table, fans out the summary via
+    `NotificationDispatcher.from_settings(settings)`. Dispatch
+    failures NEVER fail the CLI — exit code stays driven by
+    findings severity alone (cron `health || alert` one-liners
+    must not flake on Telegram outages).
+
 ## [0.2.1] — 2026-05-07
 
 ### Added

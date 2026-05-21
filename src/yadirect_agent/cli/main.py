@@ -1793,10 +1793,12 @@ app.add_typer(notify_app, name="notify")
 def notify_test_cmd() -> None:
     """Send a test notification via the configured Telegram sink.
 
-    Operator runs this once after setting
-    ``YADIRECT_TELEGRAM_BOT_TOKEN`` and ``YADIRECT_TELEGRAM_CHAT_ID``
-    to verify the round-trip works (sink construction + Bot API
-    send + delivery to the target chat). Exit codes:
+    Operator runs this once after setting ``TELEGRAM_BOT_TOKEN``
+    and ``TELEGRAM_CHAT_ID`` (env-var names match the field names —
+    pydantic-settings has no ``env_prefix`` here, NOT
+    ``YADIRECT_*``) to verify the round-trip works (sink
+    construction + Bot API send + delivery to the target chat).
+    Exit codes:
 
     - 0 — message delivered.
     - 1 — sink rejected the request (bad token, wrong chat_id,
