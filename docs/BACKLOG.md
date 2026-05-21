@@ -68,9 +68,12 @@ demo-only, technically; it cannot be handed to a non-developer.
       budget exhaust deferred to M21.2 (needs M18 alert path).
 - [ ] **M21.2 — Cost tracking enforcement**: hard auto-degrade to
       ``--no-llm`` when ``agent_monthly_llm_budget_rub`` exhausted.
-      Blocked on M18 (notifications) — silently degrading without
-      an operator alert is a worse failure mode than hitting the
-      budget.
+      The alert-path blocker is lifted now that M18 slice 5a ships
+      ``NotificationDispatcher``: M21.2 can build the budget-
+      enforcement notification on top of the existing dispatch
+      surface (``health_report_to_notification`` has a sibling-
+      function pattern to follow). Still pending: the actual
+      ``--no-llm`` switch + Settings-driven threshold check.
 - [x] ~~**M6 (basic) — Metrika reporting**~~ — shipped, see Done.
 - [x] ~~**M15.5.1 — Account health check (basic rules)**~~ — shipped,
       see Done. Two rules + ``yadirect-agent health`` CLI.
@@ -103,6 +106,15 @@ mutating work via tappable approvals.
         see Done. ``Notification`` model + ``TelegramSink`` with
         retry / HTML escaping / severity emoji prefixes +
         ``yadirect-agent notify test`` CLI smoke command.
+  - [x] ~~**slice 5a — Dispatcher + health-check wiring**~~ —
+        shipped, see Done. ``NotificationDispatcher`` (fan-out +
+        partial-failure tolerance + ``from_settings``) + ``NotifySink``
+        Protocol + ``health_report_to_notification`` summary
+        renderer + ``health --notify/--no-notify`` CLI wiring.
+        Carved out of formal slice 5 so the daily health-check
+        loop closes architecturally now; remaining sinks
+        (Slack / Email / Chat) and severity routing stay in
+        slice 5 proper.
   - [ ] **slice 2 — Approval flow** (§M18.2): inline-keyboard
         Apply/Reject/Why cards, callback_data → local socket /
         pipe → ``apply-plan``, 24h plan timeout, audit
@@ -117,12 +129,14 @@ mutating work via tappable approvals.
         helper, keyring storage, ``/start`` chat_id capture);
         analogous for Slack incoming webhook and SMTP for
         email digests.
-  - [ ] **slice 5 — Slack + Email + Chat sinks** (§M18.1
-        remainder): ``SlackSink`` (Incoming Webhook +
+  - [ ] **slice 5 — Slack + Email + Chat sinks + severity routing**
+        (§M18.1 remainder): ``SlackSink`` (Incoming Webhook +
         ``/yadirect-approve <plan_id>`` slashcommand),
         ``EmailSink`` (SMTP for weekly/monthly), ``ChatSink``
-        (MCP tool result fallback). Plus ``NotificationDispatcher``
-        wiring severity → channels per ``agent_policy.yml``.
+        (MCP tool result fallback). Plus extends the existing
+        slice-5a ``NotificationDispatcher`` with severity-based
+        routing (``HIGH → all sinks, INFO → digest only``) per
+        ``agent_policy.yml``.
 - [ ] **M19 — Rollback / time machine** (§M19): per-run snapshot
       of dangerous fields (budgets, statuses, strategies, bids,
       adjustments), `rollback --to=<run_id>` (re-uses safety
@@ -854,6 +868,61 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M18 slice 5a — NotificationDispatcher + health-check wiring**
+      (Phase 2 release 0.3.0 second step). Closes the read-only
+      Phase 1 notification loop: findings produced by
+      ``HealthCheckService`` now reach the operator's configured
+      channels automatically. Without this PR, slice 1 was
+      effectively dead code in production — the Telegram sink
+      existed but nothing connected to it. Also unblocks M21.2
+      (cost-budget enforcement needs an alert path, and the
+      Dispatcher is now that path).
+
+      Four pieces:
+
+      - ``services/notify/protocol.py`` — ``NotifySink`` Protocol.
+        One method (``async send(Notification) -> None``); 3rd-
+        party sinks and test doubles need zero couplings to
+        this codebase.
+      - ``services/notify/dispatcher.py`` — ``NotificationDispatcher``.
+        Constructor takes any iterable of sinks (stored as an
+        immutable tuple); ``from_settings`` aggregates whatever
+        per-sink ``from_settings`` returns non-None for (today
+        only ``TelegramSink``; symmetric block-per-sink scales
+        when slice 5 proper adds Slack / Email / Chat). ``send``
+        fan-outs to every sink, swallows per-sink failures, logs
+        a structured ``notify.dispatcher.sink_failed`` warning
+        with the sink class name for per-channel attribution.
+        Sequential rather than parallel (1-3 sinks; readability
+        + temporal log clustering > sub-second wall-clock).
+      - ``services/notify/render.py`` —
+        ``health_report_to_notification``. Folds a ``HealthReport``
+        into ONE summary Notification (not one-per-finding —
+        operator inbox protection). Empty report → None (no "no
+        news" pings). Severity = max across findings. Title
+        carries scale + HIGH count when present. Body: per-line
+        ``[H]``/``[W]``/``[I]`` markers, capped at 10 lines +
+        ``... and N more`` trailer, date-range footer.
+      - ``cli/main.py:health_cmd`` — wires it together. After
+        rendering the table, the CLI folds findings into a
+        summary, builds a Dispatcher from Settings, and fans out.
+        ``--notify/--no-notify`` flag (default on) lets operators
+        skip dispatch for ad-hoc checks. Dispatch failures
+        NEVER fail the CLI — exit code stays driven by findings
+        severity alone.
+
+      Tests: 11 dispatcher tests (fan-out, partial-failure,
+      structlog event attribution via ``capture_logs``,
+      ``from_settings`` env-pipe), 11 render tests (severity
+      aggregation, title/body shape, truncation, date-range
+      footer), 4 CLI tests (dispatches on findings; skips on
+      empty; ``--no-notify`` suppresses; unconfigured envs
+      gracefully skip). Total +26 tests.
+
+      Slice 5 proper (Slack + Email + Chat sinks + severity
+      routing) sits on top of this surface — adding a new sink
+      is "one import + one block in ``from_settings``".
 
 - [x] **M18 slice 1 — Notification model + TelegramSink + CLI smoke**
       (Phase 2 release 0.3.0 first step). Foundation of the M18
