@@ -12,6 +12,8 @@ top — promoted to a numbered version on release-cut.
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-05-21
+
 ### Added
 
 - **M18 slice 5a** — closes the read-only Phase 1 notification
@@ -43,6 +45,21 @@ top — promoted to a numbered version on release-cut.
     failures NEVER fail the CLI — exit code stays driven by
     findings severity alone (cron `health || alert` one-liners
     must not flake on Telegram outages).
+
+### Why a patch release (0.2.2, not 0.3.0)
+
+M18 slice 5a adds NEW observable behavior (configured Telegram now
+receives a daily summary instead of staying silent), but the change
+is fully backward-compatible: operators without `TELEGRAM_*` envs
+see zero behavioral change. The new `--no-notify` flag is opt-out
+only — defaults preserve the auto-dispatch path for the operator
+who configured Telegram precisely so they could be notified.
+Pre-1.0 + backward-compatible + no protocol/schema changes ⇒ patch.
+
+The major-jump (0.3.0) is reserved for slice 2 (approval flow),
+which DOES introduce a new long-running process surface
+(bot polling thread + apply-plan IPC bridge) and ships Phase 2
+proper.
 
 ## [0.2.1] — 2026-05-07
 
@@ -179,7 +196,8 @@ M0–M3 + early M15.5.1 work; no `auth`, no `install-into-claude-desktop`,
 no scheduler, no onboarding tool. Released as a release-management
 checkpoint, not a user-ready cut.
 
-[Unreleased]: https://github.com/Kozharina/yadirect-agent/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/Kozharina/yadirect-agent/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/Kozharina/yadirect-agent/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Kozharina/yadirect-agent/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Kozharina/yadirect-agent/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Kozharina/yadirect-agent/releases/tag/v0.1.0
