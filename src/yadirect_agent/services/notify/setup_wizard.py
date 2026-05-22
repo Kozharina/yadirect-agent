@@ -47,24 +47,35 @@ from typing import Any
 import httpx
 import structlog
 
+from .bot_api import BOT_API_BASE
+
 _log = structlog.get_logger(component="services.notify.setup_wizard")
 
-# Same base URL the production sink uses (see
-# ``services/notify/telegram.py``). Pinned here too so the helpers
-# can be respx-mocked against the identical base without coupling
-# to the sink module.
-_BOT_API_BASE = "https://api.telegram.org"
-
-# Default poll interval when the wizard is waiting for the
-# operator's first message. 2 seconds is friendly against Telegram
-# rate limits and matches the wizard's "ожидание" UX cadence.
-# Tests override to 0.0 to spin as fast as the event loop allows.
+# Default sleep BETWEEN long-poll cycles when the wizard is waiting
+# for the operator's first message. The 2-second floor is a safety
+# net against tight retry loops on transient 5xx; under normal
+# operation the SERVER-side long-poll (see _LONG_POLL_SERVER_S
+# below) holds the connection so this sleep is only paid when the
+# server returns immediately (which happens only on error). Tests
+# override to 0.0 to spin as fast as the event loop allows.
 _DEFAULT_POLL_INTERVAL_S = 2.0
 
-# Per-poll HTTP timeout. Telegram's long-poll long-options (``timeout``
-# query param) defaults are 0-50; we send 10 so the loop ticks even
-# when the wizard is also waiting for the wall-clock deadline.
-_PER_POLL_TIMEOUT_S = 15.0
+# Server-side long-poll budget — passed as the ``timeout`` query
+# parameter to Telegram's ``/getUpdates``. Telegram holds the
+# connection for up to this many seconds until a message arrives or
+# the timer expires (whichever comes first). 30 s is the Telegram-
+# recommended long-poll value; combined with our wall-clock deadline
+# in ``await_first_chat_id``, it means we poll the server ~4 times
+# over a 120-s wizard window instead of ~60 times with timeout=0.
+# Telegram caps the value at 50 per the Bot API spec.
+_LONG_POLL_SERVER_S = 30
+
+# Per-call HTTP timeout for the ``getUpdates`` long-poll. MUST exceed
+# ``_LONG_POLL_SERVER_S`` so the client doesn't tear down the
+# connection while the server is still legitimately holding it; the
+# 5-s buffer absorbs network jitter without making operator-visible
+# delays meaningfully longer.
+_PER_POLL_TIMEOUT_S = _LONG_POLL_SERVER_S + 5.0
 
 # Per-call HTTP timeout for one-shot getMe. Short — if Telegram
 # can't answer a simple identity call in 10s, the operator's
@@ -120,7 +131,7 @@ async def validate_telegram_token(bot_token: str) -> BotInfo:
     """
     url = f"/bot{bot_token}/getMe"
     try:
-        async with httpx.AsyncClient(base_url=_BOT_API_BASE, timeout=_GETME_TIMEOUT_S) as client:
+        async with httpx.AsyncClient(base_url=BOT_API_BASE, timeout=_GETME_TIMEOUT_S) as client:
             response = await client.get(url)
     except httpx.HTTPError as exc:
         _log.warning(
@@ -195,11 +206,15 @@ async def await_first_chat_id(
     deadline = time.monotonic() + timeout_s
     offset = 0
 
-    async with httpx.AsyncClient(base_url=_BOT_API_BASE, timeout=_PER_POLL_TIMEOUT_S) as client:
+    async with httpx.AsyncClient(base_url=BOT_API_BASE, timeout=_PER_POLL_TIMEOUT_S) as client:
         while time.monotonic() < deadline:
             response = await client.get(
                 f"/bot{bot_token}/getUpdates",
-                params={"offset": offset, "timeout": 0},
+                # Server-side long-poll: Telegram holds the connection
+                # until a message arrives or _LONG_POLL_SERVER_S elapses,
+                # whichever comes first. Reduces wizard request volume
+                # ~15x compared to ``timeout=0`` short-polling.
+                params={"offset": offset, "timeout": _LONG_POLL_SERVER_S},
             )
             if response.status_code == 200:
                 try:

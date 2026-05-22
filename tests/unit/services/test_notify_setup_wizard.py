@@ -131,6 +131,49 @@ class TestValidateTelegramToken:
 
 class TestAwaitFirstChatId:
     @pytest.mark.asyncio
+    async def test_sends_long_poll_timeout_to_server(self) -> None:
+        # Pin server-side long-poll: ``timeout`` query param must be
+        # > 0 so Telegram holds the connection until a message
+        # arrives instead of returning empty immediately.
+        # ``timeout=0`` (short-poll) would 15x our request volume
+        # against the Bot API over a 120-s wizard window — a real
+        # regression risk because the loop's outer-side sleep makes
+        # the bug invisible without inspecting the wire.
+        async with respx.mock(base_url="https://api.telegram.org") as mock:
+            route = mock.get(f"/bot{_BOT_TOKEN}/getUpdates").respond(
+                200,
+                json={
+                    "ok": True,
+                    "result": [
+                        {
+                            "update_id": 1,
+                            "message": {
+                                "message_id": 1,
+                                "chat": {"id": 42, "type": "private"},
+                                "date": 1747900000,
+                                "text": "/start",
+                            },
+                        }
+                    ],
+                },
+            )
+
+            await await_first_chat_id(
+                _BOT_TOKEN,
+                timeout_s=5.0,
+                poll_interval_s=0.0,
+            )
+
+            # respx exposes the matched request; check the query
+            # string sent to Telegram.
+            assert route.called
+            sent_url = str(route.calls[0].request.url)
+            assert "timeout=" in sent_url, sent_url
+            assert "timeout=0&" not in sent_url and not sent_url.endswith("timeout=0"), (
+                f"long-poll regression — wizard reverted to short-poll: {sent_url}"
+            )
+
+    @pytest.mark.asyncio
     async def test_returns_chat_id_from_first_update(self) -> None:
         # Operator sends /start; bot receives one update. Helper
         # returns the chat.id as str.

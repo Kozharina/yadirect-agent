@@ -1803,6 +1803,17 @@ notify_setup_app = typer.Typer(
 notify_app.add_typer(notify_setup_app, name="setup")
 
 
+# Bounds for the wizard's chat-id capture window. Lower floor of 5 s
+# avoids zero-or-near-zero values that would make the wizard
+# effectively un-usable (operator never gets a chance to /start the
+# bot); upper ceiling of 600 s (10 min) bounds the worst-case hang
+# if the operator walks away mid-setup. Default 120 s matches the
+# UX hint we print in step 4.
+_TELEGRAM_CHAT_ID_TIMEOUT_MIN_S = 5
+_TELEGRAM_CHAT_ID_TIMEOUT_MAX_S = 600
+_TELEGRAM_CHAT_ID_TIMEOUT_DEFAULT_S = 120.0
+
+
 @notify_setup_app.command("telegram")
 def notify_setup_telegram_cmd(
     reset: Annotated[
@@ -1820,14 +1831,15 @@ def notify_setup_telegram_cmd(
         float,
         typer.Option(
             "--chat-id-timeout-s",
-            min=5,
-            max=600,
+            min=_TELEGRAM_CHAT_ID_TIMEOUT_MIN_S,
+            max=_TELEGRAM_CHAT_ID_TIMEOUT_MAX_S,
             help=(
                 "How long to wait for the operator's /start message before "
-                "giving up. Default 120 s; tests can override."
+                f"giving up. Default {_TELEGRAM_CHAT_ID_TIMEOUT_DEFAULT_S:.0f} s; "
+                "tests can override."
             ),
         ),
-    ] = 120.0,
+    ] = _TELEGRAM_CHAT_ID_TIMEOUT_DEFAULT_S,
 ) -> None:
     """Interactive 5-step wizard to set up the Telegram notification channel.
 

@@ -18,6 +18,8 @@ classes stay English (machine identifiers).
 
 from __future__ import annotations
 
+import httpx
+import structlog
 import typer
 from pydantic import SecretStr
 from rich.console import Console
@@ -32,6 +34,8 @@ from ..services.notify.setup_wizard import (
     validate_telegram_token,
 )
 from ..services.notify.telegram import TelegramSink
+
+_log = structlog.get_logger(component="cli.notify_setup")
 
 
 def render_telegram_reset(out: Console) -> None:
@@ -105,6 +109,14 @@ async def run_telegram_setup_wizard(
             f"Подробности (для отладки): {exc}[/dim]"
         )
         return 1
+    # Telemetry: bot_id is the stable identifier the operator (or
+    # support staff debugging later) can correlate against BotFather
+    # records and the audit log, independent of username re-binding.
+    _log.info(
+        "notify.setup.token_validated",
+        bot_id=bot_info.id,
+        username=bot_info.username,
+    )
     out.print(f"[green]✓ Бот @{bot_info.username} найден.[/green]")
 
     # ------------------------------------------------------------------
@@ -147,14 +159,23 @@ async def run_telegram_setup_wizard(
     )
     try:
         await sink.send(test_notification)
-    except Exception as exc:
+    except httpx.HTTPError as exc:
         # Token saved + chat_id captured, but the test send hit a
-        # transient issue (bot was blocked between /start and the
-        # test, Telegram had a 5xx burst, etc). Keep the keychain
+        # transient issue (bot blocked between /start and the test,
+        # Telegram 5xx burst, network glitch). Keep the keychain
         # entry — operator can re-run ``notify test`` later after
         # fixing the immediate issue. Discarding the entry would
         # force them to redo the whole wizard for a recoverable
         # failure.
+        #
+        # Deliberately tight catch: only ``httpx.HTTPError`` and its
+        # subclasses (HTTPStatusError, TransportError, TimeoutException,
+        # ConnectError…). A broader ``except Exception`` would also
+        # swallow programming bugs (AttributeError from a refactored
+        # TelegramSink, KeyError from a malformed Notification) under
+        # the "transient failure" message, making them harder to
+        # diagnose. Genuine bugs propagate to the typer top-level
+        # handler.
         err.print(
             "[yellow]Не удалось отправить тестовое сообщение.[/yellow]\n"  # noqa: RUF001
             "[dim]Учётные данные сохранены в keychain. Когда исправите "
