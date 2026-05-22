@@ -12,6 +12,47 @@ top — promoted to a numbered version on release-cut.
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-05-22
+
+### Added
+
+- **M18 slice 4** — Telegram setup wizard. Closes the onboarding
+  friction for Anna's path: she now runs
+  `yadirect-agent notify setup telegram` once, follows 5 numbered
+  prompts (BotFather instructions → token → validate → chat_id
+  capture → save+test), and ends up with a working Telegram
+  channel. No manual env-var editing, no `.env` gymnastics. Five
+  pieces:
+  - `auth/telegram_keychain.py` — `KeyringTelegramStore` (same
+    "yadirect-agent" service name as OAuth M15.3 but distinct
+    `"telegram"` username slot so `auth logout` and `notify setup
+    telegram --reset` are independent). One atomic JSON-blob slot,
+    defensive load, idempotent delete.
+  - `config.py:_hydrate_telegram_from_keyring` — second model
+    validator symmetric to OAuth. Env wins; missing env → fill
+    from keychain; per-field independence (token from env,
+    chat_id from keychain works).
+  - `services/notify/setup_wizard.py` — pure-async helpers
+    (`validate_telegram_token` via Bot API `/getMe`,
+    `await_first_chat_id` via `/getUpdates` long-poll). No typer
+    imports — respx-testable and reusable for a future MCP-tool
+    wrapper.
+  - `cli/notify_setup.py` — Russian render layer + 5-step
+    orchestrator. Test-send failure AFTER keychain save exits 1
+    but KEEPS the entry (operator can `notify test` later
+    instead of redoing the wizard).
+  - `cli/main.py` — registers `notify setup telegram` subcommand
+    with `--reset` flag and `--chat-id-timeout-s` knob.
+
+### Why a patch release (0.2.3, not 0.3.0)
+
+Pure new opt-in feature: `notify setup telegram` is a new CLI
+subcommand that didn't exist before. Operators who never run it
+see zero behavior change. Settings has new keychain hydration
+but env vars still win — no override path breaks. No protocol
+changes, no schema additions. Pre-1.0 + backward-compatible ⇒
+patch.
+
 ## [0.2.2] — 2026-05-21
 
 ### Added
@@ -196,7 +237,8 @@ M0–M3 + early M15.5.1 work; no `auth`, no `install-into-claude-desktop`,
 no scheduler, no onboarding tool. Released as a release-management
 checkpoint, not a user-ready cut.
 
-[Unreleased]: https://github.com/Kozharina/yadirect-agent/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/Kozharina/yadirect-agent/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/Kozharina/yadirect-agent/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/Kozharina/yadirect-agent/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Kozharina/yadirect-agent/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Kozharina/yadirect-agent/compare/v0.1.0...v0.2.0

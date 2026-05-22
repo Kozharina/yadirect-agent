@@ -64,13 +64,12 @@ from tenacity import (
 
 from ...models.health import Severity
 from ...models.notification import Notification
+from .bot_api import BOT_API_BASE
 
 if TYPE_CHECKING:
     from ...config import Settings
 
 _log = structlog.get_logger(component="services.notify.telegram")
-
-_BOT_API_BASE = "https://api.telegram.org"
 
 # Pinned per-severity visual marker. Operator scanning a chat
 # spots HIGH at a glance via the colour. The round emoji set
@@ -158,7 +157,7 @@ class TelegramSink:
             reraise=True,
         )
         async def _do_send() -> Any:
-            async with httpx.AsyncClient(base_url=_BOT_API_BASE, timeout=10.0) as client:
+            async with httpx.AsyncClient(base_url=BOT_API_BASE, timeout=10.0) as client:
                 response = await client.post(endpoint, json=payload)
                 if response.status_code in _RETRYABLE_STATUSES:
                     # Wrap + raise so tenacity sees a retryable; the
