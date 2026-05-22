@@ -200,6 +200,74 @@ class Settings(BaseSettings):
             self.yandex_metrika_token = access
         return self
 
+    @model_validator(mode="after")
+    def _hydrate_telegram_from_keyring(self) -> Settings:
+        """Pull Telegram (bot_token, chat_id) from the keychain into empty fields (M18 slice 4).
+
+        Symmetric to ``_hydrate_tokens_from_keyring`` for OAuth, but
+        against a separate keychain slot
+        (``KEYRING_TELEGRAM_USERNAME = "telegram"`` vs OAuth's
+        ``"oauth"``). The two hydrations are deliberately distinct
+        model_validators rather than one bigger one so:
+
+        - Single responsibility per validator (one validator, one
+          store) keeps the failure modes inspectable.
+        - A future credential type (e.g. M16 different OAuth scope
+          set) drops in as a third validator without expanding the
+          existing two.
+        - The independence regression is type-level: it is impossible
+          for the OAuth hydration to accidentally read the Telegram
+          slot (or vice versa) because each validator imports its
+          own store class.
+
+        Per-field independence within Telegram: if env provides one
+        of ``telegram_bot_token`` / ``telegram_chat_id`` and the
+        wizard's keychain entry has both, the env value wins for
+        that field and the keychain fills the other. Mixed
+        deployments (CI secret store for the token, wizard for the
+        chat_id) are normal and must work.
+
+        Fail-soft: backend unavailable, missing slot, corrupt JSON,
+        empty fields after load → both fields stay None. The
+        ``TelegramSink.from_settings`` returns None on that state,
+        the M18 slice 5a Dispatcher.from_settings returns an empty
+        Dispatcher, and the feature is gracefully disabled.
+
+        Lazy import for the same reason as the OAuth hydration: the
+        keyring module's backend probe is non-trivial on some Linux
+        desktops, and we don't want every ``Settings`` import to pay
+        that cost.
+        """
+        # Short-circuit when both fields are already populated by
+        # env / explicit kwargs — no point probing the keychain at
+        # all (matches the OAuth hydration shape).
+        if self.telegram_bot_token is not None and self.telegram_chat_id is not None:
+            return self
+
+        try:
+            from .auth.telegram_keychain import KeyringTelegramStore
+        except ImportError:
+            return self
+
+        try:
+            loaded = KeyringTelegramStore().load()
+        except Exception:
+            # Same broad catch as the OAuth hydration: the keyring
+            # backend can raise a variety of exceptions on headless
+            # / Docker / CI hosts (NoKeyringError, InitError, etc.);
+            # collapsing them into "no creds, feature disabled" is
+            # the correct caller-side recovery.
+            return self
+        if loaded is None:
+            return self
+
+        bot_token, chat_id = loaded
+        if self.telegram_bot_token is None:
+            self.telegram_bot_token = SecretStr(bot_token)
+        if self.telegram_chat_id is None:
+            self.telegram_chat_id = chat_id
+        return self
+
 
 def get_settings() -> Settings:
     """Construct settings. Called from entry points, not import time."""
