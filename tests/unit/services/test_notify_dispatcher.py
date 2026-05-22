@@ -148,32 +148,59 @@ class TestDispatcherPartialFailure:
         await dispatcher.send(_make_notification())  # must not raise
 
     @pytest.mark.asyncio
-    async def test_send_logs_warning_per_failed_sink(self) -> None:
+    async def test_send_logs_warning_per_failed_sink(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Each per-sink failure must emit a distinct structlog event
         # so ops-side dashboards can count "delivery failures by
         # channel". A single rolled-up event would lose the channel
         # attribution.
         #
-        # ``structlog.testing.capture_logs`` is the right capture
-        # tool here (not pytest ``caplog``): structlog's processor
-        # chain does NOT route through stdlib ``logging`` by default
-        # in this project, so ``caplog`` sees zero records even when
-        # the events are emitted. Same pattern as
-        # ``test_reporting.py`` malformed-row tests.
-        from structlog.testing import capture_logs
+        # Why the manual LogCapture + monkeypatch dance instead of
+        # the convenience ``structlog.testing.capture_logs``: this
+        # project sets ``cache_logger_on_first_use=True`` in
+        # ``configure_logging`` for perf. Once a test elsewhere in
+        # the session triggers that path (e.g. any CliRunner.invoke
+        # that hits the CLI's _root callback), the dispatcher
+        # module's ``_log`` proxy has already resolved into a
+        # bound logger with the CLI-time processor chain, and
+        # ``capture_logs`` (or even a global reset+reconfigure)
+        # cannot intercept it — the bound logger is captured by
+        # value, not reference. The seed-dependent CI flake
+        # (py3.11 only, specific test orderings) is exactly that.
+        #
+        # Fix: build a fresh logger whose processors include our
+        # LogCapture, then monkeypatch ``dispatcher._log`` to it.
+        # monkeypatch auto-restores after the test; the global
+        # structlog config we touched is rolled back in finally.
+        import structlog
+        from structlog.testing import LogCapture
 
-        dispatcher = NotificationDispatcher(
-            sinks=[
-                _FailingSink(RuntimeError("boom-1")),
-                _FailingSink(RuntimeError("boom-2")),
-            ],
+        from yadirect_agent.services.notify import dispatcher as _disp_module
+
+        cap = LogCapture()
+        old_config = structlog.get_config()
+        structlog.reset_defaults()
+        structlog.configure(
+            processors=[cap],
+            cache_logger_on_first_use=False,
         )
-        with capture_logs() as captured:
+        fresh_logger = structlog.get_logger(component="services.notify.dispatcher")
+        monkeypatch.setattr(_disp_module, "_log", fresh_logger)
+
+        try:
+            dispatcher = NotificationDispatcher(
+                sinks=[
+                    _FailingSink(RuntimeError("boom-1")),
+                    _FailingSink(RuntimeError("boom-2")),
+                ],
+            )
             await dispatcher.send(_make_notification())
+        finally:
+            structlog.reset_defaults()
+            structlog.configure(**old_config)
 
         failed_events = [
             log
-            for log in captured
+            for log in cap.entries
             if log.get("event") == "notify.dispatcher.sink_failed"
             and log.get("log_level") == "warning"
         ]

@@ -46,6 +46,8 @@ from .tools import Tool, ToolContext, ToolRegistry
 if TYPE_CHECKING:  # pragma: no cover
     from anthropic.types import Message
 
+    from ..services.cost_budget import BudgetGuard
+
 
 # --------------------------------------------------------------------------
 # Public exceptions.
@@ -202,6 +204,7 @@ class Agent:
         repetition_limit: int = 5,
         system_prompt: str = SYSTEM_PROMPT,
         cost_store: CostStore | None = None,
+        budget_guard: BudgetGuard | None = None,
     ) -> None:
         if max_iterations < 1:
             msg = "max_iterations must be >= 1"
@@ -225,6 +228,14 @@ class Agent:
         if cost_store is None:
             cost_store = CostStore(settings.audit_log_path.parent / "cost.jsonl")
         self._cost_store = cost_store
+        # Budget enforcement (M21.2). None = no enforcement (backward-
+        # compat for callers that haven't opted in). When wired in,
+        # the guard's check_or_raise runs BEFORE each messages.create
+        # so we never spend the call that would push us further past
+        # ``Settings.agent_monthly_llm_budget_rub``. Alert dispatch is
+        # the guard's own responsibility (M18 slice 5a Dispatcher
+        # wired into the guard via from_settings).
+        self._budget_guard = budget_guard
 
     async def run(self, user_message: str) -> AgentRun:
         """Execute the tool-use loop until end_turn or a guard trips."""
@@ -238,6 +249,17 @@ class Agent:
 
         for iteration in range(1, self._max_iterations + 1):
             log = log.bind(iteration=iteration)
+            # M21.2 pre-call budget gate. When wired in, raises
+            # BudgetExhaustedError if month-to-date spend has crossed
+            # ``Settings.agent_monthly_llm_budget_rub``. Iteration N-1
+            # (the one that crossed the threshold) completed its work
+            # and its CostRecord persisted; this iteration refuses to
+            # spend further. The exception propagates to ``Agent.run``'s
+            # caller (CLI / MCP) — alert dispatch is the guard's own
+            # responsibility, so by the time the caller sees the
+            # exception, the operator has already been pinged.
+            if self._budget_guard is not None:
+                await self._budget_guard.check_or_raise()
             log.info("agent.turn.start")
             response = await self._client.messages.create(
                 model=self._settings.anthropic_model,

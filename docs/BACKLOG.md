@@ -66,14 +66,12 @@ demo-only, technically; it cannot be handed to a non-developer.
       Observability surface (per-call CostRecord, JSONL persistence,
       ``cost status`` CLI). Hard auto-degrade to ``--no-llm`` on
       budget exhaust deferred to M21.2 (needs M18 alert path).
-- [ ] **M21.2 — Cost tracking enforcement**: hard auto-degrade to
-      ``--no-llm`` when ``agent_monthly_llm_budget_rub`` exhausted.
-      The alert-path blocker is lifted now that M18 slice 5a ships
-      ``NotificationDispatcher``: M21.2 can build the budget-
-      enforcement notification on top of the existing dispatch
-      surface (``health_report_to_notification`` has a sibling-
-      function pattern to follow). Still pending: the actual
-      ``--no-llm`` switch + Settings-driven threshold check.
+- [x] ~~**M21.2 — Cost tracking enforcement**~~ — shipped, see Done.
+      Hard refuse on next ``messages.create`` when month-to-date
+      LLM spend crosses ``agent_monthly_llm_budget_rub``, with a
+      HIGH-severity Telegram alert on first exhaustion (dedup'd
+      per process). Phase 0+1 cost-control loop closed
+      architecturally.
 - [x] ~~**M6 (basic) — Metrika reporting**~~ — shipped, see Done.
 - [x] ~~**M15.5.1 — Account health check (basic rules)**~~ — shipped,
       see Done. Two rules + ``yadirect-agent health`` CLI.
@@ -871,6 +869,50 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M21.2 — Cost-budget enforcement + alert dispatch**
+      (Phase 0+1 release 0.2.4). Closes the auto-degrade loop on
+      ``agent_monthly_llm_budget_rub``. The blocker (M18 alert
+      path) is now removed — built directly on top of slice 5a's
+      Dispatcher. Phase 0+1 cost-control loop architecturally
+      complete.
+
+      Three pieces:
+
+      - ``services/cost_budget.py`` — ``BudgetGuard`` +
+        ``BudgetExhaustedError``. ``check_or_raise`` is the only
+        mutator; no-op when ``budget_rub is None`` (backward-
+        compat — pre-M21.2 users keep working). Soft cutoff
+        semantics (``spent >= budget`` raises) so the iteration
+        that crossed the threshold completes its work and its
+        CostRecord persists, but the next iteration refuses.
+        One alert per process via ``_alerted_this_process``
+        flag — tight retry loops don't page the operator N
+        times. Dispatcher-optional + dispatcher-disabled handled
+        symmetrically (enforcement works without a notification
+        channel; caller still sees the exception). Month-scoped
+        via injected ``clock`` callable for testability without
+        freezegun. ``from_settings(settings, dispatcher)``
+        mirrors the assembly pattern used elsewhere.
+      - ``agent/loop.py`` — adds optional ``budget_guard`` kwarg
+        to ``Agent.__init__``; calls ``check_or_raise`` BEFORE
+        each ``messages.create``. Last-call-finishes falls out
+        for free (cost capture happens after the response, so
+        the iteration that crossed completes its work and its
+        record persists; the NEXT iteration's pre-check
+        catches the now-crossed state). Exception propagates to
+        ``Agent.run``'s caller.
+      - ``cli/main.py`` — ``run`` + ``chat`` commands catch
+        ``BudgetExhaustedError`` BEFORE the generic AgentLoopError
+        catch, render Russian message with actionable
+        spent/budget numbers + a pointer to ``cost status``.
+        ``chat`` EXITS THE LOOP on exhaustion (continuing to
+        prompt for inputs that will fail is hostile UX). Alert
+        dispatch is the guard's responsibility — by the time
+        the CLI catches, the operator has already been pinged.
+
+      Tests: 14 BudgetGuard + 4 Agent-integration = +18 tests.
+      Full suite 1269 passing (was 1251).
 
 - [x] **M18 slice 4 — Telegram setup wizard + keychain storage**
       (Phase 2 release 0.3.0 third step). Closes the onboarding
