@@ -158,9 +158,29 @@ def run_cmd(
     task: Annotated[str, typer.Argument(help="Task description in plain text.")],
 ) -> None:
     """Run an ad-hoc agent task and print the outcome."""
+    from ..services.cost_budget import BudgetExhaustedError
+
     settings = _bootstrap_settings()
     try:
         result = asyncio.run(_run_agent(settings, task))
+    except BudgetExhaustedError as exc:
+        # M21.2: month-to-date spend crossed
+        # agent_monthly_llm_budget_rub. The guard has ALREADY
+        # dispatched a Telegram alert (if Dispatcher was configured)
+        # by the time we see the exception — the CLI's job is just
+        # to render the operator-facing message and exit non-zero.
+        # Exit 2 matches the ``auth login`` / ``health`` convention
+        # for "user-actionable misconfiguration" (the action here:
+        # raise the budget or wait for next month).
+        _err.print(
+            f"[red]LLM-бюджет исчерпан[/red] "
+            f"({exc.spent_rub:.0f} / {exc.budget_rub:.0f} RUB за месяц).\n"
+            "[dim]Агент остановлен, чтобы не тратить дальше. "
+            "Чтобы продолжить: поднимите agent_monthly_llm_budget_rub в .env "
+            "или дождитесь следующего месяца. Текущий расход — "
+            "``yadirect-agent cost status``.[/dim]"
+        )
+        raise typer.Exit(code=2) from exc
     except AgentLoopError as exc:
         _err.print(f"[red]agent aborted:[/red] {exc}")
         raise typer.Exit(code=2) from exc
@@ -175,6 +195,8 @@ def run_cmd(
 @app.command("chat")
 def chat_cmd() -> None:
     """Interactive loop — each line becomes an independent agent run."""
+    from ..services.cost_budget import BudgetExhaustedError
+
     settings = _bootstrap_settings()
     _out.print("[dim]yadirect-agent chat. Type an empty line or Ctrl-D to exit.[/dim]")
     while True:
@@ -187,6 +209,18 @@ def chat_cmd() -> None:
             return
         try:
             result = asyncio.run(_run_agent(settings, task))
+        except BudgetExhaustedError as exc:
+            # M21.2: same message + structure as ``run`` — but here
+            # we EXIT the chat loop entirely. The budget is exhausted
+            # for the entire month; continuing to prompt the operator
+            # for more inputs that will immediately fail is hostile.
+            _err.print(
+                f"[red]LLM-бюджет исчерпан[/red] "
+                f"({exc.spent_rub:.0f} / {exc.budget_rub:.0f} RUB за месяц).\n"
+                "[dim]Чат завершён. Поднимите agent_monthly_llm_budget_rub "
+                "или дождитесь следующего месяца, затем запустите снова.[/dim]"
+            )
+            return
         except AgentLoopError as exc:
             _err.print(f"[red]agent aborted:[/red] {exc}")
             continue
@@ -712,8 +746,19 @@ def _bootstrap_settings() -> Settings:
 
 
 async def _run_agent(settings: Settings, task: str) -> AgentRun:
+    # M21.2: wire the budget guard with the configured Dispatcher so
+    # the agent loop refuses LLM calls past
+    # ``agent_monthly_llm_budget_rub`` AND the operator gets a
+    # Telegram alert on first exhaustion in this process. When the
+    # operator hasn't set a budget, ``budget_rub`` is None and the
+    # guard is a no-op — pre-M21.2 behaviour preserved.
+    from ..services.cost_budget import BudgetGuard
+    from ..services.notify.dispatcher import NotificationDispatcher
+
     registry = build_default_registry(settings)
-    agent = Agent(settings, registry)
+    dispatcher = NotificationDispatcher.from_settings(settings)
+    budget_guard = BudgetGuard.from_settings(settings, dispatcher=dispatcher)
+    agent = Agent(settings, registry, budget_guard=budget_guard)
     return await agent.run(task)
 
 

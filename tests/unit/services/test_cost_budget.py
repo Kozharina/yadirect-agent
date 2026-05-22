@@ -41,15 +41,15 @@ from pathlib import Path
 
 import pytest
 from pydantic import SecretStr
-from yadirect_agent.services.cost_budget import (
-    BudgetExhaustedError,
-    BudgetGuard,
-)
 
 from yadirect_agent.agent.cost import CostStore
 from yadirect_agent.models.cost import CostRecord
 from yadirect_agent.models.health import Severity
 from yadirect_agent.models.notification import Notification
+from yadirect_agent.services.cost_budget import (
+    BudgetExhaustedError,
+    BudgetGuard,
+)
 from yadirect_agent.services.notify.dispatcher import NotificationDispatcher
 
 
