@@ -42,6 +42,7 @@ from __future__ import annotations
 import httpx
 import pytest
 import respx
+
 from yadirect_agent.services.notify.setup_wizard import (
     BotInfo,
     ChatIdTimeoutError,

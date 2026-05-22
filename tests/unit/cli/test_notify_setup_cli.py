@@ -137,12 +137,18 @@ def stub_helpers(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         if isinstance(result, Exception):
             raise result
 
-    # Patch in the cli/main module's namespace (where they're imported),
-    # not just the source modules — typer late-binds imports.
-    from yadirect_agent.cli import main as cli_main
+    # Patch in the cli/notify_setup module's namespace because that's
+    # where the wizard orchestrator imports the helpers as ``from
+    # ..services.notify.setup_wizard import await_first_chat_id, ...``
+    # — patching ``setup_wizard.await_first_chat_id`` alone does NOT
+    # update the local-name binding already captured at import time.
+    from yadirect_agent.cli import notify_setup as cli_notify_setup
 
-    monkeypatch.setattr(cli_main, "validate_telegram_token", fake_validate, raising=False)
-    monkeypatch.setattr(cli_main, "await_first_chat_id", fake_await_chat_id, raising=False)
+    monkeypatch.setattr(cli_notify_setup, "validate_telegram_token", fake_validate)
+    monkeypatch.setattr(cli_notify_setup, "await_first_chat_id", fake_await_chat_id)
+    # Also patch the source-module attributes so any other caller
+    # (a future MCP-tool wrapper that imports the helpers directly)
+    # would see the stubs too.
     monkeypatch.setattr(setup_wizard, "validate_telegram_token", fake_validate)
     monkeypatch.setattr(setup_wizard, "await_first_chat_id", fake_await_chat_id)
     monkeypatch.setattr(telegram_module.TelegramSink, "send", fake_send)

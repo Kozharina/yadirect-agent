@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import keyring.errors
 import pytest
+
 from yadirect_agent.auth.telegram_keychain import (
     KEYRING_TELEGRAM_SERVICE_NAME,
     KEYRING_TELEGRAM_USERNAME,

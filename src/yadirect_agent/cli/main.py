@@ -1789,6 +1789,96 @@ notify_app = typer.Typer(
 app.add_typer(notify_app, name="notify")
 
 
+# `notify setup <medium>` — interactive wizards that walk an operator
+# from zero to a working notification channel without them having to
+# read any docs. Slice 4 ships `telegram`; future slices add `slack`
+# / `email` / `chat` as the corresponding sinks land.
+notify_setup_app = typer.Typer(
+    name="setup",
+    help=(
+        "Interactive setup wizards for notification channels. Currently: telegram only (slice 4)."
+    ),
+    no_args_is_help=True,
+)
+notify_app.add_typer(notify_setup_app, name="setup")
+
+
+@notify_setup_app.command("telegram")
+def notify_setup_telegram_cmd(
+    reset: Annotated[
+        bool,
+        typer.Option(
+            "--reset",
+            help=(
+                "Delete the stored Telegram credentials from the OS keychain "
+                "and exit. Use this when you've revoked the bot via @BotFather "
+                "and want to wipe the local entry."
+            ),
+        ),
+    ] = False,
+    chat_id_timeout_s: Annotated[
+        float,
+        typer.Option(
+            "--chat-id-timeout-s",
+            min=5,
+            max=600,
+            help=(
+                "How long to wait for the operator's /start message before "
+                "giving up. Default 120 s; tests can override."
+            ),
+        ),
+    ] = 120.0,
+) -> None:
+    """Interactive 5-step wizard to set up the Telegram notification channel.
+
+    Walks the operator from "no bot at all" to a working Telegram
+    channel that ``yadirect-agent health`` will use automatically:
+
+    1. Print BotFather instructions (how to /newbot).
+    2. Prompt for the bot token (hidden input).
+    3. Validate via Bot API /getMe.
+    4. Print "now send /start to the bot" + long-poll /getUpdates
+       until the first message arrives; capture chat_id.
+    5. Save (token, chat_id) to the OS keychain via
+       ``KeyringTelegramStore``, then send a test notification to
+       confirm the round-trip works end-to-end.
+
+    Exit codes:
+    - 0 — setup succeeded (or --reset succeeded).
+    - 1 — validation / chat-id-capture / test-send failed; a
+      Russian message explains what to fix.
+    - 2 — usage error (e.g. ``notify setup slack`` before slack
+      sink lands).
+    """
+    from .notify_setup import (
+        render_telegram_reset,
+        run_telegram_setup_wizard,
+    )
+
+    if reset:
+        render_telegram_reset(_out)
+        return
+
+    exit_code = asyncio.run(
+        run_telegram_setup_wizard(
+            out=_out,
+            err=_err,
+            chat_id_timeout_s=chat_id_timeout_s,
+        ),
+    )
+    if exit_code != 0:
+        raise typer.Exit(code=exit_code)
+
+
+# Catch-all for unsupported media so ``notify setup slack`` tells the
+# operator clearly that the feature isn't landed yet rather than the
+# default typer "no such command" (which would also be exit 2 but
+# without a project-specific message).
+@notify_setup_app.callback(invoke_without_command=False)
+def _notify_setup_callback() -> None:
+    """Pass-through callback; per-medium subcommands handle the work."""
+
+
 @notify_app.command("test")
 def notify_test_cmd() -> None:
     """Send a test notification via the configured Telegram sink.
