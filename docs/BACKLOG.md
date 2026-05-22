@@ -959,10 +959,14 @@ Last 10 items (newest at top). Older items are available via
 
       Settings: ``telegram_bot_token: SecretStr | None`` and
       ``telegram_chat_id: str | None`` via env vars
-      ``YADIRECT_TELEGRAM_BOT_TOKEN`` / ``YADIRECT_TELEGRAM_CHAT_ID``
-      (M18.4 setup wizard will migrate token to keyring storage
-      with env-var fallback for headless / Docker contexts —
-      same shape as M15.3 OAuth tokens).
+      ``TELEGRAM_BOT_TOKEN`` / ``TELEGRAM_CHAT_ID`` (NO
+      ``YADIRECT_`` prefix — pydantic-settings without
+      ``env_prefix`` resolves field names uppercased; the
+      original v0.2.0 docstrings had a ``YADIRECT_*`` typo that
+      v0.2.1 fixed across config / sink / CLI hints). M18.4 setup
+      wizard will migrate token to keyring storage with env-var
+      fallback for headless / Docker contexts — same shape as
+      M15.3 OAuth tokens.
 
       CLI: ``yadirect-agent notify test`` constructs the sink
       and sends an INFO test notification. Russian operator text
