@@ -124,11 +124,14 @@ mutating work via tappable approvals.
         signature on callback_data, KS#-revalidation at apply
         time, ``notify.signature_mismatch`` audit event.
         Locks down slice 2 against forged taps.
-  - [ ] **slice 4 — Setup wizards** (§M18.4):
-        ``yadirect-agent notify setup telegram`` (BotFather
-        helper, keyring storage, ``/start`` chat_id capture);
-        analogous for Slack incoming webhook and SMTP for
-        email digests.
+  - [x] ~~**slice 4 — Setup wizard (Telegram)**~~ — shipped,
+        see Done. ``yadirect-agent notify setup telegram``
+        interactive 5-step wizard (BotFather instructions →
+        token prompt → getMe validation → /getUpdates chat_id
+        capture → keychain save + test send), plus
+        ``KeyringTelegramStore`` + Settings hydration from the
+        keychain. Slack / Email wizards land alongside their
+        respective sinks in slice 5 proper.
   - [ ] **slice 5 — Slack + Email + Chat sinks + severity routing**
         (§M18.1 remainder): ``SlackSink`` (Incoming Webhook +
         ``/yadirect-approve <plan_id>`` slashcommand),
@@ -868,6 +871,56 @@ turn actually comes.
 
 Last 10 items (newest at top). Older items are available via
 `git log -p docs/BACKLOG.md`.
+
+- [x] **M18 slice 4 — Telegram setup wizard + keychain storage**
+      (Phase 2 release 0.3.0 third step). Closes the onboarding
+      friction for Anna: she runs ``yadirect-agent notify setup
+      telegram`` once, follows 5 numbered prompts, and ends up
+      with a working Telegram channel + creds in OS keychain —
+      no manual env-var editing, no ``.env`` file gymnastics,
+      no docs-grepping for "where do I paste the token".
+
+      Five pieces:
+
+      - ``auth/telegram_keychain.py`` — ``KeyringTelegramStore``
+        with same project-wide ``service_name = "yadirect-agent"``
+        as OAuth but distinct ``username = "telegram"`` slot, so
+        ``auth logout`` does not touch Telegram and ``notify
+        setup telegram --reset`` does not touch OAuth. Single
+        atomic JSON-blob slot, defensive load returns None for
+        every "unusable creds" path (missing / corrupt / partial /
+        backend-unavailable), idempotent delete.
+      - ``config.py:_hydrate_telegram_from_keyring`` — a second
+        model_validator symmetric to the existing OAuth one.
+        Env wins; missing env → fill from keychain; missing both
+        → both fields stay None (TelegramSink.from_settings
+        returns None, Dispatcher.from_settings returns empty
+        Dispatcher, feature gracefully disabled). Per-field
+        independence — mixed deployments (token from CI secret,
+        chat_id from wizard) work.
+      - ``services/notify/setup_wizard.py`` — pure-async helpers
+        (``validate_telegram_token`` via /getMe,
+        ``await_first_chat_id`` via /getUpdates long-poll). No
+        typer / rich imports → respx-mockable, reusable for a
+        future MCP-tool wrapper that surfaces the wizard inside
+        Claude Desktop chat.
+      - ``cli/notify_setup.py`` — operator-facing 5-step Russian
+        render layer + orchestration. Returns exit code (not
+        raise) so it unit-tests cleanly. Test-send failure AFTER
+        keychain save exits 1 but KEEPS the entry — operator can
+        ``notify test`` later instead of redoing the whole wizard.
+      - ``cli/main.py`` — registers ``notify setup`` subapp +
+        ``telegram`` subcommand + ``--reset`` flag +
+        ``--chat-id-timeout-s`` knob (default 120s).
+
+      Tests: 15 keychain + 7 Settings hydration + 9 wizard
+      helper + 7 CLI wizard = +38 tests; 1250 passed (was 1212
+      post-slice-5a).
+
+      Slack + Email wizards land alongside their respective
+      sinks in slice 5 proper; the wizard module pattern is
+      "drop in a sibling render function" so adding them is
+      symmetric to telegram.
 
 - [x] **M18 slice 5a — NotificationDispatcher + health-check wiring**
       (Phase 2 release 0.3.0 second step). Closes the read-only
