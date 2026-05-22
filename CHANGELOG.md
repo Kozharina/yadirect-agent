@@ -12,6 +12,49 @@ top — promoted to a numbered version on release-cut.
 
 ## [Unreleased]
 
+## [0.2.4] — 2026-05-22
+
+### Added
+
+- **M21.2** — Cost-budget enforcement + alert dispatch. Closes
+  the auto-degrade loop on `agent_monthly_llm_budget_rub`: when
+  month-to-date LLM spend crosses the operator's budget, the
+  agent loop refuses the next `messages.create` call AND fires
+  a HIGH-severity Telegram alert (dedup'd to one per process so
+  retry loops don't spam). The M18 alert-path blocker is now
+  removed — M21.2 builds directly on slice 5a's Dispatcher.
+  Phase 0+1 cost-control loop architecturally complete.
+  - `services/cost_budget.py` — `BudgetGuard` +
+    `BudgetExhaustedError`. Soft cutoff (`spent >= budget`
+    raises) so the iteration that crossed the threshold
+    completes its work; cost capture happens after the
+    response, so `cost status` accounting stays accurate even
+    on aborted runs. One alert per process via dedup flag.
+    Dispatcher-optional + month-scoped via injected `clock`.
+    `from_settings(settings, dispatcher=None)` ergonomics.
+  - `agent/loop.py` — adds optional `budget_guard` kwarg to
+    `Agent.__init__`; pre-call check runs BEFORE each
+    `messages.create`. Backward-compat (None = no enforcement);
+    exception propagates to `Agent.run`'s caller.
+  - `cli/main.py` — `run` and `chat` catch
+    `BudgetExhaustedError` BEFORE the generic `AgentLoopError`
+    catch; render Russian message with spent/budget numbers +
+    pointer to `cost status`. `chat` exits the loop on
+    exhaustion (continuing to prompt is hostile UX).
+
+### Why a patch release (0.2.4, not 0.3.0)
+
+Pure new opt-in enforcement layer. Operators who never set
+`agent_monthly_llm_budget_rub` see zero behaviour change. The
+new `budget_guard` kwarg on `Agent.__init__` defaults to None
+so existing callers (tests, MCP tools, acceptance tests) keep
+working unchanged. No protocol changes, no schema additions.
+Pre-1.0 + backward-compatible ⇒ patch.
+
+The major-jump (0.3.0) stays reserved for slice 2 (approval
+flow with long-running bot polling thread + apply-plan IPC
+bridge), which is the next Phase-2-proper surface.
+
 ## [0.2.3] — 2026-05-22
 
 ### Added
@@ -237,7 +280,8 @@ M0–M3 + early M15.5.1 work; no `auth`, no `install-into-claude-desktop`,
 no scheduler, no onboarding tool. Released as a release-management
 checkpoint, not a user-ready cut.
 
-[Unreleased]: https://github.com/Kozharina/yadirect-agent/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/Kozharina/yadirect-agent/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/Kozharina/yadirect-agent/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/Kozharina/yadirect-agent/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/Kozharina/yadirect-agent/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Kozharina/yadirect-agent/compare/v0.2.0...v0.2.1
